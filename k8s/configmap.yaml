@@ -1,0 +1,48 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cargobay-config
+  namespace: cargobay
+data:
+  config.yaml: |
+    server:
+      port: 4500
+      host: 0.0.0.0
+    storage:
+      type: s3
+      config:
+        bucket: cargobay-artifacts
+        region: us-east-1
+    database:
+      type: postgres
+      dsn: postgres://cargobay:password@cargobay-postgres:5432/cargobay
+    cache:
+      type: redis
+      url: redis://cargobay-redis:6379
+      ttl: 3600
+      max_size: 1073741824
+    registries:
+      - id: dockerhub
+        name: Docker Hub
+        url: https://registry-1.docker.io
+        type: docker
+        proxy: true
+        enabled: true
+        priority: 100
+      - id: npm
+        name: NPM
+        url: https://registry.npmjs.org
+        type: npm
+        proxy: true
+        enabled: true
+        priority: 100
+      - id: maven-central
+        name: Maven Central
+        url: https://repo1.maven.org
+        type: maven
+        proxy: true
+        enabled: true
+        priority: 100
+    security:
+      signature_verification: false
+      enable_user_management: true

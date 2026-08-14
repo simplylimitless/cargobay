@@ -1,0 +1,78 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cargobay
+  namespace: cargobay
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cargobay
+  template:
+    metadata:
+      labels:
+        app: cargobay
+    spec:
+      containers:
+        - name: cargobay
+          image: cargobay:latest
+          ports:
+            - containerPort: 4500
+          env:
+            - name: PORT
+              value: "4500"
+            - name: HOST
+              value: "0.0.0.0"
+            - name: DATABASE_URL
+              value: postgres://cargobay:password@cargobay-postgres:5432/cargobay
+            - name: REDIS_URL
+              value: redis://cargobay-redis:6379
+            - name: STORAGE_TYPE
+              value: s3
+            - name: S3_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: cargobay-config
+                  key: s3_bucket
+            - name: S3_REGION
+              value: us-east-1
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 4500
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 4500
+            initialDelaySeconds: 5
+            periodSeconds: 5
+---
+# Horizontal Pod Autoscaler
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: cargobay-hpa
+  namespace: cargobay
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: cargobay
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
