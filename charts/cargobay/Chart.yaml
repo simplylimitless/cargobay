@@ -1,0 +1,16 @@
+apiVersion: v2
+name: cargobay
+description: cargobay - Universal Binary Repository Manager
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+keywords:
+  - artifact
+  - registry
+  - docker
+  - npm
+  - maven
+home: https://github.com/anthropics/cargobay
+maintainers:
+  - name: Anthropics
+    url: https://github.com/anthropics

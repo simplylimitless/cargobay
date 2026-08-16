@@ -1,0 +1,47 @@
+server:
+  port: 4500
+  host: 0.0.0.0
+
+storage:
+  type: local
+  config:
+    path: ./storage
+
+database:
+  type: postgres
+  dsn: postgres://localhost:5432/cargobay
+
+cache:
+  type: redis
+  url: redis://localhost:6379
+  ttl: 3600
+  max_size: 1073741824
+
+registries:
+  - id: dockerhub
+    name: Docker Hub
+    url: https://registry-1.docker.io
+    type: docker
+    proxy: true
+    enabled: true
+    priority: 100
+
+  - id: npm
+    name: NPM Registry
+    url: https://registry.npmjs.org
+    type: npm
+    proxy: true
+    enabled: true
+    priority: 100
+
+  - id: maven-central
+    name: Maven Central
+    url: https://repo1.maven.org
+    type: maven
+    proxy: true
+    enabled: true
+    priority: 100
+
+security:
+  signature_verification: false
+  enable_user_management: true

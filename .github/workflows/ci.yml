@@ -1,0 +1,261 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+    paths-ignore:
+      - '**.md'
+      - 'charts/**'
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'charts/**'
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: cargobay
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: cargobay
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: --health-cmd "redis-cli ping" --health-interval 10s --health-timeout 5s --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Download Go modules
+        working-directory: ./backend
+        run: go mod download
+
+      - name: Run unit tests
+        working-directory: ./backend
+        run: go test -v ./pkg/... -timeout 60s
+
+      - name: Run integration tests
+        working-directory: ./backend
+        run: go test -tags=integration -v ./pkg/integration/... -timeout 120s
+
+      - name: Run E2E tests
+        working-directory: ./tests/e2e
+        run: go test -v ./... -timeout 120s
+
+      - name: Build backend
+        working-directory: ./backend
+        run: go build -o ../bin/cargobay ./cmd/server/main.go
+
+      - name: Build frontend
+        working-directory: ./frontend
+        run: |
+          npm ci
+          npm run build
+
+  lint:
+    name: Lint Code
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Go fmt check
+        run: |
+          go fmt ./...
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "Code not formatted. Run 'go fmt ./...' and commit changes."
+            exit 1
+          fi
+
+      - name: Go vet
+        working-directory: ./backend
+        run: go vet ./...
+
+      - name: Install golangci-lint
+        run: |
+          go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.55.2
+
+      - name: Run golangci-lint
+        working-directory: ./backend
+        run: golangci-lint run -E gofmt,goimports,misspell
+
+      - name: ESLint
+        working-directory: ./frontend
+        run: |
+          npm ci
+          npm run lint
+
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Run gosec security scanner
+        uses: securego/gosec@master
+        with:
+          args: ./backend/...
+
+      - name: Run npm audit
+        working-directory: ./frontend
+        run: |
+          npm ci
+          npm audit --audit-level=high || true
+
+  docker:
+    name: Build Docker Images
+    runs-on: ubuntu-latest
+    needs: [test, lint]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build backend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          push: false
+          tags: cargobay/backend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build frontend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          push: false
+          tags: cargobay/frontend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Validate docker-compose
+        run: |
+          docker compose -f docker-compose.yml config > /dev/null
+
+  helm:
+    name: Validate Helm Chart
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: 'v3.13.0'
+
+      - name: Run helm lint
+        run: |
+          helm lint charts/cargobay
+
+      - name: Run helm template
+        run: |
+          helm template test charts/cargobay > /dev/null
+
+  e2e:
+    name: E2E Tests with Docker Compose
+    runs-on: ubuntu-latest
+    needs: [docker]
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: cargobay
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: cargobay
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Compose
+        run: |
+          docker compose version
+          docker --version
+
+      - name: Start services
+        working-directory: .
+        run: docker compose up -d
+
+      - name: Wait for services
+        run: |
+          sleep 10
+          docker compose logs
+
+      - name: Run E2E tests
+        working-directory: ./tests/e2e
+        run: |
+          go mod download
+          go test -v ./...
+
+      - name: Cleanup
+        if: always()
+        working-directory: .
+        run: docker compose down -v

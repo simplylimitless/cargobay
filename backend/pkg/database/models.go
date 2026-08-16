@@ -24,23 +24,22 @@ type ArtifactMetadata struct {
 
 // Signature represents a digital signature on an artifact
 type Signature struct {
-	Type       string `db:"type"`
-	KeyID      string `db:"key_id"`
-	Signature  string `db:"signature"`
-	Timestamp  time.Time `db:"timestamp"`
-	Verified   bool   `db:"verified"`
+	Type      string    `db:"type"`
+	KeyID     string    `db:"key_id"`
+	Timestamp time.Time `db:"timestamp"`
+	Verified  bool      `db:"verified"`
 }
 
 // UserRepository represents a user in the system
 type UserRepository struct {
-	UserID     string    `db:"user_id"`
-	Username   string    `db:"username"`
-	Email      string    `db:"email"`
-	PasswordHash string  `db:"password_hash"`
-	Roles      []string  `db:"roles"`
-	CreatedAt  time.Time `db:"created_at"`
-	LastLogin  *time.Time `db:"last_login"`
-	IsActive   bool      `db:"is_active"`
+	UserID       string     `db:"user_id" json:"userId"`
+	Username     string     `db:"username" json:"username"`
+	Email        string     `db:"email" json:"email"`
+	PasswordHash string     `db:"password_hash" json:"-"`
+	Roles        []string   `db:"roles" json:"roles"`
+	CreatedAt    time.Time  `db:"created_at" json:"createdAt"`
+	LastLogin    *time.Time `db:"last_login" json:"lastLogin"`
+	IsActive     bool       `db:"is_active" json:"isActive"`
 }
 
 // AccessKey represents an API access key
@@ -67,3 +66,58 @@ type RegistryConfig struct {
 	Priority int    `db:"priority"`
 }
 
+// AuditLog represents an audit log entry
+type AuditLog struct {
+	ID          string    `db:"id"`
+	UserID      string    `db:"user_id"`
+	Action      string    `db:"action"`
+	ResourceType string   `db:"resource_type"`
+	ResourceID  string    `db:"resource_id"`
+	Details     string    `db:"details"`
+	CreatedAt   time.Time `db:"created_at"`
+}
+
+// Permission defines a granular permission
+type Permission struct {
+	ID          string `db:"id"`
+	Name        string `db:"name"`
+	Description string `db:"description"`
+	Resource    string `db:"resource"`
+	Action      string `db:"action"`
+	IsSystem    bool   `db:"is_system"`
+}
+
+// Role represents a role in the RBAC system
+type Role struct {
+	ID          string    `db:"id"`
+	Name        string    `db:"name"`
+	Description string    `db:"description"`
+	IsSystem    bool      `db:"is_system"`
+	CreatedAt   time.Time `db:"created_at"`
+}
+
+// RolePermission links roles to permissions
+type RolePermission struct {
+	RoleID      string `db:"role_id"`
+	PermissionID string `db:"permission_id"`
+}
+
+// CursorPaginationOptions represents cursor-based pagination parameters
+type CursorPaginationOptions struct {
+	Namespace    string // Filter by namespace
+	ArtifactType string // Filter by artifact type
+	Limit        int    // Number of results per page (default: 50, max: 200)
+	Cursor       string // Cursor from previous page (base64-encoded timestamp)
+	OrderBy      string // Field to order by (default: created)
+	Order        string // Order direction: "asc" or "desc" (default: desc)
+}
+
+// CursorPaginationResponse represents a paginated response with cursors
+type CursorPaginationResponse[T any] struct {
+	Items      []T      `json:"items"`
+	NextCursor string   `json:"nextCursor,omitempty"`
+	PrevCursor string   `json:"prevCursor,omitempty"`
+	HasNext    bool     `json:"hasNext"`
+	HasPrev    bool     `json:"hasPrev"`
+	Limit      int      `json:"limit"`
+}

@@ -16,9 +16,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/anthropics/cargobay/pkg/cache"
-	"github.com/anthropics/cargobay/pkg/database"
-	"github.com/anthropics/cargobay/pkg/storage"
+	"github.com/anthropics/cargobay/backend/pkg/cache"
+	"github.com/anthropics/cargobay/backend/pkg/database"
+	"github.com/anthropics/cargobay/backend/pkg/storage"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -108,7 +108,10 @@ func (p *MavenProxy) handleJAR(w http.ResponseWriter, r *http.Request) {
 	resp.Body.Read(data)
 
 	// Save to storage
-	p.storage.SaveArtifact("maven", group, artifact, version, data)
+	if _, err := p.storage.SaveArtifact("maven", group, artifact, version, data); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to save artifact: %v", err), http.StatusInternalServerError)
+		return
+	}
 
 	// Save to cache
 	p.cache.Set(fmt.Sprintf("jar:%s:%s:%s", group, artifact, version), data)
@@ -145,7 +148,10 @@ func (p *MavenProxy) handlePOM(w http.ResponseWriter, r *http.Request) {
 	resp.Body.Read(data)
 
 	// Save to storage
-	p.storage.SaveArtifact("maven", group, artifact, version, data)
+	if _, err := p.storage.SaveArtifact("maven", group, artifact, version, data); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to save artifact: %v", err), http.StatusInternalServerError)
+		return
+	}
 
 	// Save to cache
 	p.cache.Set(fmt.Sprintf("pom:%s:%s:%s", group, artifact, version), data)
@@ -197,7 +203,10 @@ func (p *MavenProxy) handleArtifactFile(w http.ResponseWriter, r *http.Request, 
 	resp.Body.Read(data)
 
 	// Save to storage
-	p.storage.SaveArtifact("maven", group, artifact, version, data)
+	if _, err := p.storage.SaveArtifact("maven", group, artifact, version, data); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to save artifact: %v", err), http.StatusInternalServerError)
+		return
+	}
 
 	// Save to cache
 	p.cache.Set(fmt.Sprintf("%s:%s:%s:%s", ext, group, artifact, version), data)

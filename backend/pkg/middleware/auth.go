@@ -6,47 +6,9 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/anthropics/cargobay/backend/pkg/database"
 )
-
-// AuthMiddleware validates authentication tokens
-func AuthMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Public endpoints that don't require auth
-		publicPaths := []string{
-			"/health",
-			"/metrics",
-			"/npm/-/",
-			"/maven/-/",
-		}
-
-		path := r.URL.Path
-		for _, pubPath := range publicPaths {
-			if strings.HasPrefix(path, pubPath) {
-				next.ServeHTTP(w, r)
-				return
-			}
-		}
-
-		// Extract and validate token
-		authHeader := r.Header.Get("Authorization")
-		if authHeader == "" {
-			http.Error(w, "Unauthorized: Missing authorization header", http.StatusUnauthorized)
-			return
-		}
-
-		// Parse Bearer token
-		if !strings.HasPrefix(authHeader, "Bearer ") {
-			http.Error(w, "Unauthorized: Invalid authorization format", http.StatusUnauthorized)
-			return
-		}
-
-		// In production, validate JWT or lookup in database
-		// For now, accept any token for development
-		// In production, use: db.ValidateAccessKey(tokenHash)
-
-		next.ServeHTTP(w, r)
-	})
-}
 
 // AuthContextKey is the key for user info in request context
 type AuthContextKey string
@@ -55,35 +17,67 @@ const AuthUserKey AuthContextKey = "auth_user"
 
 // User represents an authenticated user
 type User struct {
-	UserID     string
-	Username   string
-	Email      string
-	Roles      []string
+	UserID      string
+	Username    string
+	Email       string
+	Roles       []string
 	Permissions []string
 }
 
-// WithUser adds user info to request context
-func WithUser(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		authHeader := r.Header.Get("Authorization")
-		if authHeader == "" {
-			next.ServeHTTP(w, r)
-			return
-		}
+// RoleAndPermissionLookup provides a user's roles and their expanded
+// permission set. Implemented by *rbac.RBAC; kept as an interface here to
+// avoid an import cycle (rbac already depends on this package).
+type RoleAndPermissionLookup interface {
+	GetUserRoles(userID string) ([]string, error)
+	GetUserRolePermissions(userID string) []string
+}
 
-		// In production, decode JWT or lookup user
-		// For now, create a mock user
-		user := &User{
-			UserID:      "mock-user-id",
-			Username:    "developer",
-			Email:       "dev@example.com",
-			Roles:       []string{"developer"},
-			Permissions: []string{"read"},
-		}
+// NewAuthMiddleware validates the bearer token against access_keys, loads
+// the owning user and their RBAC roles/permissions, and attaches the result
+// to the request context. Requests without a (valid) token proceed
+// unauthenticated — routes that require a user should be wrapped in
+// RequireAuth or rbac.RequirePermission.
+func NewAuthMiddleware(db *database.Database, roles RoleAndPermissionLookup) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			authHeader := r.Header.Get("Authorization")
+			if authHeader == "" {
+				next.ServeHTTP(w, r)
+				return
+			}
 
-		ctx := context.WithValue(r.Context(), AuthUserKey, user)
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
+			token := strings.TrimPrefix(authHeader, "Bearer ")
+			if token == authHeader {
+				// Missing "Bearer " prefix — not a token we understand.
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			key, err := db.ValidateAccessKey(token)
+			if err != nil || key == nil {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			dbUser, err := db.GetUserByID(key.UserID)
+			if err != nil || dbUser == nil || !dbUser.IsActive {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			userRoles, _ := roles.GetUserRoles(dbUser.UserID)
+			user := &User{
+				UserID:      dbUser.UserID,
+				Username:    dbUser.Username,
+				Email:       dbUser.Email,
+				Roles:       userRoles,
+				Permissions: roles.GetUserRolePermissions(dbUser.UserID),
+			}
+
+			ctx := context.WithValue(r.Context(), AuthUserKey, user)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
 }
 
 // GetUser retrieves the user from request context

@@ -1,0 +1,161 @@
+# cargobay Helm chart values
+# Default configuration for deploying cargobay to Kubernetes
+
+replicaCount: 2
+
+image:
+  repository: cargobay/backend
+  tag: "1.0.0"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+
+podSecurityContext: {}
+  # fsGroup: 2000
+
+securityContext: {}
+  # capabilities:
+  #   drop:
+  #     - ALL
+  # readOnlyRootFilesystem: true
+  # runAsNonRoot: true
+  # runAsUser: 1000
+
+service:
+  type: ClusterIP
+  port: 4500
+  targetPort: 4500
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    kubernetes.io/ingress.class: nginx
+  hosts:
+    - host: cargobay.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: cargobay-tls
+      hosts:
+        - cargobay.local
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+  targetMemoryUtilizationPercentage: 80
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+# Database configuration
+database:
+  host: cargobay-postgresql
+  port: 5432
+  name: cargobay
+  user: cargobay
+  # password: ""  # Set via secret or use existing PostgreSQL
+
+# Redis configuration
+redis:
+  host: cargobay-redis-master
+  port: 6379
+
+# Elasticsearch configuration (optional)
+elasticsearch:
+  enabled: false
+  host: cargobay-elasticsearch
+  port: 9200
+  indexName: cargobay-artifacts
+
+# Storage configuration
+storage:
+  type: s3
+  config:
+    # For S3
+    endpoint: ""
+    region: us-east-1
+    bucket: cargobay-artifacts
+    # For local fallback
+    path: /app/storage
+
+# Proxy registries
+registries:
+  - id: dockerhub
+    name: Docker Hub
+    url: https://registry-1.docker.io
+    type: docker
+    proxy: true
+    enabled: true
+    priority: 100
+
+  - id: npm
+    name: NPM Registry
+    url: https://registry.npmjs.org
+    type: npm
+    proxy: true
+    enabled: true
+    priority: 100
+
+  - id: maven-central
+    name: Maven Central
+    url: https://repo1.maven.org
+    type: maven
+    proxy: true
+    enabled: true
+    priority: 100
+
+# Security settings
+security:
+  signatureVerification: false
+  enableUserManagement: true
+
+# Liveness and readiness probes
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 4500
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /health
+    port: 4500
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+# Pod disruption budget
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+
+# Service account annotations for IAM roles (AWS EKS)
+serviceAccountAnnotations: {}

@@ -1,0 +1,99 @@
+# MkDocs Configuration for cargobay
+
+```yaml
+site_name: cargobay - Universal Binary Repository Manager
+site_description: Documentation for cargobay, the unified artifact registry
+site_url: https://docs.cargobay.io
+
+repo_name: your-org/cargobay
+repo_url: https://github.com/your-org/cargobay
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  language: en
+  palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to system mode
+  features:
+    - navigation.indexes
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - content.code.copy
+    - content.code.annotate
+  icon:
+    logo: material/database
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            docstring_style: sphinx
+
+markdown_extensions:
+  - attr_list
+  - md_in_html
+  - pymdownx.arithmatex:
+      generic: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+
+nav:
+  - Home: index.md
+  - Getting Started:
+    - Quick Start: getting-started.md
+    - Installation: installation.md
+    - Configuration: configuration.md
+  - Features:
+    - Multi-format Support: features/multi-format.md
+    - Proxy Caching: features/proxy-caching.md
+    - Vulnerability Scanning: features/vulnerability-scanning.md
+    - RBAC: features/rbac.md
+    - Audit Logging: features/audit-logging.md
+  - API Reference: api.md
+  - Deployment:
+    - Docker Compose: deployment/docker-compose.md
+    - Kubernetes: deployment/kubernetes.md
+    - Helm Chart: deployment/helm.md
+    - AWS ECS: deployment/aws-ecs.md
+  - Contributing: contributing.md
+  - Changelog: changelog.md
+  - Roadmap: roadmap.md
+```
+
+## Theme
+
+Uses Material theme with dark mode support.
+
+## Plugins
+
+- search - Full-text search
+- mkdocstrings - API documentation from docstrings
+
+## Markdown Extensions
+
+- attr_list - Attribute lists for elements
+- md_in_html - Markdown in HTML
+- pymdownx.arithmatex - Math rendering
+- pymdownx.highlight - Syntax highlighting
+- pymdownx.inlinehilite - Inline code highlighting
+- pymdownx.snippets - Snippet inclusion
+- pymdownx.superfences - Advanced code blocks

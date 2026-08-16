@@ -9,11 +9,12 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
-	"github.com/anthropics/cargobay/pkg/cache"
-	"github.com/anthropics/cargobay/pkg/database"
-	"github.com/anthropics/cargobay/pkg/search"
-	"github.com/anthropics/cargobay/pkg/storage"
+	"github.com/anthropics/cargobay/backend/pkg/cache"
+	"github.com/anthropics/cargobay/backend/pkg/database"
+	"github.com/anthropics/cargobay/backend/pkg/search"
+	"github.com/anthropics/cargobay/backend/pkg/storage"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -43,7 +44,7 @@ func (pm *ProxyManager) ListRegistries(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// SearchArtifacts searches across all artifacts
+// SearchArtifacts searches across all artifacts with caching
 func (pm *ProxyManager) SearchArtifacts(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query().Get("q")
 	registryID := r.URL.Query().Get("registry")
@@ -59,6 +60,18 @@ func (pm *ProxyManager) SearchArtifacts(w http.ResponseWriter, r *http.Request) 
 		offset = 0 // default
 	}
 
+	// Generate cache key for search results
+	cacheKey := fmt.Sprintf("search:v2:%s:%s:%s:%d:%d", query, registryID, artifactType, limit, offset)
+
+	// Try to get cached results
+	var cachedResults map[string]interface{}
+	if err := pm.cache.Get(cacheKey, &cachedResults); err == nil && cachedResults != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Cache", "HIT")
+		json.NewEncoder(w).Encode(cachedResults)
+		return
+	}
+
 	artifacts, err := pm.db.SearchArtifacts(query, database.SearchOptions{
 		RegistryID:   registryID,
 		ArtifactType: artifactType,
@@ -70,14 +83,30 @@ func (pm *ProxyManager) SearchArtifacts(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	// Calculate total (for pagination metadata)
+	total := len(artifacts)
+	if total >= limit {
+		total = limit // For now, actual total would require a separate COUNT query
+	}
+
+	results := map[string]interface{}{
 		"query":    query,
 		"results":  artifacts,
-		"total":    len(artifacts),
+		"total":    total,
 		"limit":    limit,
 		"offset":   offset,
-	})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Cache", "MISS")
+
+	// Store in cache with 5-minute TTL
+	if err := pm.cache.SetWithTTL(cacheKey, results, 5*time.Minute); err != nil {
+		// Log but don't fail the request if cache fails
+		fmt.Printf("Failed to cache search results: %v\n", err)
+	}
+
+	json.NewEncoder(w).Encode(results)
 }
 
 // upstreamSearchResult is a single row in the SearchUpstream response,
@@ -102,6 +131,19 @@ func (pm *ProxyManager) SearchUpstream(w http.ResponseWriter, r *http.Request) {
 	registryID := r.URL.Query().Get("registry")
 	artifactType := r.URL.Query().Get("type")
 
+	// Generate cache key for upstream search results (5-minute TTL)
+	cacheKey := fmt.Sprintf("upstream_search:%s:%s:%s", query, registryID, artifactType)
+
+	var cachedResults map[string]interface{}
+
+	// Try to get cached upstream results
+	if err := pm.cache.Get(cacheKey, &cachedResults); err == nil && cachedResults != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Cache", "HIT")
+		json.NewEncoder(w).Encode(cachedResults)
+		return
+	}
+
 	local, err := pm.db.SearchArtifacts(query, database.SearchOptions{
 		RegistryID:   registryID,
 		ArtifactType: artifactType,
@@ -125,14 +167,23 @@ func (pm *ProxyManager) SearchUpstream(w http.ResponseWriter, r *http.Request) {
 
 	upstreamAvailable := false
 	if searcher, ok := search.Dispatch(registryID); ok && query != "" {
-		upstreamAvailable = true
-		upstreamResults, err := searcher.Search(r.Context(), query)
-		if err != nil {
-			// Upstream errors degrade to local-only results rather than
-			// failing the whole request.
-			upstreamAvailable = false
-		} else {
-			for _, res := range upstreamResults {
+		// Try to get cached upstream search results
+		var cachedUpstream []search.Result
+		upstreamCacheKey := fmt.Sprintf("upstream_results:%s:%s", query, registryID)
+
+		if err := pm.cache.Get(upstreamCacheKey, &cachedUpstream); err != nil || cachedUpstream == nil {
+			// Cache miss - make upstream API call
+			upstreamResults, err := searcher.Search(r.Context(), query)
+			if err == nil {
+				cachedUpstream = upstreamResults
+				// Cache upstream results with 1-minute TTL (data changes less frequently)
+				_ = pm.cache.SetWithTTL(upstreamCacheKey, cachedUpstream, 1*time.Minute)
+			}
+		}
+
+		if len(cachedUpstream) > 0 {
+			upstreamAvailable = true
+			for _, res := range cachedUpstream {
 				key := strings.ToLower(res.Namespace + "/" + res.Name)
 				if seen[key] {
 					continue
@@ -150,13 +201,20 @@ func (pm *ProxyManager) SearchUpstream(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	response := map[string]interface{}{
 		"query":             query,
 		"results":           results,
 		"upstreamAvailable": upstreamAvailable,
 		"total":             len(results),
-	})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Cache", "MISS")
+
+	// Cache the combined results
+	_ = pm.cache.SetWithTTL(cacheKey, response, 5*time.Minute)
+
+	json.NewEncoder(w).Encode(response)
 }
 
 // GetArtifactInfo returns artifact information
@@ -166,7 +224,7 @@ func (pm *ProxyManager) GetArtifactInfo(w http.ResponseWriter, r *http.Request) 
 	version := chi.URLParam(r, "version")
 	registryID := r.URL.Query().Get("registry")
 
-	artifact, err := pm.db.GetArtifact(registryID, namespace, artifactName, version)
+	artifact, err := pm.db.GetArtifactByParams(registryID, namespace, artifactName, version)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to get artifact: %v", err), http.StatusInternalServerError)
 		return
@@ -194,7 +252,7 @@ func (pm *ProxyManager) DownloadArtifact(w http.ResponseWriter, r *http.Request)
 	version := chi.URLParam(r, "version")
 	registryID := r.URL.Query().Get("registry")
 
-	artifact, err := pm.db.GetArtifact(registryID, namespace, artifactName, version)
+	artifact, err := pm.db.GetArtifactByParams(registryID, namespace, artifactName, version)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to get artifact: %v", err), http.StatusInternalServerError)
 		return

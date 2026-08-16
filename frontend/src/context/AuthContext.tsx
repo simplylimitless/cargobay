@@ -1,55 +1,112 @@
-import { createContext, useContext, useState, ReactNode } from 'react'
+import { createContext, useContext, useState, useEffect, ReactNode } from 'react'
 
-export type Role = 'admin' | 'user'
+export type Role = 'admin' | 'developer' | 'viewer' | 'publisher' | 'auditor'
 
-export interface MockUser {
+export interface User {
   id: string
   username: string
   email: string
-  role: Role
+  roles: Role[]
+  permissions: string[]
 }
 
-export const MOCK_USERS: MockUser[] = [
-  { id: 'admin', username: 'admin', email: 'admin@cargobay.dev', role: 'admin' },
-  { id: 'alice', username: 'alice', email: 'alice@cargobay.dev', role: 'user' },
-  { id: 'bob', username: 'bob', email: 'bob@cargobay.dev', role: 'user' },
-]
-
-const STORAGE_KEY = 'cargobay_auth_user'
+const STORAGE_KEY = 'cargobay_access_token'
+const STORAGE_USER_KEY = 'cargobay_user'
 
 interface AuthContextValue {
-  currentUser: MockUser | null
+  currentUser: User | null
+  token: string | null
   isAdmin: boolean
-  login: (userId: string) => void
+  login: (username: string, password: string) => Promise<void>
   logout: () => void
   canManage: (uploadedBy: string) => boolean
 }
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined)
 
-function loadStoredUser(): MockUser | null {
-  const raw = localStorage.getItem(STORAGE_KEY)
+function loadStoredUser(): User | null {
+  const raw = localStorage.getItem(STORAGE_USER_KEY)
   if (!raw) return null
-  const found = MOCK_USERS.find((u) => u.id === raw)
-  return found ?? null
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return null
+  }
+}
+
+function loadToken(): string | null {
+  return localStorage.getItem(STORAGE_KEY)
 }
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [currentUser, setCurrentUser] = useState<MockUser | null>(loadStoredUser)
+  const [currentUser, setCurrentUser] = useState<User | null>(loadStoredUser)
+  const [token, setToken] = useState<string | null>(loadToken())
 
-  const login = (userId: string) => {
-    const user = MOCK_USERS.find((u) => u.id === userId)
-    if (!user) return
-    setCurrentUser(user)
-    localStorage.setItem(STORAGE_KEY, user.id)
+  useEffect(() => {
+    // Check if we have a token but no user - this can happen on refresh
+    if (token && !currentUser) {
+      const user = loadStoredUser()
+      if (user) {
+        setCurrentUser(user)
+      }
+    }
+  }, [token])
+
+  const login = async (username: string, password: string) => {
+    try {
+      const response = await fetch('/api/v1/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password }),
+      })
+
+      const data = await response.json()
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Login failed')
+      }
+
+      if (data.accessToken) {
+        setToken(data.accessToken)
+        if (data.user) {
+          const user: User = {
+            id: data.user.userId,
+            username: data.user.username,
+            email: data.user.email,
+            roles: data.user.roles || [],
+            permissions: data.user.permissions || [],
+          }
+          setCurrentUser(user)
+          localStorage.setItem(STORAGE_KEY, data.accessToken)
+          localStorage.setItem(STORAGE_USER_KEY, JSON.stringify(user))
+        }
+      }
+    } catch (error) {
+      console.error('Login error:', error)
+      throw error
+    }
   }
 
   const logout = () => {
+    // Call the logout endpoint to invalidate the token
+    const currentToken = localStorage.getItem(STORAGE_KEY)
+    if (currentToken) {
+      fetch('/api/v1/auth/logout', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${currentToken}`,
+        },
+      }).catch(() => {}) // Ignore errors on logout
+    }
+
+    setToken(null)
     setCurrentUser(null)
     localStorage.removeItem(STORAGE_KEY)
+    localStorage.removeItem(STORAGE_USER_KEY)
   }
 
-  const isAdmin = currentUser?.role === 'admin'
+  const isAdmin = currentUser?.roles.includes('admin') || false
 
   const canManage = (uploadedBy: string) => {
     if (!currentUser) return false
@@ -57,7 +114,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }
 
   return (
-    <AuthContext.Provider value={{ currentUser, isAdmin, login, logout, canManage }}>
+    <AuthContext.Provider value={{ currentUser, token, isAdmin, login, logout, canManage }}>
       {children}
     </AuthContext.Provider>
   )

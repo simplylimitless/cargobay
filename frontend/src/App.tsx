@@ -9,6 +9,11 @@ import { SearchResults } from './pages/SearchResults'
 import { Login } from './pages/Login'
 import { Admin } from './pages/Admin'
 import { GettingStarted } from './pages/GettingStarted'
+import { ArtifactUpload } from './pages/ArtifactUpload'
+import { ArtifactBrowse } from './pages/ArtifactBrowse'
+import { RegistryStatus } from './pages/RegistryStatus'
+import { VulnerabilityResults } from './pages/VulnerabilityResults'
+import { AuditLogs } from './pages/AuditLogs'
 
 function App() {
   return (
@@ -27,6 +32,15 @@ function App() {
           <Route path="/login" element={<Login />} />
           <Route path="/admin" element={<Admin />} />
           <Route path="/getting-started" element={<GettingStarted />} />
+          <Route path="/upload" element={<ArtifactUpload />} />
+          <Route path="/browse" element={<ArtifactBrowse />} />
+          <Route path="/browse/:registryId" element={<ArtifactBrowse />} />
+          <Route path="/browse/:registryId/:artifactType" element={<ArtifactBrowse />} />
+          <Route path="/browse/:registryId/:artifactType/:namespace" element={<ArtifactBrowse />} />
+          <Route path="/registries/status" element={<RegistryStatus />} />
+          <Route path="/vulnerabilities" element={<VulnerabilityResults />} />
+          <Route path="/vulnerabilities/:artifactId" element={<VulnerabilityResults />} />
+          <Route path="/audit-logs" element={<AuditLogs />} />
         </Routes>
       </main>
     </div>

@@ -1,0 +1,17 @@
+# cargobay PersistentVolume (for local development)
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: {{ include "cargobay.fullname" . }}-storage-pv
+  labels:
+    {{- include "cargobay.labels" . | nindent 4 }}
+spec:
+  capacity:
+    storage: {{ .Values.storage.size | default "10Gi" }}
+  accessModes:
+    - ReadWriteOnce
+  {{- if .Values.storage.className }}
+  storageClassName: {{ .Values.storage.className }}
+  {{- end }}
+  hostPath:
+    path: {{ .Values.storage.hostPath | default "/mnt/data/cargobay" }}

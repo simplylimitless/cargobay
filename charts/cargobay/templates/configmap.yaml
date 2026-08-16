@@ -1,0 +1,17 @@
+# cargobay ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "cargobay.fullname" . }}-config
+  labels:
+    {{- include "cargobay.labels" . | nindent 4 }}
+data:
+  REGISTRY_ID: {{ .Values.registries | default "dockerhub" | quote }}
+  {{- range .Values.registries }}
+  REGISTRY_{{ .id | upper }}_NAME: {{ .name | quote }}
+  REGISTRY_{{ .id | upper }}_URL: {{ .url | quote }}
+  REGISTRY_{{ .id | upper }}_TYPE: {{ .type | quote }}
+  REGISTRY_{{ .id | upper }}_PROXY: {{ .proxy | quote }}
+  REGISTRY_{{ .id | upper }}_ENABLED: {{ .enabled | quote }}
+  REGISTRY_{{ .id | upper }}_PRIORITY: {{ .priority | quote }}
+  {{- end }}

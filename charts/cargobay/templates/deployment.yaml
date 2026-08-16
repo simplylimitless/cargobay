@@ -1,0 +1,103 @@
+# cargobay Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "cargobay.fullname" . }}
+  labels:
+    {{- include "cargobay.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "cargobay.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "cargobay.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "cargobay.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.targetPort }}
+              protocol: TCP
+          env:
+            - name: PORT
+              value: "{{ .Values.service.targetPort }}"
+            - name: HOST
+              value: "0.0.0.0"
+            - name: DATABASE_URL
+              value: "postgres://{{ .Values.database.user }}:{{ .Values.database.password }}@{{ .Values.database.host }}:{{ .Values.database.port }}/{{ .Values.database.name }}"
+            - name: REDIS_URL
+              value: "redis://{{ .Values.redis.host }}:{{ .Values.redis.port }}/0"
+            {{- if .Values.elasticsearch.enabled }}
+            - name: ELASTICSEARCH_URL
+              value: "http://{{ .Values.elasticsearch.host }}:{{ .Values.elasticsearch.port }}"
+            - name: ELASTICSEARCH_INDEX
+              value: "{{ .Values.elasticsearch.indexName }}"
+            {{- end }}
+            - name: STORAGE_TYPE
+              value: "{{ .Values.storage.type }}"
+            - name: STORAGE_CONFIG
+              value: |
+                {{- if eq .Values.storage.type "s3" }}
+                endpoint: {{ .Values.storage.config.endpoint }}
+                region: {{ .Values.storage.config.region }}
+                bucket: {{ .Values.storage.config.bucket }}
+                {{- else if eq .Values.storage.type "local" }}
+                path: {{ .Values.storage.config.path }}
+                {{- end }}
+          envFrom:
+            {{- if .Values.configSecret }}
+            - secretRef:
+                name: {{ .Values.configSecret }}
+            {{- end }}
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: storage
+              mountPath: /app/storage
+              subPath: {{ .Values.storage.config.path | default "storage" }}
+            {{- if .Values.configSecret }}
+            - name: config
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+            {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: storage
+          persistentVolumeClaim:
+            claimName: {{ include "cargobay.fullname" . }}-storage
+        {{- if .Values.configSecret }}
+        - name: config
+          secret:
+            secretName: {{ .Values.configSecret }}
+        {{- end }}

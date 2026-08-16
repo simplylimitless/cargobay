@@ -30,6 +30,12 @@ func New(storageType string, config map[string]string) (StorageAdapter, error) {
 	switch storageType {
 	case "", "local":
 		return NewLocalAdapter(config)
+	case "s3":
+		return NewS3Adapter(config)
+	case "gcs":
+		return NewGCSAdapter(config)
+	case "azure":
+		return NewAzureAdapter(config)
 	default:
 		return nil, fmt.Errorf("unsupported storage type: %s", storageType)
 	}

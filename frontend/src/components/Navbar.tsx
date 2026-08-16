@@ -45,21 +45,64 @@ export function Navbar() {
             >
               Guide
             </Link>
+            {currentUser && (
+              <>
+                <Link
+                  to="/upload"
+                  className="hidden md:block px-3 py-1.5 text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-800 rounded-lg transition-all"
+                >
+                  Upload
+                </Link>
+                <Link
+                  to="/browse"
+                  className="hidden md:block px-3 py-1.5 text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-800 rounded-lg transition-all"
+                >
+                  Browse
+                </Link>
+                <Link
+                  to="/registries/status"
+                  className="hidden md:block px-3 py-1.5 text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-800 rounded-lg transition-all"
+                >
+                  Status
+                </Link>
+              </>
+            )}
             {isAdmin && (
-              <Link
-                to="/admin"
-                className="hidden md:block px-3 py-1.5 text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-800 rounded-lg transition-all"
-              >
-                Admin
-              </Link>
+              <div className="hidden md:flex gap-1">
+                <Link
+                  to="/admin"
+                  className="px-3 py-1.5 text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-800 rounded-lg transition-all"
+                >
+                  Admin
+                </Link>
+                <Link
+                  to="/vulnerabilities"
+                  className="px-3 py-1.5 text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-800 rounded-lg transition-all"
+                >
+                  Vulnerabilities
+                </Link>
+                <Link
+                  to="/audit-logs"
+                  className="px-3 py-1.5 text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-800 rounded-lg transition-all"
+                >
+                  Audit
+                </Link>
+              </div>
             )}
             {currentUser ? (
               <div className="flex items-center gap-2">
                 <span className="hidden md:flex items-center gap-1.5 px-3 py-1.5 bg-gray-800 rounded-lg text-sm">
                   <span className="text-gray-200 font-medium">{currentUser.username}</span>
-                  <span className={`badge ${currentUser.role === 'admin' ? 'badge-warning' : 'badge-info'}`}>
-                    {currentUser.role}
-                  </span>
+                  {currentUser.roles.length > 0 && (
+                    <span className={`badge ${
+                      currentUser.roles.includes('admin') ? 'badge-warning' :
+                      currentUser.roles.includes('developer') ? 'badge-blue' :
+                      currentUser.roles.includes('publisher') ? 'badge-green' :
+                      currentUser.roles.includes('auditor') ? 'badge-purple' : 'badge-info'
+                    }`}>
+                      {currentUser.roles[0]}
+                    </span>
+                  )}
                 </span>
                 <button onClick={handleLogout} className="btn btn-secondary btn-sm">
                   Log out

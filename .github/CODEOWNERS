@@ -1,0 +1,26 @@
+# Code owners for cargobay
+# This file specifies who is responsible for which parts of the codebase.
+
+# Backend Go code
+/backend/ @anthropics/cargobay-maintainers @anthropics/go-team
+
+# Frontend React code
+/frontend/ @anthropics/cargobay-maintainers @anthropics/frontend-team
+
+# Documentation
+/*.md @anthropics/cargobay-maintainers @anthropics/docs-team
+
+# Helm chart
+/charts/ @anthropics/cargobay-maintainers @anthropics/infrastructure-team
+
+# Kubernetes manifests
+/k8s/ @anthropics/cargobay-maintainers @anthropics/infrastructure-team
+
+# CI/CD
+/.github/workflows/ @anthropics/cargobay-maintainers @anthropics/devops-team
+
+# Tests
+/tests/ @anthropics/cargobay-maintainers @anthropics/qe-team
+
+# Security-related files
+SECURITY.md @anthropics/cargobay-maintainers @anthropics/security-team

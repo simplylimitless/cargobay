@@ -15,9 +15,9 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/anthropics/cargobay/pkg/cache"
-	"github.com/anthropics/cargobay/pkg/database"
-	"github.com/anthropics/cargobay/pkg/storage"
+	"github.com/anthropics/cargobay/backend/pkg/cache"
+	"github.com/anthropics/cargobay/backend/pkg/database"
+	"github.com/anthropics/cargobay/backend/pkg/storage"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -217,14 +217,26 @@ func (p *NPMProxy) handleTarball(w http.ResponseWriter, r *http.Request) {
 	pkgName := chi.URLParam(r, "pkgName")
 	version := chi.URLParam(r, "version")
 
-	// Try cache first
-	if data, err := p.storage.GetArtifact("npm", "", pkgName, version); err == nil && data != nil {
+	// Try to get from local storage first
+	data, err := p.storage.GetArtifact("npm", "", pkgName, version)
+	if err == nil && data != nil {
+		// Check if upstream has a newer version by comparing digest
+		if updated, err := p.fetchIfUpdated("npm", "", pkgName, version); err == nil && updated != nil {
+			// Upstream has a newer version, use the updated data
+			data = updated
+			// Save updated data to storage
+			if _, err := p.storage.SaveArtifact("npm", "", pkgName, version, data); err != nil {
+				// Log but don't fail - we still have the local data
+				fmt.Printf("Failed to save updated artifact: %v\n", err)
+			}
+		}
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s-%s.tgz", pkgName, version))
 		w.Write(data)
 		return
 	}
 
+	// Local artifact not found or failed to check for updates
 	// Fetch from upstream
 	tarballURL, err := p.getTarballURL(pkgName, version)
 	if err != nil {
@@ -239,11 +251,14 @@ func (p *NPMProxy) handleTarball(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	data := make([]byte, resp.ContentLength)
+	data = make([]byte, resp.ContentLength)
 	resp.Body.Read(data)
 
 	// Save to storage
-	p.storage.SaveArtifact("npm", "", pkgName, version, data)
+	if _, err := p.storage.SaveArtifact("npm", "", pkgName, version, data); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to save artifact: %v", err), http.StatusInternalServerError)
+		return
+	}
 
 	// Save to cache
 	p.cacheSet(fmt.Sprintf("tarball:%s:%s", pkgName, version), data)
@@ -282,7 +297,10 @@ func (p *NPMProxy) handleScopedTarball(w http.ResponseWriter, r *http.Request) {
 	resp.Body.Read(data)
 
 	// Save to storage
-	p.storage.SaveArtifact("npm", scope, pkgName, version, data)
+	if _, err := p.storage.SaveArtifact("npm", scope, pkgName, version, data); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to save artifact: %v", err), http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s-%s.tgz", packageName, version))

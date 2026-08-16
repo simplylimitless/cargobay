@@ -1,0 +1,88 @@
+# .gitignore
+
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Dependency directories (remove the comment below to ignore it)
+# go/pkg/mod
+
+# Go workspace file
+go.work
+
+# Go mod files
+go.sum
+go.mod
+
+# Dependency management
+vendor/
+
+# Node modules
+node_modules/
+
+# Frontend build output
+dist/
+build/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Coverage reports
+coverage/
+*.coverage
+
+# Helm local cache
+.helm/
+helm/
+
+# Kubernetes manifests
+kube/
+k8s/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Docker volumes
+docker-data/
+
+# Security sensitive files
+credentials.json
+*.pem
+*.key
+secrets/
+
+# User data
+user-data/
+*.csv

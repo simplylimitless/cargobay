@@ -16,10 +16,10 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/anthropics/cargobay/pkg/cache"
-	"github.com/anthropics/cargobay/pkg/database"
-	"github.com/anthropics/cargobay/pkg/middleware"
-	"github.com/anthropics/cargobay/pkg/storage"
+	"github.com/anthropics/cargobay/backend/pkg/cache"
+	"github.com/anthropics/cargobay/backend/pkg/database"
+	"github.com/anthropics/cargobay/backend/pkg/middleware"
+	"github.com/anthropics/cargobay/backend/pkg/storage"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -196,7 +196,10 @@ func (p *DockerProxy) handlePutManifest(w http.ResponseWriter, r *http.Request) 
 	digest := fmt.Sprintf("sha256:%x", body)
 
 	// Save manifest to storage
-	p.storage.SaveArtifact("docker", repository, reference, "latest", body)
+	if _, err := p.storage.SaveArtifact("docker", repository, reference, "latest", body); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to save manifest: %v", err), http.StatusInternalServerError)
+		return
+	}
 
 	// Save to database
 	artifact := &database.ArtifactMetadata{
