@@ -18,7 +18,7 @@ require (
 	github.com/redis/go-redis/v9 v9.3.0
 	github.com/spf13/cobra v1.8.0
 	github.com/stretchr/testify v1.11.1
-	golang.org/x/crypto v0.54.0
+	golang.org/x/crypto v0.55.0
 	golang.org/x/exp v0.0.0-20260813180055-c1d0aacb2297
 	google.golang.org/api v0.293.0
 	gopkg.in/yaml.v3 v3.0.1
@@ -91,7 +91,7 @@ require (
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/text v0.40.0 // indirect
+	golang.org/x/text v0.41.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	google.golang.org/genproto v0.0.0-20260519071638-aa98bba5eb94 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260630182238-925bb5da69e7 // indirect
