@@ -16,9 +16,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/anthropics/cargobay/backend/pkg/cache"
-	"github.com/anthropics/cargobay/backend/pkg/database"
-	"github.com/anthropics/cargobay/backend/pkg/storage"
+	"github.com/simplylimitless/cargobay/backend/pkg/cache"
+	"github.com/simplylimitless/cargobay/backend/pkg/database"
+	proxypkg "github.com/simplylimitless/cargobay/backend/pkg/proxy"
+	"github.com/simplylimitless/cargobay/backend/pkg/rbac"
+	"github.com/simplylimitless/cargobay/backend/pkg/storage"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -32,7 +34,7 @@ type PyPIProxy struct {
 }
 
 // NewPyPIProxy creates a new PyPI proxy instance
-func NewPyPIProxy(db *database.Database, storage storage.StorageAdapter, cache *cache.Cache, registries []database.RegistryConfig) chi.Router {
+func NewPyPIProxy(db *database.Database, storage storage.StorageAdapter, cache *cache.Cache, rbacMgr *rbac.RBAC, registries []database.RegistryConfig) chi.Router {
 	r := chi.NewRouter()
 
 	proxy := &PyPIProxy{
@@ -42,6 +44,8 @@ func NewPyPIProxy(db *database.Database, storage storage.StorageAdapter, cache *
 		registries: registries,
 		registry:   "pypi",
 	}
+
+	r.Use(proxypkg.RequireReadAccess(db, rbacMgr, registries, "pypi"))
 
 	// PyPI Simple API routes
 	// Root: /simple/ - lists all available packages
@@ -76,7 +80,7 @@ func (p *PyPIProxy) handleSimpleRoot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get packages from database
-	artifacts, err := p.db.ListArtifacts("pypi", database.ListOptions{
+	artifacts, err := p.db.ListArtifacts(proxypkg.TargetFromContext(r, "pypi").Label, database.ListOptions{
 		ArtifactType: "pypi",
 		Limit:        1000,
 	})
@@ -112,7 +116,7 @@ func (p *PyPIProxy) handlePackageIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get versions from database
-	artifacts, err := p.db.ListArtifacts("pypi", database.ListOptions{
+	artifacts, err := p.db.ListArtifacts(proxypkg.TargetFromContext(r, "pypi").Label, database.ListOptions{
 		ArtifactType: "pypi",
 		Limit:        1000,
 	})
@@ -151,7 +155,8 @@ func (p *PyPIProxy) handlePackageVersion(w http.ResponseWriter, r *http.Request)
 
 	// If not found in database, fetch from upstream
 	if artifact == nil {
-		artifact, err = p.fetchPackageFromUpstream(packageName, version)
+		t := proxypkg.TargetFromContext(r, "pypi")
+		artifact, err = p.fetchPackageFromUpstream(t.Reg, t.Label, packageName, version)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Failed to fetch package: %v", err), http.StatusBadGateway)
 			return
@@ -190,7 +195,7 @@ func (p *PyPIProxy) handlePackageFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Fetch from upstream
-	data, err = p.fetchPackageFileFromUpstream(packageName, version, fileName)
+	data, err = p.fetchPackageFileFromUpstream(proxypkg.TargetFromContext(r, "pypi").Reg, packageName, version, fileName)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to download package: %v", err), http.StatusBadGateway)
 		return
@@ -234,19 +239,20 @@ func (p *PyPIProxy) handleLegacyPackageVersion(w http.ResponseWriter, r *http.Re
 }
 
 // fetchPackageFromUpstream fetches package metadata from PyPI
-func (p *PyPIProxy) fetchPackageFromUpstream(packageName, version string) (*database.ArtifactMetadata, error) {
-	// Find upstream registry
+func (p *PyPIProxy) fetchPackageFromUpstream(reg *database.RegistryConfig, registryLabel, packageName, version string) (*database.ArtifactMetadata, error) {
 	upstream := "https://pypi.org"
-	for _, reg := range p.registries {
-		if reg.Type == "pypi" && reg.Proxy {
-			upstream = reg.URL
-			break
-		}
+	if reg != nil && reg.Proxy && reg.URL != "" {
+		upstream = reg.URL
 	}
 
 	// Get package info from PyPI API
 	infoURL := fmt.Sprintf("%s/pypi/%s/json", upstream, packageName)
-	resp, err := http.Get(infoURL)
+	infoReq, err := http.NewRequest(http.MethodGet, infoURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	proxypkg.ApplyUpstreamAuth(infoReq, reg)
+	resp, err := http.DefaultClient.Do(infoReq)
 	if err != nil {
 		return nil, err
 	}
@@ -275,8 +281,8 @@ func (p *PyPIProxy) fetchPackageFromUpstream(packageName, version string) (*data
 
 	// Create artifact metadata
 	artifact := &database.ArtifactMetadata{
-		ID:              fmt.Sprintf("pypi:%s:%s", packageName, version),
-		RegistryID:      "pypi",
+		ID:              fmt.Sprintf("pypi:%s:%s:%s", registryLabel, packageName, version),
+		RegistryID:      registryLabel,
 		ArtifactType:    "pypi",
 		Namespace:       "",
 		ArtifactName:    packageName,
@@ -313,21 +319,20 @@ func (p *PyPIProxy) fetchPackageFromUpstream(packageName, version string) (*data
 }
 
 // fetchPackageFileFromUpstream fetches a package file from PyPI
-func (p *PyPIProxy) fetchPackageFileFromUpstream(packageName, version, fileName string) ([]byte, error) {
-	// Find upstream registry
+func (p *PyPIProxy) fetchPackageFileFromUpstream(reg *database.RegistryConfig, packageName, version, fileName string) ([]byte, error) {
 	upstream := "https://files.pythonhosted.org"
-	for _, reg := range p.registries {
-		if reg.Type == "pypi" && reg.Proxy {
-			if strings.HasPrefix(reg.URL, "http") {
-				upstream = reg.URL
-			}
-			break
-		}
+	if reg != nil && reg.Proxy && strings.HasPrefix(reg.URL, "http") {
+		upstream = reg.URL
 	}
 
 	// PyPI file URL format
 	fileURL := fmt.Sprintf("%s/packages/%s/%s/%s", upstream, packageName[0:1], packageName, fileName)
-	resp, err := http.Get(fileURL)
+	fileReq, err := http.NewRequest(http.MethodGet, fileURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	proxypkg.ApplyUpstreamAuth(fileReq, reg)
+	resp, err := http.DefaultClient.Do(fileReq)
 	if err != nil {
 		return nil, err
 	}

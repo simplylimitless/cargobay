@@ -493,6 +493,31 @@ func (db *Database) GetUserByUsername(username string) (*UserRepository, error) 
 	return &user, nil
 }
 
+// GetUserByEmail retrieves a user by email
+func (db *Database) GetUserByEmail(email string) (*UserRepository, error) {
+	row := db.pool.QueryRow(
+		context.Background(),
+		`SELECT u.user_id, u.username, u.email, u.password_hash, u.created_at, u.last_login, u.is_active,
+			 COALESCE(json_agg(ur.role_id) FILTER (WHERE ur.role_id IS NOT NULL), '[]'::json) as roles
+		 FROM users u
+		 LEFT JOIN user_roles ur ON u.user_id = ur.user_id
+		 WHERE u.email = $1
+		 GROUP BY u.user_id`,
+		email,
+	)
+
+	var user UserRepository
+	err := row.Scan(&user.UserID, &user.Username, &user.Email, &user.PasswordHash,
+		&user.CreatedAt, &user.LastLogin, &user.IsActive, &user.Roles)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get user: %w", err)
+	}
+	return &user, nil
+}
+
 // CreateUser creates a new user with bcrypt password hash verification
 func (db *Database) CreateUser(username, email, passwordHash string, roles []string) (*UserRepository, error) {
 	userID := generateUUID()
@@ -546,6 +571,32 @@ func (db *Database) SetUserActive(userID string, isActive bool) error {
 	)
 	if err != nil {
 		return fmt.Errorf("failed to update user active status: %w", err)
+	}
+	return nil
+}
+
+// UpdateUserProfile updates a user's username and email
+func (db *Database) UpdateUserProfile(userID, username, email string) error {
+	_, err := db.pool.Exec(
+		context.Background(),
+		`UPDATE users SET username = $1, email = $2 WHERE user_id = $3`,
+		username, email, userID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update user profile: %w", err)
+	}
+	return nil
+}
+
+// UpdateUserPassword updates a user's password hash
+func (db *Database) UpdateUserPassword(userID, passwordHash string) error {
+	_, err := db.pool.Exec(
+		context.Background(),
+		`UPDATE users SET password_hash = $1 WHERE user_id = $2`,
+		passwordHash, userID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update user password: %w", err)
 	}
 	return nil
 }
@@ -639,7 +690,9 @@ func (db *Database) ListUserAccessKeys(userID string) ([]AccessKey, error) {
 func (db *Database) ListRegistries() ([]RegistryConfig, error) {
 	rows, err := db.pool.Query(
 		context.Background(),
-		`SELECT id, name, url, type, enabled, priority FROM registries WHERE enabled = TRUE ORDER BY priority ASC`,
+		`SELECT id, name, url, type, enabled, priority, private, proxy, COALESCE(host, ''),
+		        upstream_auth_type, COALESCE(upstream_username, ''), (upstream_secret IS NOT NULL AND upstream_secret != '')
+		 FROM registries WHERE enabled = TRUE ORDER BY priority ASC`,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list registries: %w", err)
@@ -649,7 +702,8 @@ func (db *Database) ListRegistries() ([]RegistryConfig, error) {
 	var registries []RegistryConfig
 	for rows.Next() {
 		var r RegistryConfig
-		err := rows.Scan(&r.ID, &r.Name, &r.URL, &r.Type, &r.Enabled, &r.Priority)
+		err := rows.Scan(&r.ID, &r.Name, &r.URL, &r.Type, &r.Enabled, &r.Priority, &r.Private, &r.Proxy, &r.Host,
+			&r.UpstreamAuthType, &r.UpstreamUsername, &r.HasUpstreamSecret)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan registry: %w", err)
 		}
@@ -662,35 +716,80 @@ func (db *Database) ListRegistries() ([]RegistryConfig, error) {
 func (db *Database) GetRegistry(id string) (*RegistryConfig, error) {
 	row := db.pool.QueryRow(
 		context.Background(),
-		`SELECT id, name, url, type, enabled, priority FROM registries WHERE id = $1`,
+		`SELECT id, name, url, type, enabled, priority, private, proxy, COALESCE(host, ''),
+		        upstream_auth_type, COALESCE(upstream_username, ''), COALESCE(upstream_secret, '')
+		 FROM registries WHERE id = $1`,
 		id,
 	)
 
 	var r RegistryConfig
-	err := row.Scan(&r.ID, &r.Name, &r.URL, &r.Type, &r.Enabled, &r.Priority)
+	err := row.Scan(&r.ID, &r.Name, &r.URL, &r.Type, &r.Enabled, &r.Priority, &r.Private, &r.Proxy, &r.Host,
+		&r.UpstreamAuthType, &r.UpstreamUsername, &r.UpstreamSecret)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("failed to get registry: %w", err)
 	}
+	r.HasUpstreamSecret = r.UpstreamSecret != ""
 	return &r, nil
 }
 
-// SaveRegistry saves registry configuration
+// GetRegistryByHost retrieves the registry bound to the given hostname (no
+// port), if any. Used for virtual-host-style routing so downstream clients
+// can address a specific registry purely by the hostname they connect to,
+// with no path prefix or repository/package renaming.
+func (db *Database) GetRegistryByHost(host string) (*RegistryConfig, error) {
+	if host == "" {
+		return nil, nil
+	}
+	row := db.pool.QueryRow(
+		context.Background(),
+		`SELECT id, name, url, type, enabled, priority, private, proxy, COALESCE(host, ''),
+		        upstream_auth_type, COALESCE(upstream_username, ''), COALESCE(upstream_secret, '')
+		 FROM registries WHERE host = $1 AND enabled = TRUE`,
+		host,
+	)
+
+	var r RegistryConfig
+	err := row.Scan(&r.ID, &r.Name, &r.URL, &r.Type, &r.Enabled, &r.Priority, &r.Private, &r.Proxy, &r.Host,
+		&r.UpstreamAuthType, &r.UpstreamUsername, &r.UpstreamSecret)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get registry by host: %w", err)
+	}
+	r.HasUpstreamSecret = r.UpstreamSecret != ""
+	return &r, nil
+}
+
+// SaveRegistry saves registry configuration. UpstreamSecret is only written
+// when non-empty, so editing a registry without retyping its credential
+// (the standard "leave blank to keep existing" UX) doesn't clobber it.
 func (db *Database) SaveRegistry(config *RegistryConfig) error {
+	if config.UpstreamAuthType == "" {
+		config.UpstreamAuthType = "none"
+	}
 	_, err := db.pool.Exec(
 		context.Background(),
-		`INSERT INTO registries (id, name, url, type, enabled, priority)
-		 VALUES ($1, $2, $3, $4, $5, $6)
+		`INSERT INTO registries (id, name, url, type, enabled, priority, private, proxy, host, upstream_auth_type, upstream_username, upstream_secret)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''), $10, NULLIF($11, ''), NULLIF($12, ''))
 		 ON CONFLICT (id)
 		 DO UPDATE SET
 		   name = EXCLUDED.name,
 		   url = EXCLUDED.url,
 		   type = EXCLUDED.type,
 		   enabled = EXCLUDED.enabled,
-		   priority = EXCLUDED.priority`,
-		config.ID, config.Name, config.URL, config.Type, config.Enabled, config.Priority,
+		   priority = EXCLUDED.priority,
+		   private = EXCLUDED.private,
+		   proxy = EXCLUDED.proxy,
+		   host = EXCLUDED.host,
+		   upstream_auth_type = EXCLUDED.upstream_auth_type,
+		   upstream_username = EXCLUDED.upstream_username,
+		   upstream_secret = COALESCE(EXCLUDED.upstream_secret, registries.upstream_secret)`,
+		config.ID, config.Name, config.URL, config.Type, config.Enabled, config.Priority, config.Private, config.Proxy, config.Host,
+		config.UpstreamAuthType, config.UpstreamUsername, config.UpstreamSecret,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to save registry: %w", err)
@@ -705,6 +804,80 @@ func (db *Database) DeleteRegistry(id string) error {
 		return fmt.Errorf("failed to delete registry: %w", err)
 	}
 	return nil
+}
+
+// GrantRegistryAccess creates or updates a user's read/publish grant on a
+// private registry.
+func (db *Database) GrantRegistryAccess(access *RegistryAccess) error {
+	_, err := db.pool.Exec(
+		context.Background(),
+		`INSERT INTO registry_access (registry_id, user_id, can_read, can_publish)
+		 VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (registry_id, user_id)
+		 DO UPDATE SET
+		   can_read = EXCLUDED.can_read,
+		   can_publish = EXCLUDED.can_publish`,
+		access.RegistryID, access.UserID, access.CanRead, access.CanPublish,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to grant registry access: %w", err)
+	}
+	return nil
+}
+
+// RevokeRegistryAccess removes a user's grant on a registry.
+func (db *Database) RevokeRegistryAccess(registryID, userID string) error {
+	_, err := db.pool.Exec(
+		context.Background(),
+		`DELETE FROM registry_access WHERE registry_id = $1 AND user_id = $2`,
+		registryID, userID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to revoke registry access: %w", err)
+	}
+	return nil
+}
+
+// GetRegistryAccess retrieves a single user's grant on a registry, if any.
+func (db *Database) GetRegistryAccess(registryID, userID string) (*RegistryAccess, error) {
+	row := db.pool.QueryRow(
+		context.Background(),
+		`SELECT registry_id, user_id, can_read, can_publish, granted_at FROM registry_access WHERE registry_id = $1 AND user_id = $2`,
+		registryID, userID,
+	)
+
+	var a RegistryAccess
+	err := row.Scan(&a.RegistryID, &a.UserID, &a.CanRead, &a.CanPublish, &a.GrantedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get registry access: %w", err)
+	}
+	return &a, nil
+}
+
+// ListRegistryAccessForRegistry lists all user grants on a registry.
+func (db *Database) ListRegistryAccessForRegistry(registryID string) ([]RegistryAccess, error) {
+	rows, err := db.pool.Query(
+		context.Background(),
+		`SELECT registry_id, user_id, can_read, can_publish, granted_at FROM registry_access WHERE registry_id = $1 ORDER BY granted_at ASC`,
+		registryID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list registry access: %w", err)
+	}
+	defer rows.Close()
+
+	var grants []RegistryAccess
+	for rows.Next() {
+		var a RegistryAccess
+		if err := rows.Scan(&a.RegistryID, &a.UserID, &a.CanRead, &a.CanPublish, &a.GrantedAt); err != nil {
+			return nil, fmt.Errorf("failed to scan registry access: %w", err)
+		}
+		grants = append(grants, a)
+	}
+	return grants, rows.Err()
 }
 
 // GenerateAuditLog creates an audit log entry
@@ -1053,6 +1226,16 @@ func (db *Database) SaveSignature(artifactID string, signature *Signature) error
 	return nil
 }
 
+// CountUsers returns the total number of users in the system
+func (db *Database) CountUsers() (int, error) {
+	var count int
+	err := db.pool.QueryRow(context.Background(), `SELECT COUNT(*) FROM users`).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count users: %w", err)
+	}
+	return count, nil
+}
+
 // ListUsers returns all users
 func (db *Database) ListUsers() ([]UserRepository, error) {
 	rows, err := db.pool.Query(
@@ -1337,4 +1520,57 @@ func (db *Database) ListUsersCursor(opts CursorPaginationOptions) ([]UserReposit
 	}
 
 	return users, nextCursor, hasNext, nil
+}
+
+// GetVulnDBSettings returns the singleton vulnerability-DB update settings row.
+func (db *Database) GetVulnDBSettings() (*VulnDBSettings, error) {
+	row := db.pool.QueryRow(
+		context.Background(),
+		`SELECT auto_update_enabled, update_interval_hours, last_checked_at, last_updated_at, last_error
+		 FROM vulnerability_db_settings WHERE id = 1`,
+	)
+
+	var s VulnDBSettings
+	err := row.Scan(&s.AutoUpdateEnabled, &s.UpdateIntervalHours, &s.LastCheckedAt, &s.LastUpdatedAt, &s.LastError)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get vulnerability DB settings: %w", err)
+	}
+	return &s, nil
+}
+
+// UpdateVulnDBSettings persists the user-tunable fields (auto-update toggle
+// and refresh interval). Status fields (last checked/updated/error) are only
+// ever written by RecordVulnDBUpdateResult.
+func (db *Database) UpdateVulnDBSettings(autoUpdateEnabled bool, intervalHours int) error {
+	_, err := db.pool.Exec(
+		context.Background(),
+		`UPDATE vulnerability_db_settings SET auto_update_enabled = $1, update_interval_hours = $2 WHERE id = 1`,
+		autoUpdateEnabled, intervalHours,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update vulnerability DB settings: %w", err)
+	}
+	return nil
+}
+
+// RecordVulnDBUpdateResult stamps the outcome of a DB refresh attempt.
+func (db *Database) RecordVulnDBUpdateResult(checkedAt time.Time, succeeded bool, errMsg string) error {
+	var err error
+	if succeeded {
+		_, err = db.pool.Exec(
+			context.Background(),
+			`UPDATE vulnerability_db_settings SET last_checked_at = $1, last_updated_at = $1, last_error = '' WHERE id = 1`,
+			checkedAt,
+		)
+	} else {
+		_, err = db.pool.Exec(
+			context.Background(),
+			`UPDATE vulnerability_db_settings SET last_checked_at = $1, last_error = $2 WHERE id = 1`,
+			checkedAt, errMsg,
+		)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to record vulnerability DB update result: %w", err)
+	}
+	return nil
 }

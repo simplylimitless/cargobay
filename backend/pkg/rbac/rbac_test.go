@@ -3,7 +3,7 @@ package rbac
 import (
 	"testing"
 
-	"github.com/anthropics/cargobay/backend/pkg/database"
+	"github.com/simplylimitless/cargobay/backend/pkg/database"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 )

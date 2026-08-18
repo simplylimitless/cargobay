@@ -2,12 +2,14 @@ package middleware
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/anthropics/cargobay/backend/pkg/database"
+	"github.com/simplylimitless/cargobay/backend/pkg/auth"
+	"github.com/simplylimitless/cargobay/backend/pkg/database"
 )
 
 // AuthContextKey is the key for user info in request context
@@ -32,12 +34,26 @@ type RoleAndPermissionLookup interface {
 	GetUserRolePermissions(userID string) []string
 }
 
-// NewAuthMiddleware validates the bearer token against access_keys, loads
-// the owning user and their RBAC roles/permissions, and attaches the result
-// to the request context. Requests without a (valid) token proceed
-// unauthenticated — routes that require a user should be wrapped in
-// RequireAuth or rbac.RequirePermission.
+// NewAuthMiddleware validates the caller's credentials — either a bearer
+// token against access_keys, or HTTP Basic username/password against the
+// users table (used by `docker login`/`docker push`, which speak Basic
+// auth rather than this app's session tokens) — loads the owning user and
+// their RBAC roles/permissions, and attaches the result to the request
+// context. Requests without (valid) credentials proceed unauthenticated —
+// routes that require a user should be wrapped in RequireAuth or
+// rbac.RequirePermission.
 func NewAuthMiddleware(db *database.Database, roles RoleAndPermissionLookup) func(http.Handler) http.Handler {
+	loadUser := func(dbUser *database.UserRepository) *User {
+		userRoles, _ := roles.GetUserRoles(dbUser.UserID)
+		return &User{
+			UserID:      dbUser.UserID,
+			Username:    dbUser.Username,
+			Email:       dbUser.Email,
+			Roles:       userRoles,
+			Permissions: roles.GetUserRolePermissions(dbUser.UserID),
+		}
+	}
+
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			authHeader := r.Header.Get("Authorization")
@@ -46,9 +62,30 @@ func NewAuthMiddleware(db *database.Database, roles RoleAndPermissionLookup) fun
 				return
 			}
 
+			if basicCreds := strings.TrimPrefix(authHeader, "Basic "); basicCreds != authHeader {
+				decoded, err := base64.StdEncoding.DecodeString(basicCreds)
+				if err != nil {
+					next.ServeHTTP(w, r)
+					return
+				}
+				username, password, ok := strings.Cut(string(decoded), ":")
+				if !ok {
+					next.ServeHTTP(w, r)
+					return
+				}
+				dbUser, err := db.GetUserByUsername(username)
+				if err != nil || dbUser == nil || !dbUser.IsActive || !auth.VerifyPassword(dbUser.PasswordHash, password) {
+					next.ServeHTTP(w, r)
+					return
+				}
+				ctx := context.WithValue(r.Context(), AuthUserKey, loadUser(dbUser))
+				next.ServeHTTP(w, r.WithContext(ctx))
+				return
+			}
+
 			token := strings.TrimPrefix(authHeader, "Bearer ")
 			if token == authHeader {
-				// Missing "Bearer " prefix — not a token we understand.
+				// Neither "Bearer " nor "Basic " prefix — not a credential we understand.
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -65,16 +102,7 @@ func NewAuthMiddleware(db *database.Database, roles RoleAndPermissionLookup) fun
 				return
 			}
 
-			userRoles, _ := roles.GetUserRoles(dbUser.UserID)
-			user := &User{
-				UserID:      dbUser.UserID,
-				Username:    dbUser.Username,
-				Email:       dbUser.Email,
-				Roles:       userRoles,
-				Permissions: roles.GetUserRolePermissions(dbUser.UserID),
-			}
-
-			ctx := context.WithValue(r.Context(), AuthUserKey, user)
+			ctx := context.WithValue(r.Context(), AuthUserKey, loadUser(dbUser))
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}

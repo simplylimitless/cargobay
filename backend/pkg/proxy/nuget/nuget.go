@@ -17,9 +17,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/anthropics/cargobay/backend/pkg/cache"
-	"github.com/anthropics/cargobay/backend/pkg/database"
-	"github.com/anthropics/cargobay/backend/pkg/storage"
+	"github.com/simplylimitless/cargobay/backend/pkg/cache"
+	"github.com/simplylimitless/cargobay/backend/pkg/database"
+	proxypkg "github.com/simplylimitless/cargobay/backend/pkg/proxy"
+	"github.com/simplylimitless/cargobay/backend/pkg/rbac"
+	"github.com/simplylimitless/cargobay/backend/pkg/storage"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -33,7 +35,7 @@ type NuGetProxy struct {
 }
 
 // NewNuGetProxy creates a new NuGet proxy instance
-func NewNuGetProxy(db *database.Database, storage storage.StorageAdapter, cache *cache.Cache, registries []database.RegistryConfig) chi.Router {
+func NewNuGetProxy(db *database.Database, storage storage.StorageAdapter, cache *cache.Cache, rbacMgr *rbac.RBAC, registries []database.RegistryConfig) chi.Router {
 	r := chi.NewRouter()
 
 	proxy := &NuGetProxy{
@@ -43,6 +45,8 @@ func NewNuGetProxy(db *database.Database, storage storage.StorageAdapter, cache 
 		registries: registries,
 		registry:   "nuget",
 	}
+
+	r.Use(proxypkg.RequireReadAccess(db, rbacMgr, registries, "nuget"))
 
 	// NuGet V3 API routes (recommended)
 	// Search: /query?q={query}&skip={skip}&take={take}
@@ -165,7 +169,8 @@ func (n *NuGetProxy) handlePackageMetadata(w http.ResponseWriter, r *http.Reques
 
 	// If not found, fetch from upstream
 	if artifact == nil {
-		artifact, err = n.fetchPackageFromUpstream(packageId, version)
+		t := proxypkg.TargetFromContext(r, "nuget")
+		artifact, err = n.fetchPackageFromUpstream(t.Reg, t.Label, packageId, version)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Failed to fetch package: %v", err), http.StatusBadGateway)
 			return
@@ -217,7 +222,7 @@ func (n *NuGetProxy) handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Fetch from upstream
-	data, err = n.fetchPackageFileFromUpstream(packageId, version, fileName)
+	data, err = n.fetchPackageFileFromUpstream(proxypkg.TargetFromContext(r, "nuget").Reg, packageId, version, fileName)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to download package: %v", err), http.StatusBadGateway)
 		return
@@ -331,7 +336,8 @@ func (n *NuGetProxy) handlePackageV2(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if artifact == nil {
-		artifact, err = n.fetchPackageFromUpstream(packageId, version)
+		t := proxypkg.TargetFromContext(r, "nuget")
+		artifact, err = n.fetchPackageFromUpstream(t.Reg, t.Label, packageId, version)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Failed to fetch package: %v", err), http.StatusBadGateway)
 			return
@@ -372,7 +378,7 @@ func (n *NuGetProxy) handlePackageV2(w http.ResponseWriter, r *http.Request) {
 func (n *NuGetProxy) handleListPackages(w http.ResponseWriter, r *http.Request) {
 	limit := 20
 
-	artifacts, err := n.db.ListArtifacts("nuget", database.ListOptions{
+	artifacts, err := n.db.ListArtifacts(proxypkg.TargetFromContext(r, "nuget").Label, database.ListOptions{
 		ArtifactType: "nuget",
 		Limit:        limit,
 	})
@@ -417,7 +423,7 @@ func (n *NuGetProxy) handleRegistrationIndex(w http.ResponseWriter, r *http.Requ
 	packageId := chi.URLParam(r, "packageId")
 
 	// Get all versions from database
-	artifacts, err := n.db.ListArtifacts("nuget", database.ListOptions{
+	artifacts, err := n.db.ListArtifacts(proxypkg.TargetFromContext(r, "nuget").Label, database.ListOptions{
 		ArtifactType: "nuget",
 	})
 	if err != nil {
@@ -474,7 +480,8 @@ func (n *NuGetProxy) handleRegistrationVersion(w http.ResponseWriter, r *http.Re
 	}
 
 	if artifact == nil {
-		artifact, err = n.fetchPackageFromUpstream(packageId, version)
+		t := proxypkg.TargetFromContext(r, "nuget")
+		artifact, err = n.fetchPackageFromUpstream(t.Reg, t.Label, packageId, version)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Failed to fetch package: %v", err), http.StatusBadGateway)
 			return
@@ -507,19 +514,20 @@ func (n *NuGetProxy) handleRegistrationVersion(w http.ResponseWriter, r *http.Re
 }
 
 // fetchPackageFromUpstream fetches package metadata from NuGet
-func (n *NuGetProxy) fetchPackageFromUpstream(packageId, version string) (*database.ArtifactMetadata, error) {
-	// Find upstream registry
+func (n *NuGetProxy) fetchPackageFromUpstream(reg *database.RegistryConfig, registryLabel, packageId, version string) (*database.ArtifactMetadata, error) {
 	upstream := "https://api.nuget.org/v3/index.json"
-	for _, reg := range n.registries {
-		if reg.Type == "nuget" && reg.Proxy {
-			upstream = reg.URL
-			break
-		}
+	if reg != nil && reg.Proxy && reg.URL != "" {
+		upstream = reg.URL
 	}
 
 	// Get catalog entry
 	catalogURL := fmt.Sprintf("%s/%s/%s.json", strings.TrimSuffix(upstream, "/v3/index.json"), packageId, version)
-	resp, err := http.Get(catalogURL)
+	catalogReq, err := http.NewRequest(http.MethodGet, catalogURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	proxypkg.ApplyUpstreamAuth(catalogReq, reg)
+	resp, err := http.DefaultClient.Do(catalogReq)
 	if err != nil {
 		return nil, err
 	}
@@ -535,8 +543,8 @@ func (n *NuGetProxy) fetchPackageFromUpstream(packageId, version string) (*datab
 	catalogEntry := result["catalogEntry"].(map[string]interface{})
 
 	artifact := &database.ArtifactMetadata{
-		ID:              fmt.Sprintf("nuget:%s:%s", packageId, version),
-		RegistryID:      "nuget",
+		ID:              fmt.Sprintf("nuget:%s:%s:%s", registryLabel, packageId, version),
+		RegistryID:      registryLabel,
 		ArtifactType:    "nuget",
 		Namespace:       "",
 		ArtifactName:    packageId,
@@ -550,10 +558,12 @@ func (n *NuGetProxy) fetchPackageFromUpstream(packageId, version string) (*datab
 	}
 
 	// Get package content size
-	contentResp, err := http.Get(packageContent)
-	if err == nil {
-		contentResp.Body.Close()
-		artifact.Size = contentResp.ContentLength
+	if contentReq, err := http.NewRequest(http.MethodGet, packageContent, nil); err == nil {
+		proxypkg.ApplyUpstreamAuth(contentReq, reg)
+		if contentResp, err := http.DefaultClient.Do(contentReq); err == nil {
+			contentResp.Body.Close()
+			artifact.Size = contentResp.ContentLength
+		}
 	}
 
 	n.db.SaveArtifact(artifact)
@@ -561,19 +571,20 @@ func (n *NuGetProxy) fetchPackageFromUpstream(packageId, version string) (*datab
 }
 
 // fetchPackageFileFromUpstream fetches a .nupkg file from NuGet
-func (n *NuGetProxy) fetchPackageFileFromUpstream(packageId, version, fileName string) ([]byte, error) {
-	// Find upstream registry
+func (n *NuGetProxy) fetchPackageFileFromUpstream(reg *database.RegistryConfig, packageId, version, fileName string) ([]byte, error) {
 	upstream := "https://www.nuget.org"
-	for _, reg := range n.registries {
-		if reg.Type == "nuget" && reg.Proxy {
-			upstream = reg.URL
-			break
-		}
+	if reg != nil && reg.Proxy && reg.URL != "" {
+		upstream = reg.URL
 	}
 
 	// NuGet package URL format
 	fileURL := fmt.Sprintf("%s/api/v2/package/%s/%s", upstream, packageId, version)
-	resp, err := http.Get(fileURL)
+	fileReq, err := http.NewRequest(http.MethodGet, fileURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	proxypkg.ApplyUpstreamAuth(fileReq, reg)
+	resp, err := http.DefaultClient.Do(fileReq)
 	if err != nil {
 		return nil, err
 	}

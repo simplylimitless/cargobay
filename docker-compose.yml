@@ -8,9 +8,9 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      # Local bind mount — point this at an NFS-mounted host path if needed,
-      # but note NFS is not recommended for the live Postgres data directory
-      # (fsync/locking semantics can cause corruption). Prefer local/block storage here.
+      # Deliberately its own top-level mount, separate from ./data/app -- Postgres
+      # needs real fsync/locking guarantees, so this should stay on local/block
+      # storage even if ./data/app ends up on NFS.
       - ./data/postgres:/var/lib/postgresql/data
       - ./backend/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
     healthcheck:
@@ -30,6 +30,24 @@ services:
       timeout: 5s
       retries: 5
 
+  trivy:
+    image: aquasec/trivy:latest
+    # --cache-dir is passed explicitly (rather than relying on the default
+    # ~/.cache/trivy) because this container runs as uid 1000 with no home
+    # directory of its own -- same reason the mount target below isn't /root.
+    command: server --listen 0.0.0.0:4954 --cache-dir /cache
+    # Matches the backend container's non-root `app` user (uid/gid 1000) so
+    # both containers can read/write the same shared cache directory without
+    # permission conflicts.
+    user: "1000:1000"
+    volumes:
+      # Trivy's own vulnerability-DB cache (pulled from ghcr.io/aquasecurity/trivy-db
+      # and trivy-java-db, refreshed automatically on its own TTL). Lives under the
+      # shared application volume alongside other non-artifact app state.
+      - ./data/app/trivy-cache:/cache
+    ports:
+      - "4954:4954"
+
   backend:
     build:
       context: ./backend
@@ -40,11 +58,16 @@ services:
       HOST: "0.0.0.0"
       DATABASE_URL: postgres://cargobay:password@postgres:5432/cargobay
       REDIS_URL: redis://redis:6379
+      # Shared with the `trivy` service's cache volume below, so both the
+      # backend's own DB-refresh CLI calls and `trivy server`'s scans see
+      # the same downloaded vulnerability DB.
+      TRIVY_CACHE_DIR: /app/trivy-cache
     volumes:
       # Local bind mount for artifact storage — used when storage.type is "local"
       # in backend/config.yaml. Point this at an NFS mount if desired, or switch
       # storage.type to "s3"/"gcs" in config.yaml to bypass this path entirely.
       - ./data/artifacts:/app/storage
+      - ./data/app/trivy-cache:/app/trivy-cache
     depends_on:
       postgres:
         condition: service_healthy

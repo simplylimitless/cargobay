@@ -48,7 +48,7 @@ export function Login() {
               type="text"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
-              className="input input-bordered w-full bg-gray-800 border-gray-700 text-white focus:border-blue-500 focus:ring-blue-500/20"
+              className="input"
               placeholder="Enter your username"
               disabled={loading}
               required
@@ -63,7 +63,7 @@ export function Login() {
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              className="input input-bordered w-full bg-gray-800 border-gray-700 text-white focus:border-blue-500 focus:ring-blue-500/20"
+              className="input"
               placeholder="Enter your password"
               disabled={loading}
               required
@@ -78,12 +78,6 @@ export function Login() {
             {loading ? 'Signing in...' : 'Sign In'}
           </button>
         </form>
-
-        <div className="text-center text-sm text-gray-500">
-          <p>Default admin credentials:</p>
-          <p>Username: admin</p>
-          <p>Password: admin123</p>
-        </div>
       </div>
     </div>
   )

@@ -4,10 +4,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/anthropics/cargobay/backend/pkg/cache"
-	"github.com/anthropics/cargobay/backend/pkg/database"
-	"github.com/anthropics/cargobay/backend/pkg/rbac"
-	"github.com/anthropics/cargobay/backend/pkg/storage"
+	"github.com/simplylimitless/cargobay/backend/pkg/cache"
+	"github.com/simplylimitless/cargobay/backend/pkg/database"
+	"github.com/simplylimitless/cargobay/backend/pkg/rbac"
+	"github.com/simplylimitless/cargobay/backend/pkg/storage"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

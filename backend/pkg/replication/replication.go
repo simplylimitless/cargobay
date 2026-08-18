@@ -5,9 +5,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/anthropics/cargobay/backend/pkg/cache"
-	"github.com/anthropics/cargobay/backend/pkg/database"
-	"github.com/anthropics/cargobay/backend/pkg/storage"
+	"github.com/simplylimitless/cargobay/backend/pkg/cache"
+	"github.com/simplylimitless/cargobay/backend/pkg/database"
+	"github.com/simplylimitless/cargobay/backend/pkg/storage"
 )
 
 // ReplicationService manages cross-region and cross-cloud replication
@@ -124,7 +124,7 @@ func (r *ReplicationService) replicateToRegions(regions []RegionConfig) {
 
 	for _, artifact := range artifacts {
 		for _, region := range regions {
-			if err := r.replicateArtifactToRegion(artifact, region); err != nil {
+			if err := r.replicateArtifactToRegion(&artifact, region); err != nil {
 				r.statsLock.Lock()
 				r.stats.FailedSyncs++
 				r.statsLock.Unlock()
@@ -166,7 +166,7 @@ func (r *ReplicationService) replicateArtifactToRegion(artifact *database.Artifa
 
 	defer client.Close()
 
-	return client.PushArtifact(&artifact, data)
+	return client.PushArtifact(artifact, data)
 }
 
 // syncScheduler periodically syncs all artifacts
@@ -215,7 +215,7 @@ func (r *ReplicationService) fullSync() {
 
 		for _, artifact := range artifacts {
 			for _, region := range enabledRegions {
-				r.replicateArtifactToRegion(artifact, region)
+				r.replicateArtifactToRegion(&artifact, region)
 			}
 		}
 

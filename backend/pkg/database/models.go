@@ -57,13 +57,46 @@ type AccessKey struct {
 
 // RegistryConfig represents an upstream registry
 type RegistryConfig struct {
-	ID       string `db:"id"`
-	Name     string `db:"name"`
-	URL      string `db:"url"`
-	Type     string `db:"type"`
-	Proxy    bool   `db:"proxy"`
-	Enabled  bool   `db:"enabled"`
-	Priority int    `db:"priority"`
+	ID       string `db:"id" json:"id"`
+	Name     string `db:"name" json:"name"`
+	URL      string `db:"url" json:"url"`
+	Type     string `db:"type" json:"type"`
+	Proxy    bool   `db:"proxy" json:"proxy"`
+	Enabled  bool   `db:"enabled" json:"enabled"`
+	Priority int    `db:"priority" json:"priority"`
+	Private  bool   `db:"private" json:"private"`
+	// Host binds this registry to a hostname for virtual-host routing
+	// (e.g. "private1.cargobay.example.com"). Empty means unbound: the
+	// registry is only reachable as the default public proxy for its
+	// type at the existing /docker, /npm, ... path prefixes.
+	Host string `db:"host" json:"host"`
+	// Credentials cargobay presents when it pulls through Proxy+URL from an
+	// upstream registry that itself requires authentication -- e.g. another
+	// private cargobay instance, or any private Docker/Maven/npm/PyPI/NuGet/
+	// Helm registry. UpstreamAuthType is one of "none" (default), "basic"
+	// (HTTP Basic, the convention for Maven/PyPI/Docker Hub-style private
+	// registries), or "bearer" (a static bearer token, the convention for
+	// npm/GitHub Packages-style registries). UpstreamSecret is the password
+	// for basic auth or the token for bearer auth; it is never serialized
+	// to JSON so it can't leak back out over the API.
+	UpstreamAuthType string `db:"upstream_auth_type" json:"upstreamAuthType"`
+	UpstreamUsername string `db:"upstream_username" json:"upstreamUsername"`
+	UpstreamSecret   string `db:"upstream_secret" json:"-"`
+	// HasUpstreamSecret is a derived, read-only flag set by the API layer so
+	// the frontend can show "credential configured" without ever receiving
+	// the secret itself.
+	HasUpstreamSecret bool `db:"-" json:"hasUpstreamSecret"`
+}
+
+// RegistryAccess grants a specific user read and/or publish rights on a
+// private registry. Public (non-private) registries never consult this
+// table — they're open to everyone, including anonymous callers.
+type RegistryAccess struct {
+	RegistryID string    `db:"registry_id" json:"registryId"`
+	UserID     string    `db:"user_id" json:"userId"`
+	CanRead    bool      `db:"can_read" json:"canRead"`
+	CanPublish bool      `db:"can_publish" json:"canPublish"`
+	GrantedAt  time.Time `db:"granted_at" json:"grantedAt"`
 }
 
 // AuditLog represents an audit log entry
@@ -100,6 +133,16 @@ type Role struct {
 type RolePermission struct {
 	RoleID      string `db:"role_id"`
 	PermissionID string `db:"permission_id"`
+}
+
+// VulnDBSettings tunes how the backend refreshes Trivy's vulnerability DB.
+// Singleton row (id always 1).
+type VulnDBSettings struct {
+	AutoUpdateEnabled   bool       `db:"auto_update_enabled" json:"autoUpdateEnabled"`
+	UpdateIntervalHours int        `db:"update_interval_hours" json:"updateIntervalHours"`
+	LastCheckedAt       *time.Time `db:"last_checked_at" json:"lastCheckedAt"`
+	LastUpdatedAt       *time.Time `db:"last_updated_at" json:"lastUpdatedAt"`
+	LastError           string     `db:"last_error" json:"lastError"`
 }
 
 // CursorPaginationOptions represents cursor-based pagination parameters

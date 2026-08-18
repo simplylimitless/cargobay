@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/anthropics/cargobay/backend/pkg/auth"
+	"github.com/simplylimitless/cargobay/backend/pkg/auth"
 	"github.com/spf13/cobra"
 )
 

@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/anthropics/cargobay/backend/pkg/config"
-	"github.com/anthropics/cargobay/backend/pkg/database"
-	"github.com/anthropics/cargobay/backend/pkg/rbac"
+	"github.com/simplylimitless/cargobay/backend/pkg/config"
+	"github.com/simplylimitless/cargobay/backend/pkg/database"
+	"github.com/simplylimitless/cargobay/backend/pkg/rbac"
 	"github.com/spf13/cobra"
 )
 

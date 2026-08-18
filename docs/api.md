@@ -366,6 +366,64 @@ Content-Type: application/json
 DELETE /users/:id
 ```
 
+### Vulnerability DB Settings
+
+Controls how the backend refreshes Trivy's vulnerability database. The
+backend bundles the `trivy` CLI and shells out to it on a schedule against
+the same cache directory the `trivy` scan server uses — `trivy server` mode
+itself exposes no HTTP control over its own update cadence, so cargobay
+owns refreshes instead. Requires `system:read` (GET) / `system:write`
+(PUT, POST) permissions, held by the `admin` role.
+
+#### Get Settings
+
+```http
+GET /settings/vulnerability-db
+```
+
+**Response:**
+```json
+{
+  "autoUpdateEnabled": true,
+  "updateIntervalHours": 24,
+  "lastCheckedAt": "2024-02-15T14:30:00Z",
+  "lastUpdatedAt": "2024-02-15T14:30:00Z",
+  "lastError": ""
+}
+```
+
+#### Update Settings
+
+```http
+PUT /settings/vulnerability-db
+Content-Type: application/json
+```
+
+**Request Body:**
+```json
+{
+  "autoUpdateEnabled": true,
+  "updateIntervalHours": 12
+}
+```
+
+`updateIntervalHours` must be at least 1. Returns the updated settings row
+(same shape as GET). Only the toggle and interval are writable here — the
+status fields (`lastCheckedAt`, `lastUpdatedAt`, `lastError`) are stamped
+exclusively by the update process itself.
+
+#### Trigger Update Now
+
+```http
+POST /settings/vulnerability-db/update
+```
+
+Synchronously runs `trivy --cache-dir <dir> image --download-db-only` and
+returns the resulting settings row. A download failure is reported via the
+`lastError` field, not as an HTTP error status — the request itself
+succeeded in attempting the update. Responds `503` if the updater was not
+configured at startup.
+
 ### Metrics
 
 #### Prometheus Metrics

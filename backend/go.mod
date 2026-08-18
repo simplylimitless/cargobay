@@ -1,4 +1,4 @@
-module github.com/anthropics/cargobay/backend
+module github.com/simplylimitless/cargobay/backend
 
 go 1.25.0
 

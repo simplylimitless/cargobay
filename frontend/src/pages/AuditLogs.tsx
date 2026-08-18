@@ -133,12 +133,7 @@ export function AuditLogs() {
   }
 
   return (
-    <div className="max-w-7xl mx-auto">
-      <div className="mb-8">
-        <h1 className="text-3xl font-bold text-white mb-2">Audit Logs</h1>
-        <p className="text-gray-400">Track all user actions and system events</p>
-      </div>
-
+    <div>
       {/* Stats */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
         <div className="card p-4">

@@ -7,9 +7,9 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/anthropics/cargobay/backend/pkg/database"
-	"github.com/anthropics/cargobay/backend/pkg/rbac"
-	"github.com/anthropics/cargobay/backend/pkg/vulnerability"
+	"github.com/simplylimitless/cargobay/backend/pkg/database"
+	"github.com/simplylimitless/cargobay/backend/pkg/rbac"
+	"github.com/simplylimitless/cargobay/backend/pkg/vulnerability"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

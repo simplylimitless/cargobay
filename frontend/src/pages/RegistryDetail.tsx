@@ -1,24 +1,37 @@
 import { useState, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 
+interface Registry {
+  id: string
+  name: string
+  url: string
+  type: string
+  enabled: boolean
+  priority: number
+  private: boolean
+  proxy: boolean
+}
+
 export function RegistryDetail() {
   const { registryId } = useParams<{ registryId: string }>()
   const navigate = useNavigate()
-  const [registry, setRegistry] = useState<any>(null)
+  const [registry, setRegistry] = useState<Registry | null>(null)
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
-    const registries = [
-      { id: 'dockerhub', name: 'Docker Hub', url: 'https://registry-1.docker.io', type: 'docker' },
-      { id: 'ghcr', name: 'GitHub Container Registry', url: 'https://ghcr.io', type: 'docker' },
-      { id: 'quay', name: 'Quay.io', url: 'https://quay.io', type: 'docker' },
-      { id: 'npm', name: 'NPM Registry', url: 'https://registry.npmjs.org', type: 'npm' },
-      { id: 'maven-central', name: 'Maven Central', url: 'https://repo1.maven.org', type: 'maven' },
-      { id: 'artifactory', name: 'Artifactory', url: 'https://artifactory.example.com', type: 'artifactory' },
-    ]
-    const reg = registries.find((r) => r.id === registryId)
-    setRegistry(reg || null)
-    setLoading(false)
+    setLoading(true)
+    fetch(`/api/v1/registries/${encodeURIComponent(registryId!)}`)
+      .then((res) => {
+        if (!res.ok) throw new Error(res.status === 404 ? 'Registry not found' : `Request failed: ${res.status}`)
+        return res.json() as Promise<Registry>
+      })
+      .then((data) => {
+        setRegistry(data)
+        setError(null)
+      })
+      .catch((err) => setError(err.message))
+      .finally(() => setLoading(false))
   }, [registryId])
 
   const getArtifactTypes = (registryType: string) => {
@@ -29,22 +42,15 @@ export function RegistryDetail() {
           { id: 'helm', name: 'Helm Charts', icon: '⚓', desc: 'Kubernetes charts' },
         ]
       case 'npm':
-        return [
-          { id: 'npm', name: 'NPM Packages', icon: '📦', desc: 'Node.js packages' },
-        ]
+        return [{ id: 'npm', name: 'NPM Packages', icon: '📦', desc: 'Node.js packages' }]
       case 'maven':
-        return [
-          { id: 'maven', name: 'Maven Artifacts', icon: '☕', desc: 'Java libraries' },
-          { id: 'gradle', name: 'Gradle Archives', icon: '⚛️', desc: 'Gradle dependencies' },
-        ]
-      case 'artifactory':
-        return [
-          { id: 'docker', name: 'Container Images', icon: '🐳', desc: 'Docker images' },
-          { id: 'maven', name: 'Maven Artifacts', icon: '☕', desc: 'Java libraries' },
-          { id: 'npm', name: 'NPM Packages', icon: '📦', desc: 'Node.js packages' },
-          { id: 'pypi', name: 'Python Packages', icon: '🐍', desc: 'PyPI packages' },
-          { id: 'nuget', name: 'NuGet Packages', icon: '🔨', desc: '.NET packages' },
-        ]
+        return [{ id: 'maven', name: 'Maven Artifacts', icon: '☕', desc: 'Java libraries' }]
+      case 'pypi':
+        return [{ id: 'pypi', name: 'Python Packages', icon: '🐍', desc: 'PyPI packages' }]
+      case 'nuget':
+        return [{ id: 'nuget', name: 'NuGet Packages', icon: '🔨', desc: '.NET packages' }]
+      case 'helm':
+        return [{ id: 'helm', name: 'Helm Charts', icon: '⚓', desc: 'Kubernetes charts' }]
       default:
         return [{ id: registryType, name: 'Artifacts', icon: '📦', desc: 'Browse artifacts' }]
     }
@@ -58,7 +64,7 @@ export function RegistryDetail() {
     )
   }
 
-  if (!registry) {
+  if (error || !registry) {
     return (
       <div className="text-center py-12">
         <div className="text-red-500 mb-4">
@@ -67,7 +73,7 @@ export function RegistryDetail() {
           </svg>
         </div>
         <h2 className="text-2xl font-bold text-gray-200 mb-2">Registry Not Found</h2>
-        <p className="text-gray-500">The registry "{registryId}" does not exist.</p>
+        <p className="text-gray-500">{error || `The registry "${registryId}" does not exist.`}</p>
       </div>
     )
   }
@@ -92,7 +98,32 @@ export function RegistryDetail() {
             {registry.name.charAt(0)}
           </div>
           <div className="flex-1">
-            <h1 className="text-3xl font-bold text-white mb-2">{registry.name}</h1>
+            <div className="flex flex-wrap items-center gap-3 mb-2">
+              <h1 className="text-3xl font-bold text-white">{registry.name}</h1>
+              <span
+                className={`px-3 py-1 text-xs rounded-full border ${
+                  registry.enabled
+                    ? 'bg-green-500/20 text-green-400 border-green-500/30'
+                    : 'bg-gray-500/20 text-gray-400 border-gray-500/30'
+                }`}
+              >
+                {registry.enabled ? 'enabled' : 'disabled'}
+              </span>
+              <span
+                className={`px-3 py-1 text-xs rounded-full border ${
+                  registry.private
+                    ? 'bg-yellow-500/20 text-yellow-400 border-yellow-500/30'
+                    : 'bg-blue-500/20 text-blue-400 border-blue-500/30'
+                }`}
+              >
+                {registry.private ? 'private' : 'public'}
+              </span>
+              {registry.proxy && (
+                <span className="px-3 py-1 text-xs rounded-full border bg-purple-500/20 text-purple-400 border-purple-500/30">
+                  proxy
+                </span>
+              )}
+            </div>
             <p className="text-gray-400 font-mono text-lg mb-4">{registry.url}</p>
             <div className="flex flex-wrap gap-3">
               <span className="px-4 py-2 bg-blue-600/20 border border-blue-500/30 rounded-lg text-blue-400 font-medium">
@@ -101,6 +132,11 @@ export function RegistryDetail() {
               <span className="px-4 py-2 bg-gray-800 rounded-lg text-gray-300">
                 {artifactTypes.length} Artifact Types Available
               </span>
+              {registry.proxy && (
+                <span className="px-4 py-2 bg-gray-800 rounded-lg text-gray-300">
+                  Pull-through cache from upstream, fetched on demand
+                </span>
+              )}
             </div>
           </div>
         </div>
@@ -109,7 +145,7 @@ export function RegistryDetail() {
       <div>
         <h2 className="text-2xl font-semibold text-gray-100 mb-6">Available Artifact Types</h2>
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {artifactTypes.map((artifact: any) => (
+          {artifactTypes.map((artifact) => (
             <div
               key={artifact.id}
               onClick={() => navigate(`/registries/${registryId}/${artifact.id}`)}

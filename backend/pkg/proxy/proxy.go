@@ -8,13 +8,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
-	"github.com/anthropics/cargobay/backend/pkg/cache"
-	"github.com/anthropics/cargobay/backend/pkg/database"
-	"github.com/anthropics/cargobay/backend/pkg/search"
-	"github.com/anthropics/cargobay/backend/pkg/storage"
+	"github.com/simplylimitless/cargobay/backend/pkg/cache"
+	"github.com/simplylimitless/cargobay/backend/pkg/database"
+	"github.com/simplylimitless/cargobay/backend/pkg/storage"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -107,114 +105,6 @@ func (pm *ProxyManager) SearchArtifacts(w http.ResponseWriter, r *http.Request) 
 	}
 
 	json.NewEncoder(w).Encode(results)
-}
-
-// upstreamSearchResult is a single row in the SearchUpstream response,
-// unifying locally-cached artifacts and live upstream search hits.
-type upstreamSearchResult struct {
-	Namespace   string `json:"namespace"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	StarCount   int    `json:"starCount"`
-	Official    bool   `json:"official"`
-	Source      string `json:"source"`
-}
-
-// SearchUpstream searches a single registry's locally-cached artifacts and,
-// where a public anonymous search API exists (Docker Hub, Quay.io), the
-// upstream registry itself, merging and de-duplicating the results. When no
-// upstream search adapter exists for the registry (e.g. GHCR), or the
-// upstream call fails, it degrades to local-only results rather than
-// failing the request.
-func (pm *ProxyManager) SearchUpstream(w http.ResponseWriter, r *http.Request) {
-	query := r.URL.Query().Get("q")
-	registryID := r.URL.Query().Get("registry")
-	artifactType := r.URL.Query().Get("type")
-
-	// Generate cache key for upstream search results (5-minute TTL)
-	cacheKey := fmt.Sprintf("upstream_search:%s:%s:%s", query, registryID, artifactType)
-
-	var cachedResults map[string]interface{}
-
-	// Try to get cached upstream results
-	if err := pm.cache.Get(cacheKey, &cachedResults); err == nil && cachedResults != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("X-Cache", "HIT")
-		json.NewEncoder(w).Encode(cachedResults)
-		return
-	}
-
-	local, err := pm.db.SearchArtifacts(query, database.SearchOptions{
-		RegistryID:   registryID,
-		ArtifactType: artifactType,
-	})
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Search failed: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	seen := make(map[string]bool, len(local))
-	results := make([]upstreamSearchResult, 0, len(local))
-	for _, a := range local {
-		seen[strings.ToLower(a.Namespace+"/"+a.ArtifactName)] = true
-		results = append(results, upstreamSearchResult{
-			Namespace:   a.Namespace,
-			Name:        a.ArtifactName,
-			Description: "",
-			Source:      "local",
-		})
-	}
-
-	upstreamAvailable := false
-	if searcher, ok := search.Dispatch(registryID); ok && query != "" {
-		// Try to get cached upstream search results
-		var cachedUpstream []search.Result
-		upstreamCacheKey := fmt.Sprintf("upstream_results:%s:%s", query, registryID)
-
-		if err := pm.cache.Get(upstreamCacheKey, &cachedUpstream); err != nil || cachedUpstream == nil {
-			// Cache miss - make upstream API call
-			upstreamResults, err := searcher.Search(r.Context(), query)
-			if err == nil {
-				cachedUpstream = upstreamResults
-				// Cache upstream results with 1-minute TTL (data changes less frequently)
-				_ = pm.cache.SetWithTTL(upstreamCacheKey, cachedUpstream, 1*time.Minute)
-			}
-		}
-
-		if len(cachedUpstream) > 0 {
-			upstreamAvailable = true
-			for _, res := range cachedUpstream {
-				key := strings.ToLower(res.Namespace + "/" + res.Name)
-				if seen[key] {
-					continue
-				}
-				seen[key] = true
-				results = append(results, upstreamSearchResult{
-					Namespace:   res.Namespace,
-					Name:        res.Name,
-					Description: res.Description,
-					StarCount:   res.StarCount,
-					Official:    res.Official,
-					Source:      res.Source,
-				})
-			}
-		}
-	}
-
-	response := map[string]interface{}{
-		"query":             query,
-		"results":           results,
-		"upstreamAvailable": upstreamAvailable,
-		"total":             len(results),
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("X-Cache", "MISS")
-
-	// Cache the combined results
-	_ = pm.cache.SetWithTTL(cacheKey, response, 5*time.Minute)
-
-	json.NewEncoder(w).Encode(response)
 }
 
 // GetArtifactInfo returns artifact information

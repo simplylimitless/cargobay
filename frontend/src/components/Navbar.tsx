@@ -1,13 +1,10 @@
-import { Link, useLocation, useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import { SearchInput } from './SearchInput'
 import { useAuth } from '../context/AuthContext'
 
 export function Navbar() {
-  const location = useLocation()
   const navigate = useNavigate()
   const { currentUser, isAdmin, logout } = useAuth()
-
-  const isHomePage = location.pathname === '/'
 
   const handleLogout = () => {
     logout()
@@ -33,12 +30,6 @@ export function Navbar() {
           </div>
 
           <div className="flex items-center gap-3">
-            <div className="hidden md:flex items-center gap-2 text-sm">
-              <span className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-800 rounded-lg">
-                <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
-                <span className="text-green-400 font-medium">System Online</span>
-              </span>
-            </div>
             <Link
               to="/getting-started"
               className="hidden md:block px-3 py-1.5 text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-800 rounded-lg transition-all"
@@ -59,39 +50,30 @@ export function Navbar() {
                 >
                   Browse
                 </Link>
-                <Link
-                  to="/registries/status"
-                  className="hidden md:block px-3 py-1.5 text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-800 rounded-lg transition-all"
-                >
-                  Status
-                </Link>
               </>
             )}
             {isAdmin && (
-              <div className="hidden md:flex gap-1">
-                <Link
-                  to="/admin"
-                  className="px-3 py-1.5 text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-800 rounded-lg transition-all"
-                >
-                  Admin
-                </Link>
-                <Link
-                  to="/vulnerabilities"
-                  className="px-3 py-1.5 text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-800 rounded-lg transition-all"
-                >
-                  Vulnerabilities
-                </Link>
-                <Link
-                  to="/audit-logs"
-                  className="px-3 py-1.5 text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-800 rounded-lg transition-all"
-                >
-                  Audit
-                </Link>
-              </div>
+              <Link
+                to="/vulnerabilities"
+                className="hidden md:block px-3 py-1.5 text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-800 rounded-lg transition-all"
+              >
+                Vulnerabilities
+              </Link>
             )}
             {currentUser ? (
               <div className="flex items-center gap-2">
-                <span className="hidden md:flex items-center gap-1.5 px-3 py-1.5 bg-gray-800 rounded-lg text-sm">
+                {isAdmin && (
+                  <Link
+                    to="/settings"
+                    className="hidden md:block px-3 py-1.5 text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-800 rounded-lg transition-all"
+                  >
+                    Settings
+                  </Link>
+                )}
+                <Link
+                  to="/profile"
+                  className="hidden md:flex items-center gap-1.5 px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded-lg text-sm transition-colors"
+                >
                   <span className="text-gray-200 font-medium">{currentUser.username}</span>
                   {currentUser.roles.length > 0 && (
                     <span className={`badge ${
@@ -103,7 +85,7 @@ export function Navbar() {
                       {currentUser.roles[0]}
                     </span>
                   )}
-                </span>
+                </Link>
                 <button onClick={handleLogout} className="btn btn-secondary btn-sm">
                   Log out
                 </button>

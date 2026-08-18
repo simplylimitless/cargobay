@@ -32,7 +32,7 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_search
 CREATE TABLE IF NOT EXISTS users (
     user_id       TEXT PRIMARY KEY,
     username      TEXT NOT NULL UNIQUE,
-    email         TEXT NOT NULL,
+    email         TEXT NOT NULL UNIQUE,
     password_hash TEXT NOT NULL,
     roles         TEXT[] NOT NULL DEFAULT '{}',
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -58,7 +58,31 @@ CREATE TABLE IF NOT EXISTS registries (
     url      TEXT NOT NULL,
     type     TEXT NOT NULL,
     enabled  BOOLEAN NOT NULL DEFAULT TRUE,
-    priority INTEGER NOT NULL DEFAULT 100
+    priority INTEGER NOT NULL DEFAULT 100,
+    private  BOOLEAN NOT NULL DEFAULT FALSE,
+    proxy    BOOLEAN NOT NULL DEFAULT FALSE,
+    host     TEXT,
+    -- Credentials cargobay presents when pulling through an upstream
+    -- registry that itself requires authentication (e.g. another private
+    -- cargobay instance, or any private Docker/Maven/npm/PyPI/NuGet/Helm
+    -- registry). upstream_auth_type is one of 'none' | 'basic' | 'bearer'.
+    upstream_auth_type TEXT NOT NULL DEFAULT 'none',
+    upstream_username  TEXT,
+    upstream_secret    TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_registries_host ON registries (host) WHERE host IS NOT NULL;
+
+-- Per-user read/publish grants for private registries. Public registries
+-- (private = FALSE) are readable by everyone incl. anonymous and never
+-- consult this table; private registries are only usable by an explicitly
+-- granted user (or an admin, via the registry:write permission bypass).
+CREATE TABLE IF NOT EXISTS registry_access (
+    registry_id TEXT NOT NULL REFERENCES registries(id) ON DELETE CASCADE,
+    user_id     TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    can_read    BOOLEAN NOT NULL DEFAULT TRUE,
+    can_publish BOOLEAN NOT NULL DEFAULT FALSE,
+    granted_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (registry_id, user_id)
 );
 
 -- RBAC tables. The 5 built-in roles (admin/developer/viewer/publisher/auditor)
@@ -107,3 +131,15 @@ CREATE TABLE IF NOT EXISTS audit_log (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_audit_log_created_at ON audit_log (created_at DESC);
+
+-- Singleton row holding tunable settings for how the backend refreshes
+-- Trivy's vulnerability DB (see migrations/006_add_vulnerability_db_settings.sql).
+CREATE TABLE IF NOT EXISTS vulnerability_db_settings (
+    id                    INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    auto_update_enabled   BOOLEAN NOT NULL DEFAULT TRUE,
+    update_interval_hours INTEGER NOT NULL DEFAULT 24,
+    last_checked_at       TIMESTAMPTZ,
+    last_updated_at       TIMESTAMPTZ,
+    last_error            TEXT NOT NULL DEFAULT ''
+);
+INSERT INTO vulnerability_db_settings (id) VALUES (1) ON CONFLICT DO NOTHING;

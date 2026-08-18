@@ -18,9 +18,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/anthropics/cargobay/backend/pkg/cache"
-	"github.com/anthropics/cargobay/backend/pkg/database"
-	"github.com/anthropics/cargobay/backend/pkg/storage"
+	"github.com/simplylimitless/cargobay/backend/pkg/cache"
+	"github.com/simplylimitless/cargobay/backend/pkg/database"
+	proxypkg "github.com/simplylimitless/cargobay/backend/pkg/proxy"
+	"github.com/simplylimitless/cargobay/backend/pkg/rbac"
+	"github.com/simplylimitless/cargobay/backend/pkg/storage"
 	"github.com/go-chi/chi/v5"
 	"gopkg.in/yaml.v3"
 )
@@ -65,7 +67,7 @@ type IndexFile struct {
 }
 
 // NewHelmProxy creates a new Helm proxy instance
-func NewHelmProxy(db *database.Database, storage storage.StorageAdapter, cache *cache.Cache, registries []database.RegistryConfig) chi.Router {
+func NewHelmProxy(db *database.Database, storage storage.StorageAdapter, cache *cache.Cache, rbacMgr *rbac.RBAC, registries []database.RegistryConfig) chi.Router {
 	r := chi.NewRouter()
 
 	proxy := &HelmProxy{
@@ -75,6 +77,8 @@ func NewHelmProxy(db *database.Database, storage storage.StorageAdapter, cache *
 		registries: registries,
 		registry:   "helm",
 	}
+
+	r.Use(proxypkg.RequireReadAccess(db, rbacMgr, registries, "helm"))
 
 	// Helm Chart Repository API routes
 	// Root: / - returns 200 OK
@@ -117,7 +121,7 @@ func (h *HelmProxy) handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get all Helm charts from database
-	artifacts, err := h.db.ListArtifacts("helm", database.ListOptions{
+	artifacts, err := h.db.ListArtifacts(proxypkg.TargetFromContext(r, "helm").Label, database.ListOptions{
 		ArtifactType: "helm",
 	})
 	if err != nil {
@@ -250,7 +254,8 @@ func (h *HelmProxy) handleChartDownload(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Fetch from upstream
-	data, err = h.fetchChartFromUpstream(chartName, version, fileName)
+	t := proxypkg.TargetFromContext(r, "helm")
+	data, err = h.fetchChartFromUpstream(t.Reg, t.Label, chartName, version, fileName)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to download chart: %v", err), http.StatusBadGateway)
 		return
@@ -285,7 +290,8 @@ func (h *HelmProxy) handleChartDownloadAlt(w http.ResponseWriter, r *http.Reques
 
 	// Fetch from upstream
 	fileName := fmt.Sprintf("%s-%s.tgz", chartName, version)
-	data, err = h.fetchChartFromUpstream(chartName, version, fileName)
+	t := proxypkg.TargetFromContext(r, "helm")
+	data, err = h.fetchChartFromUpstream(t.Reg, t.Label, chartName, version, fileName)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to download chart: %v", err), http.StatusBadGateway)
 		return
@@ -319,7 +325,7 @@ func (h *HelmProxy) handleChartFile(w http.ResponseWriter, r *http.Request) {
 // handleChartsDir handles charts directory listing
 func (h *HelmProxy) handleChartsDir(w http.ResponseWriter, r *http.Request) {
 	// Get all Helm charts from database
-	artifacts, err := h.db.ListArtifacts("helm", database.ListOptions{
+	artifacts, err := h.db.ListArtifacts(proxypkg.TargetFromContext(r, "helm").Label, database.ListOptions{
 		ArtifactType: "helm",
 	})
 	if err != nil {
@@ -353,14 +359,10 @@ func (h *HelmProxy) handleChartsDir(w http.ResponseWriter, r *http.Request) {
 }
 
 // fetchChartFromUpstream fetches a chart from upstream
-func (h *HelmProxy) fetchChartFromUpstream(chartName, version, fileName string) ([]byte, error) {
-	// Find upstream registry
+func (h *HelmProxy) fetchChartFromUpstream(reg *database.RegistryConfig, registryLabel, chartName, version, fileName string) ([]byte, error) {
 	upstream := "https://charts.bitnami.com/bitnami"
-	for _, reg := range h.registries {
-		if reg.Type == "helm" && reg.Proxy {
-			upstream = reg.URL
-			break
-		}
+	if reg != nil && reg.Proxy && reg.URL != "" {
+		upstream = reg.URL
 	}
 
 	// Try to get from cache
@@ -374,7 +376,12 @@ func (h *HelmProxy) fetchChartFromUpstream(chartName, version, fileName string) 
 	// /charts/name-version.tgz
 	chartURL := fmt.Sprintf("%s/charts/%s", strings.TrimSuffix(upstream, "/"), fileName)
 
-	resp, err := http.Get(chartURL)
+	chartReq, err := http.NewRequest(http.MethodGet, chartURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	proxypkg.ApplyUpstreamAuth(chartReq, reg)
+	resp, err := http.DefaultClient.Do(chartReq)
 	if err != nil {
 		return nil, err
 	}
@@ -399,7 +406,7 @@ func (h *HelmProxy) fetchChartFromUpstream(chartName, version, fileName string) 
 	h.cacheSet(cacheKey, data)
 
 	// Parse chart metadata and save to database
-	if err := h.saveChartMetadata(chartName, version, data); err != nil {
+	if err := h.saveChartMetadata(registryLabel, chartName, version, data); err != nil {
 		fmt.Printf("Warning: failed to save chart metadata: %v\n", err)
 	}
 
@@ -407,13 +414,13 @@ func (h *HelmProxy) fetchChartFromUpstream(chartName, version, fileName string) 
 }
 
 // saveChartMetadata extracts and saves chart metadata
-func (h *HelmProxy) saveChartMetadata(chartName, version string, chartData []byte) error {
+func (h *HelmProxy) saveChartMetadata(registryLabel, chartName, version string, chartData []byte) error {
 	// For now, save a minimal record
 	// A full implementation would extract the .tgz, parse Chart.yaml, etc.
 
 	artifact := &database.ArtifactMetadata{
-		ID:              fmt.Sprintf("helm:%s:%s", chartName, version),
-		RegistryID:      "helm",
+		ID:              fmt.Sprintf("helm:%s:%s:%s", registryLabel, chartName, version),
+		RegistryID:      registryLabel,
 		ArtifactType:    "helm",
 		Namespace:       "",
 		ArtifactName:    chartName,

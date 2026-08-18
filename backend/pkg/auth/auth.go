@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/anthropics/cargobay/backend/pkg/database"
+	"github.com/simplylimitless/cargobay/backend/pkg/database"
 	"golang.org/x/crypto/bcrypt"
 )
 

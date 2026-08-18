@@ -10,14 +10,18 @@
 package npm
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
-	"github.com/anthropics/cargobay/backend/pkg/cache"
-	"github.com/anthropics/cargobay/backend/pkg/database"
-	"github.com/anthropics/cargobay/backend/pkg/storage"
+	"github.com/simplylimitless/cargobay/backend/pkg/cache"
+	"github.com/simplylimitless/cargobay/backend/pkg/database"
+	proxypkg "github.com/simplylimitless/cargobay/backend/pkg/proxy"
+	"github.com/simplylimitless/cargobay/backend/pkg/rbac"
+	"github.com/simplylimitless/cargobay/backend/pkg/storage"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -31,7 +35,7 @@ type NPMProxy struct {
 }
 
 // NewNPMProxy creates a new npm proxy instance
-func NewNPMProxy(db *database.Database, storage storage.StorageAdapter, cache *cache.Cache, registries []database.RegistryConfig) chi.Router {
+func NewNPMProxy(db *database.Database, storage storage.StorageAdapter, cache *cache.Cache, rbacMgr *rbac.RBAC, registries []database.RegistryConfig) chi.Router {
 	r := chi.NewRouter()
 
 	proxy := &NPMProxy{
@@ -41,6 +45,12 @@ func NewNPMProxy(db *database.Database, storage storage.StorageAdapter, cache *c
 		registries: registries,
 		registry:   "npm",
 	}
+
+	// Resolve which registry a request addresses purely from the Host
+	// header the client connected on (falling back to the default public
+	// npm proxy) and enforce read access — no change to how packages are
+	// named or referenced.
+	r.Use(proxypkg.RequireReadAccess(db, rbacMgr, registries, "npm"))
 
 	r.Get("/", proxy.handleRoot)
 	r.Get("/-/ping", proxy.handlePing)
@@ -92,6 +102,7 @@ func (p *NPMProxy) handleUserSync(w http.ResponseWriter, r *http.Request) {
 
 // handleScopedPackage handles scoped pkgName metadata
 func (p *NPMProxy) handleScopedPackage(w http.ResponseWriter, r *http.Request) {
+	t := proxypkg.TargetFromContext(r, "npm")
 	scope := chi.URLParam(r, "scope")
 	pkgName := chi.URLParam(r, "pkgName")
 	packageName := fmt.Sprintf("@%s/%s", scope, pkgName)
@@ -104,7 +115,7 @@ func (p *NPMProxy) handleScopedPackage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Fetch from upstream
-	packageData, err := p.fetchFromUpstream(fmt.Sprintf("/%s", packageName))
+	packageData, err := p.fetchFromUpstream(t.Reg, fmt.Sprintf("/%s", packageName))
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to fetch pkgName: %v", err), http.StatusBadGateway)
 		return
@@ -114,7 +125,7 @@ func (p *NPMProxy) handleScopedPackage(w http.ResponseWriter, r *http.Request) {
 	p.cacheSet(packageName, packageData)
 
 	// Save to database
-	p.savePackageMetadata(packageName, packageData)
+	p.savePackageMetadata(t.Label, packageName, packageData)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(packageData)
@@ -122,6 +133,7 @@ func (p *NPMProxy) handleScopedPackage(w http.ResponseWriter, r *http.Request) {
 
 // handleScopedPackageVersion handles scoped pkgName version metadata
 func (p *NPMProxy) handleScopedPackageVersion(w http.ResponseWriter, r *http.Request) {
+	t := proxypkg.TargetFromContext(r, "npm")
 	scope := chi.URLParam(r, "scope")
 	pkgName := chi.URLParam(r, "pkgName")
 	version := chi.URLParam(r, "version")
@@ -137,7 +149,7 @@ func (p *NPMProxy) handleScopedPackageVersion(w http.ResponseWriter, r *http.Req
 
 	// Fetch from upstream
 	urlPath := fmt.Sprintf("/%s/%s", packageName, version)
-	packageData, err := p.fetchFromUpstream(urlPath)
+	packageData, err := p.fetchFromUpstream(t.Reg, urlPath)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to fetch pkgName version: %v", err), http.StatusBadGateway)
 		return
@@ -147,7 +159,7 @@ func (p *NPMProxy) handleScopedPackageVersion(w http.ResponseWriter, r *http.Req
 	p.cacheSet(cacheKey, packageData)
 
 	// Save to database
-	p.savePackageVersionMetadata(packageName, version, packageData)
+	p.savePackageVersionMetadata(t.Label, packageName, version, packageData)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(packageData)
@@ -155,6 +167,7 @@ func (p *NPMProxy) handleScopedPackageVersion(w http.ResponseWriter, r *http.Req
 
 // handlePackage handles regular pkgName metadata
 func (p *NPMProxy) handlePackage(w http.ResponseWriter, r *http.Request) {
+	t := proxypkg.TargetFromContext(r, "npm")
 	pkgName := chi.URLParam(r, "pkgName")
 
 	// Try cache first
@@ -165,7 +178,7 @@ func (p *NPMProxy) handlePackage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Fetch from upstream
-	packageData, err := p.fetchFromUpstream(fmt.Sprintf("/%s", pkgName))
+	packageData, err := p.fetchFromUpstream(t.Reg, fmt.Sprintf("/%s", pkgName))
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to fetch pkgName: %v", err), http.StatusBadGateway)
 		return
@@ -175,7 +188,7 @@ func (p *NPMProxy) handlePackage(w http.ResponseWriter, r *http.Request) {
 	p.cacheSet(pkgName, packageData)
 
 	// Save to database
-	p.savePackageMetadata(pkgName, packageData)
+	p.savePackageMetadata(t.Label, pkgName, packageData)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(packageData)
@@ -183,6 +196,7 @@ func (p *NPMProxy) handlePackage(w http.ResponseWriter, r *http.Request) {
 
 // handlePackageVersion handles regular pkgName version metadata
 func (p *NPMProxy) handlePackageVersion(w http.ResponseWriter, r *http.Request) {
+	t := proxypkg.TargetFromContext(r, "npm")
 	pkgName := chi.URLParam(r, "pkgName")
 	version := chi.URLParam(r, "version")
 
@@ -196,7 +210,7 @@ func (p *NPMProxy) handlePackageVersion(w http.ResponseWriter, r *http.Request) 
 
 	// Fetch from upstream
 	urlPath := fmt.Sprintf("/%s/%s", pkgName, version)
-	packageData, err := p.fetchFromUpstream(urlPath)
+	packageData, err := p.fetchFromUpstream(t.Reg, urlPath)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to fetch pkgName version: %v", err), http.StatusBadGateway)
 		return
@@ -206,7 +220,7 @@ func (p *NPMProxy) handlePackageVersion(w http.ResponseWriter, r *http.Request) 
 	p.cacheSet(cacheKey, packageData)
 
 	// Save to database
-	p.savePackageVersionMetadata(pkgName, version, packageData)
+	p.savePackageVersionMetadata(t.Label, pkgName, version, packageData)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(packageData)
@@ -214,6 +228,7 @@ func (p *NPMProxy) handlePackageVersion(w http.ResponseWriter, r *http.Request) 
 
 // handleTarball handles pkgName tarball downloads
 func (p *NPMProxy) handleTarball(w http.ResponseWriter, r *http.Request) {
+	t := proxypkg.TargetFromContext(r, "npm")
 	pkgName := chi.URLParam(r, "pkgName")
 	version := chi.URLParam(r, "version")
 
@@ -221,7 +236,7 @@ func (p *NPMProxy) handleTarball(w http.ResponseWriter, r *http.Request) {
 	data, err := p.storage.GetArtifact("npm", "", pkgName, version)
 	if err == nil && data != nil {
 		// Check if upstream has a newer version by comparing digest
-		if updated, err := p.fetchIfUpdated("npm", "", pkgName, version); err == nil && updated != nil {
+		if updated, err := p.fetchIfUpdated(t.Reg, "npm", "", pkgName, version); err == nil && updated != nil {
 			// Upstream has a newer version, use the updated data
 			data = updated
 			// Save updated data to storage
@@ -238,13 +253,19 @@ func (p *NPMProxy) handleTarball(w http.ResponseWriter, r *http.Request) {
 
 	// Local artifact not found or failed to check for updates
 	// Fetch from upstream
-	tarballURL, err := p.getTarballURL(pkgName, version)
+	tarballURL, err := p.getTarballURL(t.Reg, pkgName, version)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to get tarball URL: %v", err), http.StatusBadGateway)
 		return
 	}
 
-	resp, err := http.Get(tarballURL)
+	tarballReq, err := http.NewRequest(http.MethodGet, tarballURL, nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to build tarball request: %v", err), http.StatusInternalServerError)
+		return
+	}
+	proxypkg.ApplyUpstreamAuth(tarballReq, t.Reg)
+	resp, err := http.DefaultClient.Do(tarballReq)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to download tarball: %v", err), http.StatusBadGateway)
 		return
@@ -307,18 +328,21 @@ func (p *NPMProxy) handleScopedTarball(w http.ResponseWriter, r *http.Request) {
 	w.Write(data)
 }
 
-// fetchFromUpstream fetches data from the upstream npm registry
-func (p *NPMProxy) fetchFromUpstream(path string) ([]byte, error) {
-	// Find upstream registry
+// fetchFromUpstream fetches data from the upstream npm registry for the
+// resolved registry (or the default public npm registry if reg is nil or
+// doesn't proxy an upstream).
+func (p *NPMProxy) fetchFromUpstream(reg *database.RegistryConfig, path string) ([]byte, error) {
 	upstream := "https://registry.npmjs.org"
-	for _, reg := range p.registries {
-		if reg.Type == "npm" && reg.Proxy {
-			upstream = reg.URL
-			break
-		}
+	if reg != nil && reg.Proxy && reg.URL != "" {
+		upstream = reg.URL
 	}
 
-	resp, err := http.Get(upstream + path)
+	req, err := http.NewRequest(http.MethodGet, upstream+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	proxypkg.ApplyUpstreamAuth(req, reg)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -329,9 +353,40 @@ func (p *NPMProxy) fetchFromUpstream(path string) ([]byte, error) {
 	return data, nil
 }
 
+// fetchIfUpdated re-downloads the tarball from upstream and returns its data
+// only if it differs from the locally stored artifact.
+func (p *NPMProxy) fetchIfUpdated(reg *database.RegistryConfig, artifactType, namespace, pkgName, version string) ([]byte, error) {
+	tarballURL, err := p.getTarballURL(reg, pkgName, version)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, tarballURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	proxypkg.ApplyUpstreamAuth(req, reg)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	if existing, err := p.storage.GetArtifact(artifactType, namespace, pkgName, version); err == nil && existing != nil && bytes.Equal(existing, data) {
+		return nil, nil
+	}
+
+	return data, nil
+}
+
 // getTarballURL returns the tarball URL for a pkgName version
-func (p *NPMProxy) getTarballURL(pkgName, version string) (string, error) {
-	registryData, err := p.fetchFromUpstream(fmt.Sprintf("/%s/%s", pkgName, version))
+func (p *NPMProxy) getTarballURL(reg *database.RegistryConfig, pkgName, version string) (string, error) {
+	registryData, err := p.fetchFromUpstream(reg, fmt.Sprintf("/%s/%s", pkgName, version))
 	if err != nil {
 		return "", err
 	}
@@ -367,7 +422,7 @@ func (p *NPMProxy) cacheSet(key string, data []byte) {
 }
 
 // savePackageMetadata saves pkgName metadata to database
-func (p *NPMProxy) savePackageMetadata(packageName string, data []byte) {
+func (p *NPMProxy) savePackageMetadata(registryLabel, packageName string, data []byte) {
 	// Parse and save to database
 	var pkgData map[string]interface{}
 	if err := json.Unmarshal(data, &pkgData); err != nil {
@@ -382,8 +437,8 @@ func (p *NPMProxy) savePackageMetadata(packageName string, data []byte) {
 
 	// Create artifact metadata
 	artifact := &database.ArtifactMetadata{
-		ID:              fmt.Sprintf("npm:%s:latest", packageName),
-		RegistryID:      "npm",
+		ID:              fmt.Sprintf("npm:%s:%s:latest", registryLabel, packageName),
+		RegistryID:      registryLabel,
 		ArtifactType:    "npm",
 		Namespace:       "",
 		ArtifactName:    packageName,
@@ -401,15 +456,15 @@ func (p *NPMProxy) savePackageMetadata(packageName string, data []byte) {
 }
 
 // savePackageVersionMetadata saves pkgName version metadata to database
-func (p *NPMProxy) savePackageVersionMetadata(packageName, version string, data []byte) {
+func (p *NPMProxy) savePackageVersionMetadata(registryLabel, packageName, version string, data []byte) {
 	var pkgData map[string]interface{}
 	if err := json.Unmarshal(data, &pkgData); err != nil {
 		return
 	}
 
 	artifact := &database.ArtifactMetadata{
-		ID:              fmt.Sprintf("npm:%s:%s", packageName, version),
-		RegistryID:      "npm",
+		ID:              fmt.Sprintf("npm:%s:%s:%s", registryLabel, packageName, version),
+		RegistryID:      registryLabel,
 		ArtifactType:    "npm",
 		Namespace:       "",
 		ArtifactName:    packageName,

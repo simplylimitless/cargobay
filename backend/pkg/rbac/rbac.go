@@ -6,8 +6,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/anthropics/cargobay/backend/pkg/database"
-	"github.com/anthropics/cargobay/backend/pkg/middleware"
+	"github.com/simplylimitless/cargobay/backend/pkg/database"
+	"github.com/simplylimitless/cargobay/backend/pkg/middleware"
 	"golang.org/x/exp/slices"
 )
 
@@ -190,16 +190,6 @@ var staticRoles = map[string]*RoleDefinition{
 		},
 		IsSystem: true,
 	},
-	"developer": {
-		ID:          "developer",
-		Name:        "Developer",
-		Description: "Standard developer access - read/write artifacts, search",
-		Permissions: []string{
-			"artifact:read", "artifact:write", "artifact:search",
-			"artifact:sign",
-		},
-		IsSystem: true,
-	},
 	"viewer": {
 		ID:          "viewer",
 		Name:        "Viewer",
@@ -217,16 +207,6 @@ var staticRoles = map[string]*RoleDefinition{
 		Permissions: []string{
 			"artifact:read", "artifact:write", "artifact:sign",
 			"artifact:search",
-		},
-		IsSystem: true,
-	},
-	"auditor": {
-		ID:          "auditor",
-		Name:        "Auditor",
-		Description: "Can read artifacts and audit logs",
-		Permissions: []string{
-			"artifact:read", "artifact:search",
-			"audit:read",
 		},
 		IsSystem: true,
 	},
@@ -300,6 +280,38 @@ func (r *RBAC) HasPermission(userID, permissionID string) bool {
 		}
 	}
 	return false
+}
+
+// CanReadRegistry reports whether userID (empty = anonymous) may read/pull
+// from reg. Public registries are open to everyone, including anonymous
+// callers; private registries require an explicit grant (or the
+// registry:write admin bypass).
+func (r *RBAC) CanReadRegistry(userID string, reg *database.RegistryConfig) bool {
+	if reg == nil || !reg.Private {
+		return true
+	}
+	if userID == "" {
+		return false
+	}
+	if r.HasPermission(userID, "registry:write") {
+		return true
+	}
+	access, err := r.db.GetRegistryAccess(reg.ID, userID)
+	return err == nil && access != nil && access.CanRead
+}
+
+// CanPublishRegistry reports whether userID may push to reg. Publishing to
+// a public/upstream registry is never allowed — only private registries
+// accept pushes, and only from explicitly granted users (or admins).
+func (r *RBAC) CanPublishRegistry(userID string, reg *database.RegistryConfig) bool {
+	if reg == nil || userID == "" || !reg.Private {
+		return false
+	}
+	if r.HasPermission(userID, "registry:write") {
+		return true
+	}
+	access, err := r.db.GetRegistryAccess(reg.ID, userID)
+	return err == nil && access != nil && access.CanPublish
 }
 
 // hasPermissionInRole checks if a role has a specific permission

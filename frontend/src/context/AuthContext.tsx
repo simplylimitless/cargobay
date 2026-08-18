@@ -20,6 +20,8 @@ interface AuthContextValue {
   login: (username: string, password: string) => Promise<void>
   logout: () => void
   canManage: (uploadedBy: string) => boolean
+  updateProfile: (username: string, email: string) => void
+  setSession: (accessToken: string, user: { userId: string; username: string; email: string; roles?: string[]; permissions?: string[] }) => void
 }
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined)
@@ -106,6 +108,29 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     localStorage.removeItem(STORAGE_USER_KEY)
   }
 
+  const setSession: AuthContextValue['setSession'] = (accessToken, user) => {
+    const newUser: User = {
+      id: user.userId,
+      username: user.username,
+      email: user.email,
+      roles: (user.roles || []) as Role[],
+      permissions: user.permissions || [],
+    }
+    setToken(accessToken)
+    setCurrentUser(newUser)
+    localStorage.setItem(STORAGE_KEY, accessToken)
+    localStorage.setItem(STORAGE_USER_KEY, JSON.stringify(newUser))
+  }
+
+  const updateProfile = (username: string, email: string) => {
+    setCurrentUser((prev) => {
+      if (!prev) return prev
+      const updated = { ...prev, username, email }
+      localStorage.setItem(STORAGE_USER_KEY, JSON.stringify(updated))
+      return updated
+    })
+  }
+
   const isAdmin = currentUser?.roles.includes('admin') || false
 
   const canManage = (uploadedBy: string) => {
@@ -114,7 +139,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }
 
   return (
-    <AuthContext.Provider value={{ currentUser, token, isAdmin, login, logout, canManage }}>
+    <AuthContext.Provider value={{ currentUser, token, isAdmin, login, logout, canManage, updateProfile, setSession }}>
       {children}
     </AuthContext.Provider>
   )

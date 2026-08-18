@@ -19,6 +19,7 @@ This guide explains how to configure cargobay for your environment.
 | `CB_ENCRYPTION_KEY` | Key for sensitive data encryption | Auto-generated |
 | `CB_SCAN_ENABLED` | Enable vulnerability scanning | `true` |
 | `CB_SCAN_INTERVAL` | Default scan interval in seconds | `86400` (24h) |
+| `TRIVY_CACHE_DIR` | Trivy vulnerability-DB cache directory used by the backend's own DB-refresh scheduler; must match the volume mounted into the `trivy` server container | `/app/trivy-cache` |
 | `CB_CACHE_TTL` | Cache TTL in seconds | `3600` (1h) |
 | `CB_MAX_UPLOAD_SIZE` | Maximum upload size in bytes | `1073741824` (1GB) |
 
@@ -186,6 +187,19 @@ scanning:
   fail_on_critical: false
   ignore_pending: true
 ```
+
+### Vulnerability DB Updates
+
+Unlike the rest of this section, auto-update enablement and refresh
+interval for Trivy's vulnerability database are **not** set via
+`config.yaml` — they're stored in the `vulnerability_db_settings` table
+and tunable live from Settings → Vulnerability DB in the UI, or via the
+[Vulnerability DB Settings API](api.md#vulnerability-db-settings). This is
+because the backend owns DB refreshes itself (shelling out to a bundled
+`trivy` CLI) rather than relying on `trivy server`'s own updater, which
+exposes no runtime control over its cadence. See
+[Testing](contributing.md#testing) for how this scheduler is covered by
+tests.
 
 ### Vulnerability Thresholds
 

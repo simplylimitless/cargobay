@@ -1,28 +1,30 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"time"
 
-	"github.com/anthropics/cargobay/backend/pkg/api"
-	"github.com/anthropics/cargobay/backend/pkg/cache"
-	"github.com/anthropics/cargobay/backend/pkg/config"
-	"github.com/anthropics/cargobay/backend/pkg/database"
-	"github.com/anthropics/cargobay/backend/pkg/middleware"
-	"github.com/anthropics/cargobay/backend/pkg/proxy"
-	"github.com/anthropics/cargobay/backend/pkg/proxy/docker"
-	"github.com/anthropics/cargobay/backend/pkg/proxy/helm"
-	"github.com/anthropics/cargobay/backend/pkg/proxy/maven"
-	"github.com/anthropics/cargobay/backend/pkg/proxy/nuget"
-	"github.com/anthropics/cargobay/backend/pkg/proxy/npm"
-	"github.com/anthropics/cargobay/backend/pkg/proxy/pypi"
-	"github.com/anthropics/cargobay/backend/pkg/rbac"
-	"github.com/anthropics/cargobay/backend/pkg/storage"
-	"github.com/anthropics/cargobay/backend/pkg/vulnerability"
+	"github.com/simplylimitless/cargobay/backend/pkg/api"
+	"github.com/simplylimitless/cargobay/backend/pkg/cache"
+	"github.com/simplylimitless/cargobay/backend/pkg/config"
+	"github.com/simplylimitless/cargobay/backend/pkg/database"
+	"github.com/simplylimitless/cargobay/backend/pkg/middleware"
+	"github.com/simplylimitless/cargobay/backend/pkg/proxy"
+	"github.com/simplylimitless/cargobay/backend/pkg/proxy/docker"
+	"github.com/simplylimitless/cargobay/backend/pkg/proxy/helm"
+	"github.com/simplylimitless/cargobay/backend/pkg/proxy/maven"
+	"github.com/simplylimitless/cargobay/backend/pkg/proxy/nuget"
+	"github.com/simplylimitless/cargobay/backend/pkg/proxy/npm"
+	"github.com/simplylimitless/cargobay/backend/pkg/proxy/pypi"
+	"github.com/simplylimitless/cargobay/backend/pkg/rbac"
+	"github.com/simplylimitless/cargobay/backend/pkg/storage"
+	"github.com/simplylimitless/cargobay/backend/pkg/vulnerability"
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
 )
@@ -79,8 +81,21 @@ func main() {
 	// Initialize vulnerability scanner
 	scanner := vulnerability.NewScanner(db, storageAdapter, cacheClient)
 
+	// Initialize vulnerability DB updater. The cache dir must match the
+	// volume mounted into the `trivy` server container (./data/app/trivy-cache
+	// in docker-compose.yml) so both share the same downloaded DB.
+	trivyCacheDir := os.Getenv("TRIVY_CACHE_DIR")
+	if trivyCacheDir == "" {
+		trivyCacheDir = "/app/trivy-cache"
+	}
+	vulnDBUpdater := vulnerability.NewDBUpdater(db, trivyCacheDir)
+
+	schedulerCtx, cancelScheduler := context.WithCancel(context.Background())
+	defer cancelScheduler()
+	go vulnDBUpdater.StartScheduler(schedulerCtx)
+
 	// Initialize API server
-	apiServer := api.NewServer(db, rbacMgr, scanner, storageAdapter, cacheClient)
+	apiServer := api.NewServer(db, rbacMgr, scanner, storageAdapter, cacheClient, vulnDBUpdater)
 
 	// Create router
 	r := chi.NewRouter()
@@ -110,38 +125,39 @@ func main() {
 		r.Use(middleware.NewAuthMiddleware(db, rbacMgr))
 		r.Get("/registries", proxyManager.ListRegistries)
 		r.Get("/search", proxyManager.SearchArtifacts)
-		r.Get("/search/upstream", proxyManager.SearchUpstream)
 		r.Get("/artifacts/{namespace}/{artifactName}", proxyManager.GetArtifactInfo)
 		r.Get("/artifacts/{namespace}/{artifactName}/{version}/download", proxyManager.DownloadArtifact)
 	})
 
 	// Proxy routes
 	r.Route("/npm", func(r chi.Router) {
-		r.Mount("/", npm.NewNPMProxy(db, storageAdapter, cacheClient, registries))
+		r.Use(middleware.NewAuthMiddleware(db, rbacMgr))
+		r.Mount("/", npm.NewNPMProxy(db, storageAdapter, cacheClient, rbacMgr, registries))
 	})
 
 	r.Route("/maven", func(r chi.Router) {
-		r.Mount("/", maven.NewMavenProxy(db, storageAdapter, cacheClient, registries))
+		r.Use(middleware.NewAuthMiddleware(db, rbacMgr))
+		r.Mount("/", maven.NewMavenProxy(db, storageAdapter, cacheClient, rbacMgr, registries))
 	})
 
 	r.Route("/docker", func(r chi.Router) {
 		r.Use(middleware.NewAuthMiddleware(db, rbacMgr))
-		r.Mount("/", docker.NewDockerProxy(db, storageAdapter, cacheClient, registries))
+		r.Mount("/", docker.NewDockerProxy(db, storageAdapter, cacheClient, rbacMgr, registries))
 	})
 
 	r.Route("/pypi", func(r chi.Router) {
 		r.Use(middleware.NewAuthMiddleware(db, rbacMgr))
-		r.Mount("/", pypi.NewPyPIProxy(db, storageAdapter, cacheClient, registries))
+		r.Mount("/", pypi.NewPyPIProxy(db, storageAdapter, cacheClient, rbacMgr, registries))
 	})
 
 	r.Route("/nuget", func(r chi.Router) {
 		r.Use(middleware.NewAuthMiddleware(db, rbacMgr))
-		r.Mount("/", nuget.NewNuGetProxy(db, storageAdapter, cacheClient, registries))
+		r.Mount("/", nuget.NewNuGetProxy(db, storageAdapter, cacheClient, rbacMgr, registries))
 	})
 
 	r.Route("/helm", func(r chi.Router) {
 		r.Use(middleware.NewAuthMiddleware(db, rbacMgr))
-		r.Mount("/", helm.NewHelmProxy(db, storageAdapter, cacheClient, registries))
+		r.Mount("/", helm.NewHelmProxy(db, storageAdapter, cacheClient, rbacMgr, registries))
 	})
 
 	// Server setup

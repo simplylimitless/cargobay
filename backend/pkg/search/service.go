@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/anthropics/cargobay/backend/pkg/database"
+	"github.com/simplylimitless/cargobay/backend/pkg/database"
 	"github.com/elastic/go-elasticsearch/v8"
 	"github.com/elastic/go-elasticsearch/v8/esutil"
 )

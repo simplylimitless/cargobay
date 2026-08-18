@@ -217,6 +217,39 @@ func TestArtifactUpload(t *testing.T) {
 }
 ```
 
+#### Testing code that shells out or hits Postgres directly
+
+Some backend components (e.g. `pkg/vulnerability/DBUpdater`, which shells
+out to the `trivy` CLI and writes results via `*database.Database`) depend
+on things a unit test shouldn't require: a live Postgres connection, or the
+real external binary. The established pattern, illustrated by
+`pkg/vulnerability/updater_test.go`:
+
+- Depend on a **narrow interface** (e.g. `settingsStore`, covering just the
+  two `*database.Database` methods actually used) instead of the concrete
+  type, so a lightweight in-memory fake can be substituted in tests.
+- Make the external binary's path/name a **struct field with a sane
+  default** (e.g. `trivyBin string`, defaulting to `"trivy"`), so tests can
+  point it at a small stub shell script and exercise both success and
+  failure exit codes without the real tool installed.
+- Extract any pure decision logic (e.g. the "is this update due yet"
+  check) into a **standalone function** taking plain values (no clock or DB
+  access of its own), so it can be tested directly with table-driven time
+  scenarios.
+
+```go
+// updater_test.go — fake replacing the *database.Database dependency
+type fakeSettingsStore struct{ /* ... */ }
+func (f *fakeSettingsStore) GetVulnDBSettings() (*database.VulnDBSettings, error)      { /* ... */ }
+func (f *fakeSettingsStore) RecordVulnDBUpdateResult(t time.Time, ok bool, msg string) error { /* ... */ }
+
+updater := &DBUpdater{db: store, cacheDir: t.TempDir(), trivyBin: writeStubScript(t, 1, "boom")}
+err := updater.RunUpdate(context.Background())
+// asserts the failure path was recorded, without a real trivy binary or DB
+```
+
+Run just that package's tests while iterating: `go test ./pkg/vulnerability/... -v`.
+
 ### Frontend Testing
 
 ```typescript

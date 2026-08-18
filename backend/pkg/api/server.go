@@ -8,13 +8,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/anthropics/cargobay/backend/pkg/auth"
-	"github.com/anthropics/cargobay/backend/pkg/cache"
-	"github.com/anthropics/cargobay/backend/pkg/database"
-	"github.com/anthropics/cargobay/backend/pkg/middleware"
-	"github.com/anthropics/cargobay/backend/pkg/rbac"
-	"github.com/anthropics/cargobay/backend/pkg/storage"
-	"github.com/anthropics/cargobay/backend/pkg/vulnerability"
+	"github.com/simplylimitless/cargobay/backend/pkg/auth"
+	"github.com/simplylimitless/cargobay/backend/pkg/cache"
+	"github.com/simplylimitless/cargobay/backend/pkg/database"
+	"github.com/simplylimitless/cargobay/backend/pkg/middleware"
+	"github.com/simplylimitless/cargobay/backend/pkg/rbac"
+	"github.com/simplylimitless/cargobay/backend/pkg/storage"
+	"github.com/simplylimitless/cargobay/backend/pkg/vulnerability"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -24,6 +24,7 @@ type Server struct {
 	db             *database.Database
 	rbac           *rbac.RBAC
 	scanner        *vulnerability.VulnerabilityScanner
+	vulnDBUpdater  *vulnerability.DBUpdater
 	storageAdapter storage.StorageAdapter
 	cache          *cache.Cache
 	server         *http.Server
@@ -48,12 +49,13 @@ type PaginationResponse struct {
 
 // NewServer creates a new API server
 func NewServer(db *database.Database, rbacMgr *rbac.RBAC, scanner *vulnerability.VulnerabilityScanner,
-	storageAdapter storage.StorageAdapter, cacheClient *cache.Cache) *Server {
+	storageAdapter storage.StorageAdapter, cacheClient *cache.Cache, vulnDBUpdater *vulnerability.DBUpdater) *Server {
 
 	s := &Server{
 		db:             db,
 		rbac:           rbacMgr,
 		scanner:        scanner,
+		vulnDBUpdater:  vulnDBUpdater,
 		storageAdapter: storageAdapter,
 		cache:          cacheClient,
 	}
@@ -80,6 +82,10 @@ func (s *Server) setupRoutes() {
 	// Auth endpoints (public)
 	api.Post("/auth/login", s.handleLogin)
 	api.Post("/auth/logout", s.handleLogout)
+
+	// First-run setup endpoints (public - handleSetupInit refuses once any user exists)
+	api.Get("/setup/status", s.handleSetupStatus)
+	api.Post("/setup", s.handleSetupInit)
 
 	// Artifacts endpoints
 	api.Get("/artifacts", s.handleListArtifacts)
@@ -109,6 +115,9 @@ func (s *Server) setupRoutes() {
 	api.Get("/replication/regions", s.handleListRegions)
 	api.Get("/audit/logs", s.handleListAuditLogs)
 
+	// Vulnerability DB settings (read) — permission enforced in-handler via system:read
+	api.Get("/settings/vulnerability-db", s.handleGetVulnDBSettings)
+
 	// Everything below mutates state and requires an authenticated caller.
 	api.Group(func(api chi.Router) {
 		api.Use(middleware.RequireAuth)
@@ -120,12 +129,24 @@ func (s *Server) setupRoutes() {
 
 		api.Post("/registries", s.handleCreateRegistry)
 		api.Delete("/registries/{id}", s.handleDeleteRegistry)
+		api.Post("/registries/{id}/access", s.handleGrantRegistryAccess)
+		api.Delete("/registries/{id}/access/{userId}", s.handleRevokeRegistryAccess)
+		api.Get("/registries/{id}/access", s.handleListRegistryAccess)
 
 		api.Post("/replication/sync", s.handleReplicationSync)
+
+		api.Put("/settings/vulnerability-db", s.handleUpdateVulnDBSettings)
+		api.Post("/settings/vulnerability-db/update", s.handleTriggerVulnDBUpdate)
+
+		// Self-service profile endpoints - any authenticated user may update their own account.
+		api.Put("/users/me", s.handleUpdateCurrentUser)
+		api.Post("/users/me/password", s.handleChangePassword)
 
 		// User management requires admin ("user:admin"), enforced per-handler
 		// via rbac.CanManageUser / RBAC.RequirePermission.
 		api.Post("/users", s.rbac.RequirePermission("user:admin")(http.HandlerFunc(s.handleCreateUser)).ServeHTTP)
+		api.Put("/users/{id}", s.rbac.RequirePermission("user:admin")(http.HandlerFunc(s.handleUpdateUser)).ServeHTTP)
+		api.Post("/users/{id}/password", s.rbac.RequirePermission("user:admin")(http.HandlerFunc(s.handleAdminResetPassword)).ServeHTTP)
 		api.Delete("/users/{id}", s.handleDeactivateUser)
 		api.Post("/users/{id}/roles", s.rbac.RequirePermission("user:admin")(http.HandlerFunc(s.handleAssignUserRole)).ServeHTTP)
 		api.Delete("/users/{id}/roles/{roleId}", s.rbac.RequirePermission("user:admin")(http.HandlerFunc(s.handleRevokeUserRole)).ServeHTTP)
@@ -383,6 +404,86 @@ func (s *Server) handleScanArtifact(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, result)
 }
 
+// handleGetVulnDBSettings returns the current vulnerability-DB update settings.
+func (s *Server) handleGetVulnDBSettings(w http.ResponseWriter, r *http.Request) {
+	user := middleware.GetUser(r)
+	if user == nil || !s.rbac.HasPermission(user.UserID, "system:read") {
+		s.writeJSONError(w, http.StatusForbidden, "Permission denied: system:read required")
+		return
+	}
+
+	settings, err := s.db.GetVulnDBSettings()
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get vulnerability DB settings: %v", err))
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, settings)
+}
+
+// handleUpdateVulnDBSettings updates the auto-update toggle and refresh interval.
+func (s *Server) handleUpdateVulnDBSettings(w http.ResponseWriter, r *http.Request) {
+	user := middleware.GetUser(r)
+	if user == nil || !s.rbac.HasPermission(user.UserID, "system:write") {
+		s.writeJSONError(w, http.StatusForbidden, "Permission denied: system:write required")
+		return
+	}
+
+	var input struct {
+		AutoUpdateEnabled   bool `json:"autoUpdateEnabled"`
+		UpdateIntervalHours int  `json:"updateIntervalHours"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		s.writeJSONError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	if input.UpdateIntervalHours < 1 {
+		s.writeJSONError(w, http.StatusBadRequest, "updateIntervalHours must be at least 1")
+		return
+	}
+
+	if err := s.db.UpdateVulnDBSettings(input.AutoUpdateEnabled, input.UpdateIntervalHours); err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to update vulnerability DB settings: %v", err))
+		return
+	}
+
+	settings, err := s.db.GetVulnDBSettings()
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get vulnerability DB settings: %v", err))
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, settings)
+}
+
+// handleTriggerVulnDBUpdate synchronously runs a vulnerability-DB refresh
+// and returns the resulting settings row.
+func (s *Server) handleTriggerVulnDBUpdate(w http.ResponseWriter, r *http.Request) {
+	user := middleware.GetUser(r)
+	if user == nil || !s.rbac.HasPermission(user.UserID, "system:write") {
+		s.writeJSONError(w, http.StatusForbidden, "Permission denied: system:write required")
+		return
+	}
+
+	if s.vulnDBUpdater == nil {
+		s.writeJSONError(w, http.StatusServiceUnavailable, "Vulnerability DB updater is not configured")
+		return
+	}
+
+	// Errors are surfaced via the settings row's lastError field (set by
+	// RunUpdate), not as an HTTP error — the request itself succeeded in
+	// attempting the update.
+	_ = s.vulnDBUpdater.RunUpdate(r.Context())
+
+	settings, err := s.db.GetVulnDBSettings()
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get vulnerability DB settings: %v", err))
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, settings)
+}
+
 // handleDownloadArtifact handles downloading an artifact
 func (s *Server) handleDownloadArtifact(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
@@ -486,7 +587,11 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, results)
 }
 
-// handleListRegistries handles listing registries
+// handleListRegistries handles listing registries. Private registries the
+// caller (anonymous or authenticated) can't read are omitted entirely — this
+// is the only interface most clients use to discover what registries exist,
+// so filtering here is what actually keeps a private registry's existence
+// from leaking to users with no access to it.
 func (s *Server) handleListRegistries(w http.ResponseWriter, r *http.Request) {
 	registries, err := s.db.ListRegistries()
 	if err != nil {
@@ -494,8 +599,20 @@ func (s *Server) handleListRegistries(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	userID := ""
+	if user := middleware.GetUser(r); user != nil {
+		userID = user.UserID
+	}
+
+	visible := make([]database.RegistryConfig, 0, len(registries))
+	for _, reg := range registries {
+		if s.rbac.CanReadRegistry(userID, &reg) {
+			visible = append(visible, reg)
+		}
+	}
+
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{
-		"registries": registries,
+		"registries": visible,
 	})
 }
 
@@ -533,7 +650,88 @@ func (s *Server) handleGetRegistry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	userID := ""
+	if user := middleware.GetUser(r); user != nil {
+		userID = user.UserID
+	}
+	if !s.rbac.CanReadRegistry(userID, registry) {
+		s.writeJSONError(w, http.StatusNotFound, "Registry not found")
+		return
+	}
+
 	s.writeJSON(w, http.StatusOK, registry)
+}
+
+// handleGrantRegistryAccess grants (or updates) a user's read/publish rights
+// on a private registry. Only callers with registry:write may manage grants.
+func (s *Server) handleGrantRegistryAccess(w http.ResponseWriter, r *http.Request) {
+	user := middleware.GetUser(r)
+	if user == nil || !s.rbac.HasPermission(user.UserID, "registry:write") {
+		s.writeJSONError(w, http.StatusForbidden, "Permission denied: registry:write required")
+		return
+	}
+
+	registryID := chi.URLParam(r, "id")
+	var body struct {
+		UserID     string `json:"userId"`
+		CanRead    bool   `json:"canRead"`
+		CanPublish bool   `json:"canPublish"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.UserID == "" {
+		s.writeJSONError(w, http.StatusBadRequest, "Invalid request body: userId is required")
+		return
+	}
+
+	access := &database.RegistryAccess{
+		RegistryID: registryID,
+		UserID:     body.UserID,
+		CanRead:    body.CanRead,
+		CanPublish: body.CanPublish,
+	}
+	if err := s.db.GrantRegistryAccess(access); err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to grant access: %v", err))
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, access)
+}
+
+// handleRevokeRegistryAccess removes a user's grant on a private registry.
+func (s *Server) handleRevokeRegistryAccess(w http.ResponseWriter, r *http.Request) {
+	user := middleware.GetUser(r)
+	if user == nil || !s.rbac.HasPermission(user.UserID, "registry:write") {
+		s.writeJSONError(w, http.StatusForbidden, "Permission denied: registry:write required")
+		return
+	}
+
+	registryID := chi.URLParam(r, "id")
+	userID := chi.URLParam(r, "userId")
+	if err := s.db.RevokeRegistryAccess(registryID, userID); err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to revoke access: %v", err))
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, map[string]string{"status": "revoked"})
+}
+
+// handleListRegistryAccess lists all user grants on a private registry.
+func (s *Server) handleListRegistryAccess(w http.ResponseWriter, r *http.Request) {
+	user := middleware.GetUser(r)
+	if user == nil || !s.rbac.HasPermission(user.UserID, "registry:write") {
+		s.writeJSONError(w, http.StatusForbidden, "Permission denied: registry:write required")
+		return
+	}
+
+	registryID := chi.URLParam(r, "id")
+	grants, err := s.db.ListRegistryAccessForRegistry(registryID)
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to list access: %v", err))
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"grants": grants,
+	})
 }
 
 // handleDeleteRegistry handles deleting a registry
@@ -627,6 +825,21 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if existing, err := s.db.GetUserByUsername(input.Username); err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to check username: %v", err))
+		return
+	} else if existing != nil {
+		s.writeJSONError(w, http.StatusConflict, "Username is already taken")
+		return
+	}
+	if existing, err := s.db.GetUserByEmail(input.Email); err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to check email: %v", err))
+		return
+	} else if existing != nil {
+		s.writeJSONError(w, http.StatusConflict, "Email is already in use")
+		return
+	}
+
 	// Hash password
 	passwordHash, err := auth.HashPassword(input.Password)
 	if err != nil {
@@ -685,10 +898,147 @@ func (s *Server) handleDeactivateUser(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]string{"message": "User deactivated successfully"})
 }
 
-// handleAssignUserRole handles assigning a role to a user
+// handleUpdateUser handles an admin editing another user's profile: username,
+// email, and active status. Role changes go through /users/{id}/roles;
+// password resets go through handleAdminResetPassword below.
+func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	user, err := s.db.GetUser(id)
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get user: %v", err))
+		return
+	}
+	if user == nil {
+		s.writeJSONError(w, http.StatusNotFound, "User not found")
+		return
+	}
+
+	var input struct {
+		Username string `json:"username"`
+		Email    string `json:"email"`
+		IsActive bool   `json:"isActive"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		s.writeJSONError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	if input.Username == "" {
+		s.writeJSONError(w, http.StatusBadRequest, "username is required")
+		return
+	}
+	if input.Email == "" {
+		s.writeJSONError(w, http.StatusBadRequest, "email is required")
+		return
+	}
+
+	if input.Username != user.Username {
+		if existing, err := s.db.GetUserByUsername(input.Username); err != nil {
+			s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to check username: %v", err))
+			return
+		} else if existing != nil {
+			s.writeJSONError(w, http.StatusConflict, "Username is already taken")
+			return
+		}
+	}
+	if input.Email != user.Email {
+		if existing, err := s.db.GetUserByEmail(input.Email); err != nil {
+			s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to check email: %v", err))
+			return
+		} else if existing != nil {
+			s.writeJSONError(w, http.StatusConflict, "Email is already in use")
+			return
+		}
+	}
+
+	if err := s.db.UpdateUserProfile(id, input.Username, input.Email); err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to update profile: %v", err))
+		return
+	}
+	if err := s.db.SetUserActive(id, input.IsActive); err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to update active status: %v", err))
+		return
+	}
+
+	if !input.IsActive {
+		keys, err := s.db.ListUserAccessKeys(id)
+		if err != nil {
+			s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to list access keys: %v", err))
+			return
+		}
+		for _, key := range keys {
+			if err := s.db.InvalidateAccessKey(key.ID); err != nil {
+				s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to invalidate access key %s: %v", key.ID, err))
+				return
+			}
+		}
+	}
+
+	updated, err := s.db.GetUser(id)
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to load updated user: %v", err))
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, updated)
+}
+
+// handleAdminResetPassword handles an admin setting a user's password
+// without knowing their current one (unlike handleChangePassword, which is
+// self-service and requires it).
+func (s *Server) handleAdminResetPassword(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	user, err := s.db.GetUser(id)
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get user: %v", err))
+		return
+	}
+	if user == nil {
+		s.writeJSONError(w, http.StatusNotFound, "User not found")
+		return
+	}
+
+	var input struct {
+		NewPassword string `json:"newPassword"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		s.writeJSONError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	if len(input.NewPassword) < 8 {
+		s.writeJSONError(w, http.StatusBadRequest, "newPassword must be at least 8 characters")
+		return
+	}
+
+	newHash, err := auth.HashPassword(input.NewPassword)
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, "Failed to hash password")
+		return
+	}
+
+	if err := s.db.UpdateUserPassword(id, newHash); err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to update password: %v", err))
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, map[string]string{"message": "Password reset successfully"})
+}
+
+// handleAssignUserRole handles assigning a role to a user. Users hold a
+// single role, so this replaces any roles the user currently has rather
+// than adding to them.
 func (s *Server) handleAssignUserRole(w http.ResponseWriter, r *http.Request) {
 	 userID := chi.URLParam(r, "id")
-	 roleID := chi.URLParam(r, "roleId")
+
+	 var input struct {
+		 RoleID string `json:"roleId"`
+	 }
+	 if err := json.NewDecoder(r.Body).Decode(&input); err != nil || input.RoleID == "" {
+		 s.writeJSONError(w, http.StatusBadRequest, "roleId is required")
+		 return
+	 }
+	 roleID := input.RoleID
 
 	 // Check if user exists
 	 user, err := s.db.GetUser(userID)
@@ -708,9 +1058,23 @@ func (s *Server) handleAssignUserRole(w http.ResponseWriter, r *http.Request) {
 		 return
 	 }
 
-	 // Assign role
-	 err = s.db.AssignRoleToUser(userID, roleID)
+	 // Replace existing roles with the single new role
+	 existingRoles, err := s.db.GetUserRoles(userID)
 	 if err != nil {
+		 s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get user roles: %v", err))
+		 return
+	 }
+	 for _, existingRoleID := range existingRoles {
+		 if existingRoleID == roleID {
+			 continue
+		 }
+		 if err := s.db.RevokeRoleFromUser(userID, existingRoleID); err != nil {
+			 s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to revoke existing role: %v", err))
+			 return
+		 }
+	 }
+
+	 if err := s.db.AssignRoleToUser(userID, roleID); err != nil {
 		 s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to assign role: %v", err))
 		 return
 	 }
@@ -757,6 +1121,95 @@ func (s *Server) handleGetUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSON(w, http.StatusOK, user)
+}
+
+// handleUpdateCurrentUser handles the logged-in user updating their own username/email
+func (s *Server) handleUpdateCurrentUser(w http.ResponseWriter, r *http.Request) {
+	user := middleware.GetUser(r)
+	if user == nil {
+		s.writeJSONError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	var input struct {
+		Username string `json:"username"`
+		Email    string `json:"email"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		s.writeJSONError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	if input.Username == "" {
+		s.writeJSONError(w, http.StatusBadRequest, "username is required")
+		return
+	}
+	if input.Email == "" {
+		s.writeJSONError(w, http.StatusBadRequest, "email is required")
+		return
+	}
+
+	if err := s.db.UpdateUserProfile(user.UserID, input.Username, input.Email); err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to update profile: %v", err))
+		return
+	}
+
+	updated, err := s.db.GetUserByID(user.UserID)
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to load updated profile: %v", err))
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, updated)
+}
+
+// handleChangePassword handles the logged-in user changing their own password
+func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
+	user := middleware.GetUser(r)
+	if user == nil {
+		s.writeJSONError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	var input struct {
+		CurrentPassword string `json:"currentPassword"`
+		NewPassword     string `json:"newPassword"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		s.writeJSONError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	if input.CurrentPassword == "" || input.NewPassword == "" {
+		s.writeJSONError(w, http.StatusBadRequest, "currentPassword and newPassword are required")
+		return
+	}
+	if len(input.NewPassword) < 8 {
+		s.writeJSONError(w, http.StatusBadRequest, "newPassword must be at least 8 characters")
+		return
+	}
+
+	dbUser, err := s.db.GetUserByID(user.UserID)
+	if err != nil || dbUser == nil {
+		s.writeJSONError(w, http.StatusNotFound, "User not found")
+		return
+	}
+
+	if !auth.VerifyPassword(dbUser.PasswordHash, input.CurrentPassword) {
+		s.writeJSONError(w, http.StatusUnauthorized, "Current password is incorrect")
+		return
+	}
+
+	newHash, err := auth.HashPassword(input.NewPassword)
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, "Failed to hash password")
+		return
+	}
+
+	if err := s.db.UpdateUserPassword(user.UserID, newHash); err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to update password: %v", err))
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, map[string]string{"message": "Password updated successfully"})
 }
 
 // handleGetUserRoles handles getting user roles
@@ -920,6 +1373,115 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"accessToken": output.AccessToken,
+		"expiresAt":   output.ExpiresAt,
+		"user": map[string]interface{}{
+			"userId":      output.UserID,
+			"username":    output.Username,
+			"email":       output.Email,
+			"roles":       output.Roles,
+			"permissions": output.Permissions,
+		},
+	})
+}
+
+// handleSetupStatus reports whether the instance still needs first-run setup
+// (i.e. no users exist yet).
+func (s *Server) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
+	count, err := s.db.CountUsers()
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to check setup status: %v", err))
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"needsSetup": count == 0,
+	})
+}
+
+// handleSetupInit creates the initial admin user and optional starter
+// registries. It is public but only usable while zero users exist - it
+// re-checks that invariant itself rather than trusting a prior status call,
+// so it cannot be used to create a backdoor admin once the instance is live.
+func (s *Server) handleSetupInit(w http.ResponseWriter, r *http.Request) {
+	count, err := s.db.CountUsers()
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to check setup status: %v", err))
+		return
+	}
+	if count > 0 {
+		s.writeJSONError(w, http.StatusForbidden, "Setup has already been completed")
+		return
+	}
+
+	var input struct {
+		Username   string `json:"username"`
+		Email      string `json:"email"`
+		Password   string `json:"password"`
+		Registries []struct {
+			ID       string `json:"id"`
+			Name     string `json:"name"`
+			URL      string `json:"url"`
+			Type     string `json:"type"`
+			Enabled  bool   `json:"enabled"`
+			Priority int    `json:"priority"`
+		} `json:"registries"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		s.writeJSONError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	if input.Username == "" {
+		s.writeJSONError(w, http.StatusBadRequest, "username is required")
+		return
+	}
+	if input.Email == "" {
+		s.writeJSONError(w, http.StatusBadRequest, "email is required")
+		return
+	}
+	if len(input.Password) < 8 {
+		s.writeJSONError(w, http.StatusBadRequest, "password must be at least 8 characters")
+		return
+	}
+
+	passwordHash, err := auth.HashPassword(input.Password)
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, "Failed to hash password")
+		return
+	}
+
+	if _, err := s.db.CreateUser(input.Username, input.Email, passwordHash, []string{"admin"}); err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to create admin user: %v", err))
+		return
+	}
+
+	for _, reg := range input.Registries {
+		if reg.ID == "" || reg.URL == "" {
+			continue
+		}
+		registry := database.RegistryConfig{
+			ID:       reg.ID,
+			Name:     reg.Name,
+			URL:      reg.URL,
+			Type:     reg.Type,
+			Enabled:  reg.Enabled,
+			Priority: reg.Priority,
+		}
+		if err := s.db.SaveRegistry(&registry); err != nil {
+			s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to save registry %s: %v", reg.ID, err))
+			return
+		}
+	}
+
+	// Log the new admin in immediately so the wizard can hand off straight
+	// into an authenticated session.
+	output, err := auth.Login(s.db, input.Username, input.Password)
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Admin created but login failed: %v", err))
+		return
+	}
+
+	s.writeJSON(w, http.StatusCreated, map[string]interface{}{
 		"accessToken": output.AccessToken,
 		"expiresAt":   output.ExpiresAt,
 		"user": map[string]interface{}{

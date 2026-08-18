@@ -31,8 +31,15 @@ RUN addgroup -g 1000 app && adduser -u 1000 -G app -s /bin/sh -D app
 COPY --from=builder /build/cargobay ./
 COPY --from=builder /build/config.example.yaml ./config.yaml
 
-# Storage directory for local artifact storage, owned by the app user
-RUN mkdir -p ./storage && chown -R app:app /app
+# trivy CLI, used by the backend itself to refresh the vulnerability DB on a
+# tunable schedule (trivy server mode has no HTTP control over its own DB
+# update cadence -- see pkg/vulnerability/updater.go).
+COPY --from=aquasec/trivy:latest /usr/local/bin/trivy /usr/local/bin/trivy
+
+# Storage directory for local artifact storage, and a cache dir for the
+# trivy vulnerability DB (kept under /app since /root isn't traversable by
+# the non-root app user), both owned by the app user
+RUN mkdir -p ./storage ./trivy-cache && chown -R app:app /app
 
 # Switch to non-root user
 USER app
