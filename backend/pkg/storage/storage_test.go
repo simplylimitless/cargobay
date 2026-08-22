@@ -1,12 +1,9 @@
 package storage
 
 import (
-	"bytes"
+	"crypto/rand"
 	"fmt"
 	"io"
-	"math/rand"
-	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"

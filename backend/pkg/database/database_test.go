@@ -1,12 +1,10 @@
 package database
 
 import (
-	"fmt"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 // TestGenerateUUID tests UUID generation
@@ -45,11 +43,10 @@ func TestArtifactMetadata(t *testing.T) {
 // TestSignature tests signature struct
 func TestSignature(t *testing.T) {
 	sig := Signature{
-		Type:       "pgp",
-		KeyID:      "0x12345678",
-		Signature:  "base64encoded",
-		Timestamp:  time.Now(),
-		Verified:   true,
+		Type:      "pgp",
+		KeyID:     "0x12345678",
+		Timestamp: time.Now(),
+		Verified:  true,
 	}
 
 	assert.Equal(t, "pgp", sig.Type)
@@ -153,24 +150,9 @@ func TestSearchResults(t *testing.T) {
 	assert.False(t, results.HasMore)
 }
 
-// TestRoleDefinition tests role definition
-func TestRoleDefinition(t *testing.T) {
-	role := RoleDefinition{
-		ID:          "admin",
-		Name:        "Administrator",
-		Description: "Full admin access",
-		Permissions: []string{"artifact:read", "artifact:write"},
-		IsSystem:    true,
-	}
-
-	assert.Equal(t, "admin", role.ID)
-	assert.True(t, role.IsSystem)
-	assert.Len(t, role.Permissions, 2)
-}
-
-// TestPermissionDefinition tests permission definition
-func TestPermissionDefinition(t *testing.T) {
-	perm := PermissionDefinition{
+// TestPermission tests permission struct
+func TestPermission(t *testing.T) {
+	perm := Permission{
 		ID:          "artifact:read",
 		Name:        "Read Artifacts",
 		Description: "Can read artifacts",

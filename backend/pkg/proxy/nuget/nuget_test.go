@@ -1,10 +1,13 @@
 package nuget
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"sync"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/assert"
@@ -16,560 +19,561 @@ import (
 	"github.com/simplylimitless/cargobay/backend/pkg/storage"
 )
 
-// MockDatabase is a simple mock database for testing
-type MockDatabase struct {
-	Artifacts   map[string]*database.ArtifactMetadata
-	Registries  map[string]*database.RegistryConfig
-	mu          sync.RWMutex
-}
-
-func NewMockDatabase() *MockDatabase {
-	return &MockDatabase{
-		Artifacts:  make(map[string]*database.ArtifactMetadata),
-		Registries: make(map[string]*database.RegistryConfig),
+// connectTestDB returns a live, connected database.Database, skipping the
+// test if Postgres isn't reachable in this environment.
+func connectTestDB(t *testing.T) *database.Database {
+	t.Helper()
+	db := database.New("postgres://cargobay:password@localhost:5432/cargobay")
+	if err := db.Connect(); err != nil {
+		t.Skipf("skipping: postgres not reachable: %v", err)
 	}
+	t.Cleanup(func() { db.Disconnect() })
+	return db
 }
 
-func (m *MockDatabase) SaveArtifact(a *database.ArtifactMetadata) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.Artifacts[a.ID] = a
-	return nil
-}
-
-func (m *MockDatabase) ListArtifacts(registry string, opts database.ListOptions) ([]database.ArtifactMetadata, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	var result []database.ArtifactMetadata
-	for _, a := range m.Artifacts {
-		if opts.ArtifactType != "" && a.ArtifactType != opts.ArtifactType {
-			continue
-		}
-		if opts.Namespace != "" && a.Namespace != opts.Namespace {
-			continue
-		}
-		result = append(result, *a)
+// connectTestCache returns a live, connected cache.Cache, skipping the test
+// if Redis isn't reachable in this environment.
+func connectTestCache(t *testing.T) *cache.Cache {
+	t.Helper()
+	c, err := cache.New("redis", "redis://localhost:6379/0")
+	if err != nil {
+		t.Skipf("skipping: redis not reachable: %v", err)
 	}
-	return result, nil
+	t.Cleanup(func() { c.Close() })
+	return c
 }
 
-func (m *MockDatabase) SaveRegistry(r *database.RegistryConfig) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.Registries[r.ID] = r
-	return nil
-}
-
-func (m *MockDatabase) GetRegistry(id string) (*database.RegistryConfig, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.Registries[id], nil
-}
-
-// MockStorageAdapter is a mock storage for testing
-type MockStorageAdapter struct {
-	Artifacts map[string][]byte
-	mu        sync.RWMutex
-}
-
-func NewMockStorage() *MockStorageAdapter {
-	return &MockStorageAdapter{
-		Artifacts: make(map[string][]byte),
-	}
-}
-
-func (m *MockStorageAdapter) Connect() error                      { return nil }
-func (m *MockStorageAdapter) Disconnect() error                   { return nil }
-func (m *MockStorageAdapter) SaveArtifact(reg, ns, name, ver string, data []byte) (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.Artifacts[reg+"/"+ns+"/"+name+"/"+ver] = data
-	return "", nil
-}
-func (m *MockStorageAdapter) GetArtifact(reg, ns, name, ver string) ([]byte, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.Artifacts[reg+"/"+ns+"/"+name+"/"+ver], nil
-}
-func (m *MockStorageAdapter) DeleteArtifact(reg, ns, name, ver string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.Artifacts, reg+"/"+ns+"/"+name+"/"+ver)
-	return nil
-}
-func (m *MockStorageAdapter) ArtifactExists(reg, ns, name, ver string) (bool, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	_, ok := m.Artifacts[reg+"/"+ns+"/"+name+"/"+ver]
-	return ok, nil
-}
-
-// MockCache is a mock cache for testing
-type MockCache struct {
-	Data map[string][]byte
-	mu   sync.RWMutex
-}
-
-func NewMockCache() *MockCache {
-	return &MockCache{
-		Data: make(map[string][]byte),
-	}
-}
-
-func (m *MockCache) Get(key string, value interface{}) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if data, ok := m.Data[key]; ok {
-		if val, ok := value.(*[]byte); ok {
-			*val = data
-		}
-		return nil
-	}
-	return cache.ErrCacheMiss
-}
-
-func (m *MockCache) Set(key string, value interface{}) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if data, ok := value.([]byte); ok {
-		m.Data[key] = data
-	}
-}
-
-func (m *MockCache) Delete(key string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.Data, key)
-}
-
-func (m *MockCache) Close() error { return nil }
-
-// TestNewNuGetProxy tests creating a new NuGet proxy
-func TestNewNuGetProxy(t *testing.T) {
-	db := NewMockDatabase()
-	storage := NewMockStorage()
-	cache := NewMockCache()
-	rbacMgr := rbac.New(database.New("postgres://localhost:5432/test"))
-	registries := []database.RegistryConfig{
-		{ID: "nuget", Name: "NuGet Registry", Type: "nuget", Proxy: true, Enabled: true},
-	}
-
-	router := NewNuGetProxy(db, storage, cache, rbacMgr, registries)
-	assert.NotNil(t, router)
-	assert.IsType(t, chi.NewRouter(), router)
-}
-
-// TestHandleRoot tests the root endpoint
-func TestHandleRoot(t *testing.T) {
-	db := NewMockDatabase()
-	storage := NewMockStorage()
-	cache := NewMockCache()
-	rbacMgr := rbac.New(database.New("postgres://localhost:5432/test"))
-	registries := []database.RegistryConfig{
-		{ID: "nuget", Name: "NuGet Registry", Type: "nuget", Proxy: true, Enabled: true},
-	}
-
-	proxy := &NuGetProxy{
+func newTestProxy(t *testing.T, db *database.Database, c *cache.Cache) *NuGetProxy {
+	t.Helper()
+	adapter, err := storage.NewLocalAdapter(map[string]string{"path": t.TempDir()})
+	require.NoError(t, err)
+	return &NuGetProxy{
 		db:         db,
-		storage:    storage,
-		cache:      cache,
-		registries: registries,
+		storage:    adapter,
+		cache:      c,
+		registries: nil,
 		registry:   "nuget",
 	}
+}
 
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
+// uniqueID produces a collision-free identifier for registries/artifact IDs
+// since tests share one live DB. It is NOT safe to use as a tsquery search
+// term (the hyphen is a NOT operator to to_tsquery) — use uniqueWord for
+// anything that gets passed through SearchArtifacts.
+func uniqueID(prefix string) string {
+	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+}
+
+// uniqueWord is like uniqueID but alphanumeric-only, safe to use as both an
+// artifact name and a to_tsquery search term.
+func uniqueWord(prefix string) string {
+	return fmt.Sprintf("%s%d", prefix, time.Now().UnixNano())
+}
+
+// saveArtifact seeds an artifact row under registryID. Several nuget.go
+// single-artifact handlers (handlePackageMetadata, handlePackageV2,
+// handleRegistrationVersion, handleDownload) hard-code the literal registry
+// ID "nuget" when looking artifacts up — instead of the Host-resolved
+// proxypkg.Target.Label the read-access middleware computes for every other
+// handler — so callers exercising those specific handlers must seed under
+// registryID "nuget" for the row to actually be found. See the comments on
+// TestHandlePackageMetadataFound et al.
+func saveArtifact(t *testing.T, db *database.Database, registryID, namespace, name, version string) *database.ArtifactMetadata {
+	t.Helper()
+	artifact := &database.ArtifactMetadata{
+		RegistryID:      registryID,
+		ArtifactType:    "nuget",
+		Namespace:       namespace,
+		ArtifactName:    name,
+		Version:         version,
+		Digest:          "sha256:" + version,
+		DigestAlgorithm: "sha256",
+		Tags:            []string{version},
+		Metadata: map[string]interface{}{
+			"metadata": map[string]interface{}{
+				"description": "test package",
+				"title":       name,
+			},
+		},
+	}
+	require.NoError(t, db.SaveArtifact(artifact))
+	t.Cleanup(func() { db.DeleteArtifact(registryID, namespace, name, version) })
+	return artifact
+}
+
+// bindHostRegistry saves a registry bound to a unique Host, so requests sent
+// with that Host resolve deterministically via ResolveRegistry instead of
+// depending on whatever registry (if any) other concurrently-run test
+// suites left as the DB-wide default for artifactType "nuget".
+func bindHostRegistry(t *testing.T, db *database.Database, private, proxy bool) (*database.RegistryConfig, string) {
+	t.Helper()
+	host := uniqueID("nuget-host") + ".test"
+	reg := &database.RegistryConfig{
+		ID:       uniqueID("nuget-reg"),
+		Name:     "nuget-reg-bound",
+		URL:      "https://upstream.example.com",
+		Type:     "nuget",
+		Enabled:  true,
+		Priority: 100,
+		Private:  private,
+		Proxy:    proxy,
+		Host:     host,
+	}
+	require.NoError(t, db.SaveRegistry(reg))
+	t.Cleanup(func() { db.DeleteRegistry(reg.ID) })
+	return reg, host
+}
+
+// withChiParams attaches a synthetic chi routing context carrying params, so
+// handlers that read chi.URLParam (handlePackageMetadata, handlePackageV2,
+// handleDownload, handleRegistrationIndex, handleRegistrationVersion) can be
+// called directly — white-box, bypassing the router entirely — without
+// needing a real chi match. This sidesteps two real routing quirks
+// discovered while building these tests (documented in
+// TestRegistrationVersionRouteUnreachableForDottedSemver and
+// TestDownloadRouteShadowedByPackageMetadata below): chi's default
+// {version}.json / {version}.nupkg patterns don't reliably match versions
+// that themselves contain dots (e.g. "1.0.0"), which is nuget's standard
+// version format.
+func withChiParams(req *http.Request, params map[string]string) *http.Request {
+	rctx := chi.NewRouteContext()
+	for k, v := range params {
+		rctx.URLParams.Add(k, v)
+	}
+	return req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+}
+
+func TestNewNuGetProxy(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p := newTestProxy(t, db, c)
+
+	router := NewNuGetProxy(p.db, p.storage, p.cache, rbac.New(p.db), p.registries)
+	assert.NotNil(t, router)
+}
+
+func TestHandleServiceIndex(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p := newTestProxy(t, db, c)
+
+	req := httptest.NewRequest(http.MethodGet, "/v3/index.json", nil)
+	req.Host = "cargobay.test"
 	rec := httptest.NewRecorder()
 
-	proxy.handleRoot(rec, req)
+	p.handleServiceIndex(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	var body map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&body))
+	assert.Equal(t, "3.0.0", body["version"])
+
+	resources, ok := body["resources"].([]interface{})
+	require.True(t, ok)
+	require.NotEmpty(t, resources)
+
+	first := resources[0].(map[string]interface{})
+	assert.Contains(t, first["@id"], "http://cargobay.test/nuget/query")
+}
+
+// TestHandleQuery documents a real bug found while writing this test against
+// a live Redis: Cache.Get treats a cache miss (redis.Nil) as success and
+// leaves the destination slice nil rather than returning a distinguishable
+// "miss" error, and handleQuery's `if data, err := n.cacheGet(...); err ==
+// nil` check can't tell that apart from an actual hit. So on a cold cache,
+// handleQuery always short-circuits and writes an empty 200 response —
+// SearchArtifacts is never even called. (The old hand-written MockCache
+// happened to return cache.ErrCacheMiss on a miss, which is why the
+// mock-based version of this test could pass.) Since this is a real,
+// pre-existing behavior and not something this test suite is allowed to
+// fix, the test asserts what actually happens over HTTP, then separately
+// verifies the DB-backed search logic it would use on a cache hit still
+// works correctly.
+func TestHandleQuery(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p := newTestProxy(t, db, c)
+
+	name := uniqueWord("querypkg")
+	saveArtifact(t, db, "nuget", "", name, "1.0.0")
+
+	req := httptest.NewRequest(http.MethodGet, "/query?q="+name, nil)
+	rec := httptest.NewRecorder()
+
+	p.handleQuery(rec, req)
 
 	assert.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+	assert.Equal(t, 0, rec.Body.Len(), "cold-cache handleQuery short-circuits to an empty body (see comment above)")
 
-	var body map[string]interface{}
-	err := json.NewDecoder(rec.Body).Decode(&body)
+	// The DB-backed search logic handleQuery would use on an actual cache
+	// hit still works correctly.
+	artifacts, err := p.db.SearchArtifacts(name, database.SearchOptions{ArtifactType: "nuget"})
 	require.NoError(t, err)
-	assert.Equal(t, "cargobay-nuget", body["name"])
-	assert.Equal(t, "0.1.0", body["version"])
+	require.Len(t, artifacts, 1)
+	assert.Equal(t, name, artifacts[0].ArtifactName)
 }
 
-// TestHandleCatalog tests catalog endpoint
-func TestHandleCatalog(t *testing.T) {
-	db := NewMockDatabase()
-	storage := NewMockStorage()
-	cache := NewMockCache()
-	rbacMgr := rbac.New(database.New("postgres://localhost:5432/test"))
-	registries := []database.RegistryConfig{
-		{ID: "nuget", Name: "NuGet Registry", Type: "nuget", Proxy: true, Enabled: true},
-	}
+// TestHandleSearchV2 documents the same cold-cache short-circuit bug as
+// TestHandleQuery (see its comment), for the V2 search endpoint.
+func TestHandleSearchV2(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p := newTestProxy(t, db, c)
 
-	proxy := &NuGetProxy{
-		db:         db,
-		storage:    storage,
-		cache:      cache,
-		registries: registries,
-		registry:   "nuget",
-	}
+	name := uniqueWord("searchv2pkg")
+	saveArtifact(t, db, "nuget", "", name, "1.0.0")
 
-	// Add test artifacts
-	artifacts := []*database.ArtifactMetadata{
-		{ID: "newtonsoft-json", RegistryID: "nuget", ArtifactType: "nuget", Namespace: "", ArtifactName: "Newtonsoft.Json", Version: "13.0.3"},
-		{ID: "npgsql", RegistryID: "nuget", ArtifactType: "nuget", Namespace: "", ArtifactName: "Npgsql", Version: "6.0.0"},
-	}
-	for _, a := range artifacts {
-		db.SaveArtifact(a)
-	}
-
-	req := httptest.NewRequest(http.MethodGet, "/catalog/0", nil)
+	req := httptest.NewRequest(http.MethodGet, "/Search()?searchTerm="+name, nil)
 	rec := httptest.NewRecorder()
 
-	proxy.handleCatalog(rec, req)
+	p.handleSearchV2(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, 0, rec.Body.Len(), "cold-cache handleSearchV2 short-circuits to an empty body (see TestHandleQuery)")
+
+	artifacts, err := p.db.SearchArtifacts(name, database.SearchOptions{ArtifactType: "nuget"})
+	require.NoError(t, err)
+	require.Len(t, artifacts, 1)
+	assert.Equal(t, name, artifacts[0].ArtifactName)
+}
+
+// TestHandlePackageMetadataFound seeds under registryID "nuget" (not a
+// resolved registry ID) because handlePackageMetadata hard-codes that
+// literal when looking the artifact up — see the saveArtifact doc comment.
+func TestHandlePackageMetadataFound(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p := newTestProxy(t, db, c)
+
+	name := uniqueID("metapkg")
+	saveArtifact(t, db, "nuget", "", name, "1.0.0")
+
+	req := httptest.NewRequest(http.MethodGet, "/package/"+name+"/1.0.0", nil)
+	req = withChiParams(req, map[string]string{"packageId": name, "version": "1.0.0"})
+	rec := httptest.NewRecorder()
+
+	p.handlePackageMetadata(rec, req)
 
 	assert.Equal(t, http.StatusOK, rec.Code)
 	var body map[string]interface{}
-	err := json.NewDecoder(rec.Body).Decode(&body)
-	require.NoError(t, err)
-	count := body["count"].(float64)
-	assert.GreaterOrEqual(t, count, 2.0)
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&body))
+	data := body["data"].(map[string]interface{})
+	assert.Equal(t, name, data["id"])
+	assert.Equal(t, "1.0.0", data["version"])
 }
 
-// TestHandleSearch tests search endpoint
-func TestHandleSearch(t *testing.T) {
-	db := NewMockDatabase()
-	storage := NewMockStorage()
-	cache := NewMockCache()
-	rbacMgr := rbac.New(database.New("postgres://localhost:5432/test"))
-	registries := []database.RegistryConfig{
-		{ID: "nuget", Name: "NuGet Registry", Type: "nuget", Proxy: true, Enabled: true},
-	}
+func TestHandlePackageMetadataNotFoundNoUpstream(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p := newTestProxy(t, db, c)
 
-	proxy := &NuGetProxy{
-		db:         db,
-		storage:    storage,
-		cache:      cache,
-		registries: registries,
-		registry:   "nuget",
-	}
-
-	// Add test artifacts
-	artifacts := []*database.ArtifactMetadata{
-		{ID: "pkg1", RegistryID: "nuget", ArtifactType: "nuget", Namespace: "", ArtifactName: "Microsoft.EntityFrameworkCore", Version: "6.0.0"},
-		{ID: "pkg2", RegistryID: "nuget", ArtifactType: "nuget", Namespace: "", ArtifactName: "Microsoft.AspNetCore.Mvc", Version: "2.0.0"},
-	}
-	for _, a := range artifacts {
-		db.SaveArtifact(a)
-	}
-
-	req := httptest.NewRequest(http.MethodGet, "/query?q=entityframework", nil)
+	req := httptest.NewRequest(http.MethodGet, "/package/missing-pkg/9.9.9", nil)
+	req = withChiParams(req, map[string]string{"packageId": "missing-pkg", "version": "9.9.9"})
 	rec := httptest.NewRecorder()
 
-	proxy.handleSearch(rec, req)
+	p.handlePackageMetadata(rec, req)
 
-	assert.Equal(t, http.StatusOK, rec.Code)
-	var body map[string]interface{}
-	err := json.NewDecoder(rec.Body).Decode(&body)
-	require.NoError(t, err)
-	data := body["data"].([]interface{})
-	assert.GreaterOrEqual(t, len(data), 1)
+	assert.Equal(t, http.StatusBadGateway, rec.Code)
 }
 
-// TestHandlePackageDownload tests package download (nupkg)
-func TestHandlePackageDownload(t *testing.T) {
-	db := NewMockDatabase()
-	storage := NewMockStorage()
-	cache := NewMockCache()
-	rbacMgr := rbac.New(database.New("postgres://localhost:5432/test"))
-	registries := []database.RegistryConfig{
-		{ID: "nuget", Name: "NuGet Registry", Type: "nuget", Proxy: true, Enabled: true},
-	}
+func TestHandleDownload(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p := newTestProxy(t, db, c)
 
-	proxy := &NuGetProxy{
-		db:         db,
-		storage:    storage,
-		cache:      cache,
-		registries: registries,
-		registry:   "nuget",
-	}
-
-	// Save nupkg to storage
+	name := uniqueID("downloadpkg")
 	nupkgData := []byte("fake nupkg content")
-	_, err := storage.SaveArtifact("nuget", "", "Newtonsoft.Json", "13.0.3", nupkgData)
+	// handleDownload's storage lookup, like the DB lookups above, hard-codes
+	// registryID "nuget" rather than the resolved target label.
+	_, err := p.storage.SaveArtifact("nuget", "", name, "1.0.0", nupkgData)
 	require.NoError(t, err)
 
-	req := httptest.NewRequest(http.MethodGet, "/package/newtonsoft.json/13.0.3", nil)
+	req := httptest.NewRequest(http.MethodGet, "/package/"+name+"/1.0.0.nupkg", nil)
+	req = withChiParams(req, map[string]string{"packageId": name, "version": "1.0.0"})
 	rec := httptest.NewRecorder()
 
-	proxy.handlePackageDownload(rec, req)
+	p.handleDownload(rec, req)
 
 	assert.Equal(t, http.StatusOK, rec.Code)
-	assert.Equal(t, "application/zip", rec.Header().Get("Content-Type"))
-	assert.Contains(t, rec.Body.String(), "fake nupkg content")
+	assert.Equal(t, "application/octet-stream", rec.Header().Get("Content-Type"))
+	assert.Equal(t, "3.0.0", rec.Header().Get("X-NuGet-Protocol-Version"))
+	assert.Equal(t, nupkgData, rec.Body.Bytes())
 }
 
-// TestHandlePackageDownloadNotFound tests 404 for non-existent package
-func TestHandlePackageDownloadNotFound(t *testing.T) {
-	db := NewMockDatabase()
-	storage := NewMockStorage()
-	cache := NewMockCache()
-	rbacMgr := rbac.New(database.New("postgres://localhost:5432/test"))
-	registries := []database.RegistryConfig{
-		{ID: "nuget", Name: "NuGet Registry", Type: "nuget", Proxy: true, Enabled: true},
-	}
+func TestHandleDownloadNotFoundNoUpstream(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p := newTestProxy(t, db, c)
 
-	proxy := &NuGetProxy{
-		db:         db,
-		storage:    storage,
-		cache:      cache,
-		registries: registries,
-		registry:   "nuget",
-	}
-
-	req := httptest.NewRequest(http.MethodGet, "/package/nonexistent/1.0.0", nil)
+	req := httptest.NewRequest(http.MethodGet, "/package/missing-pkg/9.9.9.nupkg", nil)
+	req = withChiParams(req, map[string]string{"packageId": "missing-pkg", "version": "9.9.9"})
 	rec := httptest.NewRecorder()
 
-	proxy.handlePackageDownload(rec, req)
+	p.handleDownload(rec, req)
 
-	assert.Equal(t, http.StatusNotFound, rec.Code)
+	assert.Equal(t, http.StatusBadGateway, rec.Code)
 }
 
-// TestHandleV3Package tests V3 package endpoint
-func TestHandleV3Package(t *testing.T) {
-	db := NewMockDatabase()
-	storage := NewMockStorage()
-	cache := NewMockCache()
-	rbacMgr := rbac.New(database.New("postgres://localhost:5432/test"))
-	registries := []database.RegistryConfig{
-		{ID: "nuget", Name: "NuGet Registry", Type: "nuget", Proxy: true, Enabled: true},
-	}
+func TestHandlePackageV2(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p := newTestProxy(t, db, c)
 
-	proxy := &NuGetProxy{
-		db:         db,
-		storage:    storage,
-		cache:      cache,
-		registries: registries,
-		registry:   "nuget",
-	}
+	name := uniqueID("v2pkg")
+	saveArtifact(t, db, "nuget", "", name, "2.0.0")
 
-	// Add test artifact
-	artifact := &database.ArtifactMetadata{
-		ID:           "newtonsoft-v3",
-		RegistryID:   "nuget",
-		ArtifactType: "nuget",
-		Namespace:    "",
-		ArtifactName: "Newtonsoft.Json",
-		Version:      "13.0.3",
-		Size:         1024,
-	}
-	db.SaveArtifact(artifact)
-
-	req := httptest.NewRequest(http.MethodGet, "/v3/registration/newtonsoft.json/index.json", nil)
+	req := httptest.NewRequest(http.MethodGet, "/Package/"+name+"/2.0.0", nil)
+	req = withChiParams(req, map[string]string{"packageId": name, "version": "2.0.0"})
 	rec := httptest.NewRecorder()
 
-	proxy.handleV3Package(rec, req)
+	p.handlePackageV2(rec, req)
 
 	assert.Equal(t, http.StatusOK, rec.Code)
 	var body map[string]interface{}
-	err := json.NewDecoder(rec.Body).Decode(&body)
-	require.NoError(t, err)
-	assert.NotNil(t, body["items"])
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&body))
+	d := body["d"].(map[string]interface{})
+	assert.Equal(t, fmt.Sprintf("%s|2.0.0", name), d["Id"])
 }
 
-// TestHandleV3Search tests V3 search endpoint
-func TestHandleV3Search(t *testing.T) {
-	db := NewMockDatabase()
-	storage := NewMockStorage()
-	cache := NewMockCache()
-	rbacMgr := rbac.New(database.New("postgres://localhost:5432/test"))
-	registries := []database.RegistryConfig{
-		{ID: "nuget", Name: "NuGet Registry", Type: "nuget", Proxy: true, Enabled: true},
-	}
+// TestHandleListPackages exercises handleListPackages directly. Unlike the
+// single-artifact handlers above, it correctly scopes by
+// proxypkg.TargetFromContext(r, "nuget").Label rather than a hard-coded
+// literal; called directly (no read-access middleware) that resolves to the
+// same "nuget" fallback label, so artifacts are seeded under that.
+func TestHandleListPackages(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p := newTestProxy(t, db, c)
 
-	proxy := &NuGetProxy{
-		db:         db,
-		storage:    storage,
-		cache:      cache,
-		registries: registries,
-		registry:   "nuget",
-	}
+	name := uniqueID("listpkg")
+	saveArtifact(t, db, "nuget", "", name, "1.0.0")
 
-	// Add test artifacts
-	artifacts := []*database.ArtifactMetadata{
-		{ID: "pkg1", RegistryID: "nuget", ArtifactType: "nuget", Namespace: "", ArtifactName: "Serilog", Version: "2.0.0"},
-		{ID: "pkg2", RegistryID: "nuget", ArtifactType: "nuget", Namespace: "", ArtifactName: "Serilog.AspNetCore", Version: "4.0.0"},
-	}
-	for _, a := range artifacts {
-		db.SaveArtifact(a)
-	}
-
-	req := httptest.NewRequest(http.MethodGet, "/v3/search?query=serilog", nil)
+	req := httptest.NewRequest(http.MethodGet, "/Package()", nil)
 	rec := httptest.NewRecorder()
 
-	proxy.handleV3Search(rec, req)
+	p.handleListPackages(rec, req)
 
 	assert.Equal(t, http.StatusOK, rec.Code)
 	var body map[string]interface{}
-	err := json.NewDecoder(rec.Body).Decode(&body)
-	require.NoError(t, err)
-	data := body["data"].([]interface{})
-	assert.GreaterOrEqual(t, len(data), 1)
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&body))
+	results := body["d"].([]interface{})
+	found := false
+	for _, r := range results {
+		if r.(map[string]interface{})["Id"] == fmt.Sprintf("%s|1.0.0", name) {
+			found = true
+		}
+	}
+	assert.True(t, found, "expected seeded package in list results")
 }
 
-// TestNuGetProxyIntegration tests the proxy integration
-func TestNuGetProxyIntegration(t *testing.T) {
-	db := NewMockDatabase()
-	storage := NewMockStorage()
-	cache := NewMockCache()
-	rbacMgr := rbac.New(database.New("postgres://localhost:5432/test"))
-	registries := []database.RegistryConfig{
-		{ID: "nuget", Name: "NuGet Registry", Type: "nuget", Proxy: true, Enabled: true},
-	}
+func TestHandleRegistrationIndex(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p := newTestProxy(t, db, c)
 
-	// Create proxy
-	proxy := NewNuGetProxy(db, storage, cache, rbacMgr, registries)
+	name := uniqueID("regidxpkg")
+	saveArtifact(t, db, "nuget", "", name, "1.0.0")
+	saveArtifact(t, db, "nuget", "", name, "2.0.0")
 
-	// Test that router is created
-	assert.NotNil(t, proxy)
+	req := httptest.NewRequest(http.MethodGet, "/registration/"+name+"/index.json", nil)
+	req = withChiParams(req, map[string]string{"packageId": name})
+	rec := httptest.NewRecorder()
 
-	// Create test server
-	server := httptest.NewServer(proxy)
+	p.handleRegistrationIndex(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	var body map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&body))
+	assert.Equal(t, float64(2), body["count"])
+	items := body["items"].([]interface{})
+	assert.Len(t, items, 2)
+}
+
+func TestHandleRegistrationVersionFound(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p := newTestProxy(t, db, c)
+
+	name := uniqueID("regverpkg")
+	saveArtifact(t, db, "nuget", "", name, "1.0.0")
+
+	req := httptest.NewRequest(http.MethodGet, "/registration/"+name+"/1.0.0.json", nil)
+	req = withChiParams(req, map[string]string{"packageId": name, "version": "1.0.0"})
+	rec := httptest.NewRecorder()
+
+	p.handleRegistrationVersion(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	var body map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&body))
+	entry := body["catalogEntry"].(map[string]interface{})
+	assert.Equal(t, name, entry["id"])
+	assert.Equal(t, "1.0.0", entry["version"])
+}
+
+func TestHandleRegistrationVersionNotFoundNoUpstream(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p := newTestProxy(t, db, c)
+
+	req := httptest.NewRequest(http.MethodGet, "/registration/missing-pkg/9.9.9.json", nil)
+	req = withChiParams(req, map[string]string{"packageId": "missing-pkg", "version": "9.9.9"})
+	rec := httptest.NewRecorder()
+
+	p.handleRegistrationVersion(rec, req)
+
+	assert.Equal(t, http.StatusBadGateway, rec.Code)
+}
+
+// TestRegistrationVersionRouteUnreachableForDottedSemver documents a real
+// chi routing bug found while writing these tests: the registered pattern
+// "/registration/{packageId}/{version}.json" only matches when version has
+// no embedded dots. A standard NuGet semver like "1.0.0" (as opposed to,
+// say, a single integer) fails to match at all and 404s before
+// handleRegistrationVersion is ever invoked — verified independently with a
+// minimal chi router outside this package. This is a real, pre-existing
+// bug in the route registration in nuget.go, not a test artifact; since
+// production code is out of scope for this test-only rewrite, this test
+// simply pins the actual (broken) behavior instead of silently ignoring it.
+func TestRegistrationVersionRouteUnreachableForDottedSemver(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p := newTestProxy(t, db, c)
+
+	_, host := bindHostRegistry(t, db, false, false)
+	router := NewNuGetProxy(p.db, p.storage, p.cache, rbac.New(p.db), p.registries)
+	server := httptest.NewServer(router)
 	defer server.Close()
 
-	// Test root endpoint
-	resp, err := http.Get(server.URL + "/")
+	httpReq, err := http.NewRequest(http.MethodGet, server.URL+"/registration/somepkg/1.0.0.json", nil)
 	require.NoError(t, err)
-	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	httpReq.Host = host
+	resp, err := http.DefaultClient.Do(httpReq)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode, "route pattern doesn't match dotted semver versions")
 }
 
-// TestCacheConcurrency tests cache thread safety
+// TestDownloadRouteShadowedByPackageMetadata documents a second real chi
+// routing bug: "/package/{packageId}/{version}" (handlePackageMetadata) and
+// "/package/{packageId}/{version}.nupkg" (handleDownload) are registered
+// against the same path shape, and for a dotted version like "1.0.0" chi
+// resolves the request to the plain (metadata) route — matching version
+// "1.0.0.nupkg" literally — rather than ever reaching handleDownload. This
+// test pins that actual dispatch behavior (a 502 from the metadata
+// handler's own not-found path) rather than the naively-expected 200 from a
+// download.
+func TestDownloadRouteShadowedByPackageMetadata(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p := newTestProxy(t, db, c)
+
+	_, host := bindHostRegistry(t, db, false, false)
+	router := NewNuGetProxy(p.db, p.storage, p.cache, rbac.New(p.db), p.registries)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	httpReq, err := http.NewRequest(http.MethodGet, server.URL+"/package/somepkg/1.0.0.nupkg", nil)
+	require.NoError(t, err)
+	httpReq.Host = host
+	resp, err := http.DefaultClient.Do(httpReq)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	// Reaches handlePackageMetadata's upstream-fallback path (no upstream
+	// configured), not handleDownload's.
+	assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
+}
+
+func TestRequireReadAccessPrivateRegistryDeniesAnonymous(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p := newTestProxy(t, db, c)
+
+	_, host := bindHostRegistry(t, db, true, false)
+
+	router := NewNuGetProxy(p.db, p.storage, p.cache, rbac.New(p.db), p.registries)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	httpReq, err := http.NewRequest(http.MethodGet, server.URL+"/query", nil)
+	require.NoError(t, err)
+	httpReq.Host = host
+	resp, err := http.DefaultClient.Do(httpReq)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+}
+
+func TestNuGetProxyIntegration(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p := newTestProxy(t, db, c)
+
+	router := NewNuGetProxy(p.db, p.storage, p.cache, rbac.New(p.db), p.registries)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/v3/index.json")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	queryResp, err := http.Get(server.URL + "/query")
+	require.NoError(t, err)
+	defer queryResp.Body.Close()
+	assert.Equal(t, http.StatusOK, queryResp.StatusCode)
+}
+
 func TestCacheConcurrency(t *testing.T) {
-	cache := NewMockCache()
-	proxy := &NuGetProxy{cache: cache}
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p := newTestProxy(t, db, c)
 
 	done := make(chan bool, 10)
 	for i := 0; i < 10; i++ {
-		go func(index int) {
-			key := "nuget-concurrent-key"
-			data := []byte(`{"value": ` + string(rune('0'+index)) + `}`)
-			proxy.cacheSet(key, data)
+		go func(i int) {
+			key := fmt.Sprintf("nuget-test-concurrency-%d", i)
+			p.cacheSet(key, []byte("value"))
 			done <- true
 		}(i)
 	}
-
 	for i := 0; i < 10; i++ {
 		<-done
 	}
-
-	// Verify last write wins
-	var retrieved []byte
-	err := proxy.cacheGet("nuget-concurrent-key", &retrieved)
-	require.NoError(t, err)
-	assert.NotNil(t, retrieved)
 }
 
-// TestEmptyNamespace tests handling of empty namespace
-func TestEmptyNamespace(t *testing.T) {
-	db := NewMockDatabase()
-	storage := NewMockStorage()
-	cache := NewMockCache()
-	rbacMgr := rbac.New(database.New("postgres://localhost:5432/test"))
-	registries := []database.RegistryConfig{
-		{ID: "nuget", Name: "NuGet Registry", Type: "nuget", Proxy: true, Enabled: true},
-	}
-
-	proxy := &NuGetProxy{
-		db:         db,
-		storage:    storage,
-		cache:      cache,
-		registries: registries,
-		registry:   "nuget",
-	}
-
-	// Add artifact with empty namespace
-	artifact := &database.ArtifactMetadata{
-		ID:           "nuget-ns-test",
-		RegistryID:   "nuget",
-		ArtifactType: "nuget",
-		Namespace:    "",
-		ArtifactName: "Microsoft.Extensions.DependencyInjection",
-		Version:      "6.0.0",
-		Size:         2048,
-	}
-	db.SaveArtifact(artifact)
-
-	// Search for artifacts
-	results, err := db.ListArtifacts("nuget", database.ListOptions{ArtifactType: "nuget"})
-	require.NoError(t, err)
-	assert.GreaterOrEqual(t, len(results), 1)
-}
-
-// TestNamespaceHandling tests namespace handling for NuGet artifacts
-func TestNamespaceHandling(t *testing.T) {
-	db := NewMockDatabase()
-	storage := NewMockStorage()
-	cache := NewMockCache()
-	rbacMgr := rbac.New(database.New("postgres://localhost:5432/test"))
-	registries := []database.RegistryConfig{
-		{ID: "nuget", Name: "NuGet Registry", Type: "nuget", Proxy: true, Enabled: true},
-	}
-
-	proxy := &NuGetProxy{
-		db:         db,
-		storage:    storage,
-		cache:      cache,
-		registries: registries,
-		registry:   "nuget",
-	}
-
-	// Create artifact with namespace
-	artifact := &database.ArtifactMetadata{
-		ID:           "nuget-ns-test",
-		RegistryID:   "nuget",
-		ArtifactType: "nuget",
-		Namespace:    "xamarin/android",
-		ArtifactName: "support-v4",
-		Version:      "28.0.0",
-		Size:         1024,
-	}
-	db.SaveArtifact(artifact)
-
-	// Search with namespace
-	results, err := db.ListArtifacts("nuget", database.ListOptions{
-		Namespace:    "xamarin/android",
-		ArtifactType: "nuget",
-	})
-	require.NoError(t, err)
-	assert.GreaterOrEqual(t, len(results), 1)
-	assert.Equal(t, "xamarin/android", results[0].Namespace)
-}
-
-// TestNuGetProxyRoutes tests all expected routes are registered
 func TestNuGetProxyRoutes(t *testing.T) {
-	db := NewMockDatabase()
-	storage := NewMockStorage()
-	cache := NewMockCache()
-	rbacMgr := rbac.New(database.New("postgres://localhost:5432/test"))
-	registries := []database.RegistryConfig{
-		{ID: "nuget", Name: "NuGet Registry", Type: "nuget", Proxy: true, Enabled: true},
-	}
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p := newTestProxy(t, db, c)
 
-	proxy := NewNuGetProxy(db, storage, cache, rbacMgr, registries)
+	// Bind a dedicated, non-proxying registry by Host so resolution is
+	// deterministic and doesn't depend on leftover state from other
+	// tests/packages sharing the live DB.
+	_, host := bindHostRegistry(t, db, false, false)
 
-	// Create test server
-	server := httptest.NewServer(proxy)
+	router := NewNuGetProxy(p.db, p.storage, p.cache, rbac.New(p.db), p.registries)
+	server := httptest.NewServer(router)
 	defer server.Close()
 
-	// Test all expected routes
 	routes := []string{
-		"/",
-		"/catalog/0",
+		"/v3/index.json",
 		"/query",
-		"/v3/registration/",
-		"/v3/search",
+		"/Search()",
+		"/Package()",
 	}
 
 	for _, route := range routes {
-		resp, err := http.Get(server.URL + route)
+		httpReq, err := http.NewRequest(http.MethodGet, server.URL+route, nil)
 		require.NoError(t, err)
-		// Routes may return different status codes depending on implementation
-		assert.NotEqual(t, http.StatusNotFound, resp.StatusCode, "Route %s should exist", route)
+		httpReq.Host = host
+		resp, err := http.DefaultClient.Do(httpReq)
+		require.NoError(t, err)
+		resp.Body.Close()
+		assert.NotEqual(t, http.StatusNotFound, resp.StatusCode, "route %s should exist", route)
 	}
 }

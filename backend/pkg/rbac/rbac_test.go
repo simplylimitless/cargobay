@@ -5,24 +5,20 @@ import (
 
 	"github.com/simplylimitless/cargobay/backend/pkg/database"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
 )
 
-// MockDatabase is a mock implementation of the Database interface
-type MockDatabase struct {
-	mock.Mock
-}
-
-// GetUserRoles is a mock implementation
-func (m *MockDatabase) GetUserRoles(userID string) ([]string, error) {
-	args := m.Called(userID)
-	return args.Get(0).([]string), args.Error(1)
+// newTestRBAC builds an RBAC manager against an unconnected database.Database.
+// RBAC's role/permission lookups are served entirely from the static
+// in-memory maps (see staticRoles/staticPermissions) and never touch the
+// DB, so a real-but-unconnected instance is safe here — see
+// pkg/integration/integration_test.go for the same pattern.
+func newTestRBAC() *RBAC {
+	return New(database.New("postgres://localhost:5432/test"))
 }
 
 // TestRBACNew tests RBAC manager creation
 func TestRBACNew(t *testing.T) {
-	db := &MockDatabase{}
-	rbac := New(db)
+	rbac := newTestRBAC()
 	assert.NotNil(t, rbac)
 	assert.NotNil(t, rbac.roleCache)
 	assert.NotNil(t, rbac.permissionCache)
@@ -30,15 +26,12 @@ func TestRBACNew(t *testing.T) {
 
 // TestRBACHasPermission tests permission checking
 func TestRBACHasPermission(t *testing.T) {
-	db := &MockDatabase{}
-	rbac := New(db)
+	rbac := newTestRBAC()
 
-	// Test static permission exists
 	perm := rbac.GetPermission("artifact:read")
 	assert.NotNil(t, perm)
 	assert.Equal(t, "Read Artifacts", perm.Name)
 
-	// Test static artifact:write permission
 	perm = rbac.GetPermission("artifact:write")
 	assert.NotNil(t, perm)
 	assert.Equal(t, "Write Artifacts", perm.Name)
@@ -46,13 +39,11 @@ func TestRBACHasPermission(t *testing.T) {
 
 // TestRBACListPermissions tests listing all permissions
 func TestRBACListPermissions(t *testing.T) {
-	db := &MockDatabase{}
-	rbac := New(db)
+	rbac := newTestRBAC()
 
 	perms := rbac.ListPermissions()
 	assert.GreaterOrEqual(t, len(perms), 15) // At least 15 static permissions
 
-	// Verify specific permissions exist
 	found := false
 	for _, p := range perms {
 		if p.ID == "artifact:read" {
@@ -65,59 +56,50 @@ func TestRBACListPermissions(t *testing.T) {
 
 // TestRBACGetRole tests getting a role
 func TestRBACGetRole(t *testing.T) {
-	db := &MockDatabase{}
-	rbac := New(db)
+	rbac := newTestRBAC()
 
-	// Test admin role
 	role := rbac.GetRole("admin")
 	assert.NotNil(t, role)
 	assert.Equal(t, "Administrator", role.Name)
 	assert.True(t, role.IsSystem)
 	assert.GreaterOrEqual(t, len(role.Permissions), 10)
 
-	// Test developer role
-	role = rbac.GetRole("developer")
+	role = rbac.GetRole("publisher")
 	assert.NotNil(t, role)
-	assert.Equal(t, "Developer", role.Name)
+	assert.Equal(t, "Publisher", role.Name)
 }
 
 // TestRBACListRoles tests listing all roles
 func TestRBACListRoles(t *testing.T) {
-	db := &MockDatabase{}
-	rbac := New(db)
+	rbac := newTestRBAC()
 
 	roles := rbac.ListRoles()
-	assert.GreaterOrEqual(t, len(roles), 5) // At least 5 static roles
+	assert.GreaterOrEqual(t, len(roles), 3) // admin, viewer, publisher
 
-	// Verify specific roles exist
 	roleNames := make(map[string]bool)
 	for _, r := range roles {
 		roleNames[r.Name] = true
 	}
 
 	assert.True(t, roleNames["Administrator"])
-	assert.True(t, roleNames["Developer"])
 	assert.True(t, roleNames["Viewer"])
+	assert.True(t, roleNames["Publisher"])
 }
 
 // TestRBACPermissionDefinition tests permission definitions
 func TestRBACPermissionDefinition(t *testing.T) {
-	db := &MockDatabase{}
-	rbac := New(db)
+	rbac := newTestRBAC()
 
-	// Test artifact:read permission
 	perm := rbac.GetPermission("artifact:read")
 	assert.NotNil(t, perm)
 	assert.Equal(t, "artifact", perm.Resource)
 	assert.Equal(t, "read", perm.Action)
 
-	// Test artifact:write permission
 	perm = rbac.GetPermission("artifact:write")
 	assert.NotNil(t, perm)
 	assert.Equal(t, "artifact", perm.Resource)
 	assert.Equal(t, "write", perm.Action)
 
-	// Test user:admin permission
 	perm = rbac.GetPermission("user:admin")
 	assert.NotNil(t, perm)
 	assert.Equal(t, "user", perm.Resource)
@@ -126,10 +108,8 @@ func TestRBACPermissionDefinition(t *testing.T) {
 
 // TestRBACRolePermissions tests role permissions
 func TestRBACRolePermissions(t *testing.T) {
-	db := &MockDatabase{}
-	rbac := New(db)
+	rbac := newTestRBAC()
 
-	// Test admin role has all permissions
 	role := rbac.GetRole("admin")
 	assert.NotNil(t, role)
 	assert.Contains(t, role.Permissions, "artifact:read")
@@ -137,14 +117,12 @@ func TestRBACRolePermissions(t *testing.T) {
 	assert.Contains(t, role.Permissions, "artifact:delete")
 	assert.Contains(t, role.Permissions, "user:admin")
 
-	// Test viewer role has limited permissions
 	role = rbac.GetRole("viewer")
 	assert.NotNil(t, role)
 	assert.Contains(t, role.Permissions, "artifact:read")
 	assert.NotContains(t, role.Permissions, "artifact:write")
 	assert.NotContains(t, role.Permissions, "artifact:delete")
 
-	// Test publisher role
 	role = rbac.GetRole("publisher")
 	assert.NotNil(t, role)
 	assert.Contains(t, role.Permissions, "artifact:write")
@@ -153,34 +131,27 @@ func TestRBACRolePermissions(t *testing.T) {
 
 // TestRBACSystemRoles tests system role protection
 func TestRBACSystemRoles(t *testing.T) {
-	db := &MockDatabase{}
-	rbac := New(db)
+	rbac := newTestRBAC()
 
-	// Test admin is a system role
 	admin := rbac.GetRole("admin")
 	assert.True(t, admin.IsSystem)
 
-	// Test viewer is a system role
 	viewer := rbac.GetRole("viewer")
 	assert.True(t, viewer.IsSystem)
 }
 
 // TestRBACNonExistentRole tests non-existent role handling
 func TestRBACNonExistentRole(t *testing.T) {
-	db := &MockDatabase{}
-	rbac := New(db)
+	rbac := newTestRBAC()
 
-	// Test non-existent role returns nil (from cache)
 	role := rbac.GetRole("non-existent")
-	assert.NotNil(t, role) // Static cache might not have it but won't return nil
+	assert.Nil(t, role)
 }
 
 // TestRBACPermissionByID tests permission lookup
 func TestRBACPermissionByID(t *testing.T) {
-	db := &MockDatabase{}
-	rbac := New(db)
+	rbac := newTestRBAC()
 
-	// Test all known permissions exist
 	knownPermissions := []string{
 		"artifact:read",
 		"artifact:write",
@@ -208,15 +179,12 @@ func TestRBACPermissionByID(t *testing.T) {
 
 // TestRBACRoleDescription tests role descriptions
 func TestRBACRoleDescription(t *testing.T) {
-	db := &MockDatabase{}
-	rbac := New(db)
+	rbac := newTestRBAC()
 
 	roles := map[string]string{
-		"admin":       "Full administrative access to all resources",
-		"developer":   "Standard developer access - read/write artifacts, search",
-		"viewer":      "Read-only access to artifacts and registries",
-		"publisher":   "Can upload and sign artifacts but not delete",
-		"auditor":     "Can read artifacts and audit logs",
+		"admin":     "Full administrative access to all resources",
+		"viewer":    "Read-only access to artifacts and registries",
+		"publisher": "Can upload and sign artifacts but not delete",
 	}
 
 	for roleID, expectedDesc := range roles {
@@ -228,24 +196,20 @@ func TestRBACRoleDescription(t *testing.T) {
 
 // TestRBACPermissionResourceType tests permission resource types
 func TestRBACPermissionResourceType(t *testing.T) {
-	db := &MockDatabase{}
-	rbac := New(db)
+	rbac := newTestRBAC()
 
-	// Test artifact permissions
 	artifactPerms := []string{"artifact:read", "artifact:write", "artifact:delete", "artifact:search", "artifact:sign", "artifact:replicate"}
 	for _, permID := range artifactPerms {
 		perm := rbac.GetPermission(permID)
 		assert.Equal(t, "artifact", perm.Resource, "Permission %s should be for artifact resource", permID)
 	}
 
-	// Test registry permissions
 	registryPerms := []string{"registry:read", "registry:write", "registry:delete"}
 	for _, permID := range registryPerms {
 		perm := rbac.GetPermission(permID)
 		assert.Equal(t, "registry", perm.Resource, "Permission %s should be for registry resource", permID)
 	}
 
-	// Test user permissions
 	userPerms := []string{"user:read", "user:write", "user:admin"}
 	for _, permID := range userPerms {
 		perm := rbac.GetPermission(permID)
@@ -255,17 +219,14 @@ func TestRBACPermissionResourceType(t *testing.T) {
 
 // TestRBACPermissionAction tests permission actions
 func TestRBACPermissionAction(t *testing.T) {
-	db := &MockDatabase{}
-	rbac := New(db)
+	rbac := newTestRBAC()
 
-	// Test read actions
 	readPerms := []string{"artifact:read", "registry:read", "user:read", "audit:read", "system:read"}
 	for _, permID := range readPerms {
 		perm := rbac.GetPermission(permID)
 		assert.Equal(t, "read", perm.Action, "Permission %s should have read action", permID)
 	}
 
-	// Test write actions
 	writePerms := []string{"artifact:write", "registry:write", "user:write", "system:write"}
 	for _, permID := range writePerms {
 		perm := rbac.GetPermission(permID)
@@ -275,10 +236,8 @@ func TestRBACPermissionAction(t *testing.T) {
 
 // TestRBACPermissionName tests permission names
 func TestRBACPermissionName(t *testing.T) {
-	db := &MockDatabase{}
-	rbac := New(db)
+	rbac := newTestRBAC()
 
-	// Test permission names are human-readable
 	permissions := map[string]string{
 		"artifact:read":      "Read Artifacts",
 		"artifact:write":     "Write Artifacts",
@@ -296,19 +255,15 @@ func TestRBACPermissionName(t *testing.T) {
 
 // TestRBACRolePermissionCount tests role permission counts
 func TestRBACRolePermissionCount(t *testing.T) {
-	db := &MockDatabase{}
-	rbac := New(db)
+	rbac := newTestRBAC()
 
-	// Admin should have many permissions
 	admin := rbac.GetRole("admin")
 	assert.GreaterOrEqual(t, len(admin.Permissions), 15)
 
-	// Developer should have fewer permissions
-	developer := rbac.GetRole("developer")
-	assert.GreaterOrEqual(t, len(developer.Permissions), 3)
-	assert.LessOrEqual(t, len(developer.Permissions), 6)
+	publisher := rbac.GetRole("publisher")
+	assert.GreaterOrEqual(t, len(publisher.Permissions), 3)
+	assert.LessOrEqual(t, len(publisher.Permissions), 6)
 
-	// Viewer should have minimal permissions
 	viewer := rbac.GetRole("viewer")
 	assert.GreaterOrEqual(t, len(viewer.Permissions), 1)
 	assert.LessOrEqual(t, len(viewer.Permissions), 4)

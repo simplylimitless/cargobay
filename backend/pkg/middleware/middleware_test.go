@@ -1,13 +1,16 @@
 package middleware
 
 import (
+	"context"
 	"encoding/base64"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"sync"
 	"testing"
 	"time"
 
+	"github.com/simplylimitless/cargobay/backend/pkg/auth"
+	"github.com/simplylimitless/cargobay/backend/pkg/database"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -37,6 +40,51 @@ func (m *MockRoleAndPermissionLookup) GetUserRolePermissions(userID string) []st
 		return perms
 	}
 	return []string{}
+}
+
+// connectTestDB connects to the docker-compose Postgres instance. The
+// auth-success paths in NewAuthMiddleware issue real queries, so those
+// tests need a live, connected *database.Database — not the unconnected
+// instances used elsewhere (see pkg/rbac/rbac_test.go for that pattern).
+// Skipped when no database is reachable.
+func connectTestDB(t *testing.T) *database.Database {
+	t.Helper()
+	db := database.New("postgres://cargobay:password@localhost:5432/cargobay")
+	if err := db.Connect(); err != nil {
+		t.Skipf("no postgres available: %v", err)
+	}
+	t.Cleanup(func() { db.Disconnect() })
+	return db
+}
+
+// seedTestUser creates a real user row (cleaned up via t.Cleanup) for tests
+// that exercise NewAuthMiddleware's Basic-auth success path.
+func seedTestUser(t *testing.T, db *database.Database, password string) *database.UserRepository {
+	t.Helper()
+	hash, err := auth.HashPassword(password)
+	require.NoError(t, err)
+
+	username := fmt.Sprintf("test-user-%d", time.Now().UnixNano())
+	user, err := db.CreateUser(username, username+"@example.com", hash, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		db.Exec(context.Background(), "DELETE FROM users WHERE user_id = $1", user.UserID)
+	})
+	return user
+}
+
+// seedTestAccessKey creates a real access key row (cleaned up via
+// t.Cleanup) for tests that exercise NewAuthMiddleware's Bearer-token
+// success path. Returns the bearer token to send in the Authorization
+// header (access_keys.key_hash is compared in plaintext).
+func seedTestAccessKey(t *testing.T, db *database.Database, userID string, permissions []string) string {
+	t.Helper()
+	key, err := db.CreateAccessKey(userID, "test-key", permissions, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		db.Exec(context.Background(), "DELETE FROM access_keys WHERE id = $1", key.ID)
+	})
+	return key.KeyHash
 }
 
 // TestNewRateLimiter creates a new rate limiter and tests its initialization
@@ -157,37 +205,29 @@ func TestNormalizePath(t *testing.T) {
 }
 
 // TestAuthMiddlewareWithBearerToken tests authentication with bearer token
+// against a live, seeded database.
 func TestAuthMiddlewareWithBearerToken(t *testing.T) {
-	db := NewMockDatabase()
+	db := connectTestDB(t)
 	lookup := NewMockRoleAndPermissionLookup()
 
-	lookup.Permissions["user-1"] = []string{"artifact:read", "artifact:write"}
+	user := seedTestUser(t, db, "testpassword123")
+	lookup.Permissions[user.UserID] = []string{"artifact:read", "artifact:write"}
+	token := seedTestAccessKey(t, db, user.UserID, []string{"artifact:read", "artifact:write"})
 
 	middleware := NewAuthMiddleware(db, lookup)
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		user := GetUser(r)
-		if user == nil {
+		authedUser := GetUser(r)
+		if authedUser == nil {
 			http.Error(w, "No user found", http.StatusUnauthorized)
 			return
 		}
-		assert.Equal(t, "user-1", user.UserID)
-		assert.Contains(t, user.Permissions, "artifact:read")
+		assert.Equal(t, user.UserID, authedUser.UserID)
+		assert.Contains(t, authedUser.Permissions, "artifact:read")
 		w.WriteHeader(http.StatusOK)
 	})
 
 	next := middleware(handler)
-
-	// Create a valid token
-	token := GenerateAPIKey()
-	db.AccessKeys[token] = &AccessKey{
-		ID:          "key-1",
-		UserID:      "user-1",
-		Name:        "test-key",
-		KeyHash:     token,
-		Permissions: []string{"artifact:read", "artifact:write"},
-		IsActive:    true,
-	}
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -199,43 +239,33 @@ func TestAuthMiddlewareWithBearerToken(t *testing.T) {
 }
 
 // TestAuthMiddlewareWithBasicAuth tests authentication with basic auth
+// against a live, seeded database.
 func TestAuthMiddlewareWithBasicAuth(t *testing.T) {
-	db := NewMockDatabase()
+	db := connectTestDB(t)
 	lookup := NewMockRoleAndPermissionLookup()
 
-	lookup.Roles["user-1"] = []string{"viewer"}
-	lookup.Permissions["user-1"] = []string{"artifact:read"}
-
-	// Create user with password
 	password := "testpassword123"
-	hashedPassword, _ := auth.HashPassword(password)
-
-	db.Users["user-1"] = &UserRepository{
-		UserID:       "user-1",
-		Username:     "testuser",
-		Email:        "test@example.com",
-		PasswordHash: hashedPassword,
-		Roles:        []string{"viewer"},
-		IsActive:     true,
-	}
+	user := seedTestUser(t, db, password)
+	lookup.Roles[user.UserID] = []string{"viewer"}
+	lookup.Permissions[user.UserID] = []string{"artifact:read"}
 
 	middleware := NewAuthMiddleware(db, lookup)
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		user := GetUser(r)
-		if user == nil {
+		authedUser := GetUser(r)
+		if authedUser == nil {
 			http.Error(w, "No user found", http.StatusUnauthorized)
 			return
 		}
-		assert.Equal(t, "testuser", user.Username)
-		assert.Contains(t, user.Roles, "viewer")
+		assert.Equal(t, user.Username, authedUser.Username)
+		assert.Contains(t, authedUser.Roles, "viewer")
 		w.WriteHeader(http.StatusOK)
 	})
 
 	next := middleware(handler)
 
 	// Create basic auth header
-	authString := "testuser:" + password
+	authString := user.Username + ":" + password
 	encodedAuth := base64.StdEncoding.EncodeToString([]byte(authString))
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -247,9 +277,11 @@ func TestAuthMiddlewareWithBasicAuth(t *testing.T) {
 	assert.Equal(t, http.StatusOK, rec.Code)
 }
 
-// TestAuthMiddlewareNoCredentials tests unauthenticated requests
+// TestAuthMiddlewareNoCredentials tests unauthenticated requests. No
+// Authorization header means NewAuthMiddleware returns before ever
+// querying the database, so an unconnected instance is safe here.
 func TestAuthMiddlewareNoCredentials(t *testing.T) {
-	db := NewMockDatabase()
+	db := database.New("postgres://localhost:5432/test")
 	lookup := NewMockRoleAndPermissionLookup()
 
 	middleware := NewAuthMiddleware(db, lookup)
@@ -270,9 +302,11 @@ func TestAuthMiddlewareNoCredentials(t *testing.T) {
 	assert.Equal(t, http.StatusOK, rec.Code)
 }
 
-// TestAuthMiddlewareInvalidToken tests invalid token handling
+// TestAuthMiddlewareInvalidToken tests invalid token handling. Uses a
+// live DB since ValidateAccessKey is actually queried, but no row will
+// match so the request proceeds unauthenticated.
 func TestAuthMiddlewareInvalidToken(t *testing.T) {
-	db := NewMockDatabase()
+	db := connectTestDB(t)
 	lookup := NewMockRoleAndPermissionLookup()
 
 	middleware := NewAuthMiddleware(db, lookup)
@@ -294,9 +328,11 @@ func TestAuthMiddlewareInvalidToken(t *testing.T) {
 	assert.Equal(t, http.StatusOK, rec.Code)
 }
 
-// TestAuthMiddlewareInvalidBasicAuth tests invalid basic auth handling
+// TestAuthMiddlewareInvalidBasicAuth tests invalid basic auth handling.
+// The base64 decode fails before any query, so an unconnected instance
+// is safe here.
 func TestAuthMiddlewareInvalidBasicAuth(t *testing.T) {
-	db := NewMockDatabase()
+	db := database.New("postgres://localhost:5432/test")
 	lookup := NewMockRoleAndPermissionLookup()
 
 	middleware := NewAuthMiddleware(db, lookup)
@@ -549,115 +585,6 @@ func TestGetUserNoContext(t *testing.T) {
 	assert.Nil(t, user)
 }
 
-// MockDatabase is a mock database for testing
-type MockDatabase struct {
-	Users      map[string]*UserRepository
-	AccessKeys map[string]*AccessKey
-	mu         sync.RWMutex
-}
-
-func NewMockDatabase() *MockDatabase {
-	return &MockDatabase{
-		Users:      make(map[string]*UserRepository),
-		AccessKeys: make(map[string]*AccessKey),
-	}
-}
-
-// Mock types
-type UserRepository struct {
-	UserID       string
-	Username     string
-	Email        string
-	PasswordHash string
-	Roles        []string
-	IsActive     bool
-}
-
-type AccessKey struct {
-	ID          string
-	UserID      string
-	Name        string
-	KeyHash     string
-	Permissions []string
-	CreatedAt   time.Time
-	LastUsed    *time.Time
-	ExpiresAt   *time.Time
-	IsActive    bool
-}
-
-// TestUserRepository tests user repository struct
-func TestUserRepository(t *testing.T) {
-	now := time.Now()
-	user := &UserRepository{
-		UserID:       "user-123",
-		Username:     "testuser",
-		Email:        "test@example.com",
-		PasswordHash: "hashedpassword",
-		Roles:        []string{"user", "developer"},
-		CreatedAt:    now,
-		IsActive:     true,
-	}
-
-	assert.Equal(t, "testuser", user.Username)
-	assert.True(t, user.IsActive)
-	assert.Len(t, user.Roles, 2)
-}
-
-// TestAccessKey tests access key struct
-func TestAccessKey(t *testing.T) {
-	now := time.Now()
-	key := &AccessKey{
-		ID:          "key-123",
-		UserID:      "user-123",
-		Name:        "production-key",
-		KeyHash:     "key_hash_123",
-		Permissions: []string{"artifact:read", "artifact:write"},
-		CreatedAt:   now,
-		ExpiresAt:   &now,
-		IsActive:    true,
-	}
-
-	assert.Equal(t, "production-key", key.Name)
-	assert.True(t, key.IsActive)
-	assert.Len(t, key.Permissions, 2)
-}
-
-// TestAccessKey_NoExpiry tests access key without expiry
-func TestAccessKey_NoExpiry(t *testing.T) {
-	key := &AccessKey{
-		ID:        "key-1",
-		ExpiresAt: nil,
-		IsActive:  true,
-	}
-
-	assert.Nil(t, key.ExpiresAt)
-	assert.True(t, key.IsActive)
-}
-
-// TestUserRepository_LastLogin tests optional last login
-func TestUserRepository_LastLogin(t *testing.T) {
-	now := time.Now()
-	user := &UserRepository{
-		UserID:    "user-1",
-		LastLogin: &now,
-		IsActive:  true,
-	}
-
-	assert.NotNil(t, user.LastLogin)
-}
-
-// TestAccessKey_LastUsed tests optional last used
-func TestAccessKey_LastUsed(t *testing.T) {
-	now := time.Now()
-	key := &AccessKey{
-		ID:        "key-1",
-		LastUsed:  &now,
-		IsActive:  true,
-	}
-
-	assert.NotNil(t, key.LastUsed)
-}
-
 // TestRateLimitWindowExpiration tests window expiration behavior
 func TestRateLimitWindowExpiration(t *testing.T) {
 	limit := 2
@@ -693,88 +620,78 @@ func TestRateLimitWindowExpiration(t *testing.T) {
 	assert.Equal(t, http.StatusOK, rec3.Code) // Should be allowed again
 }
 
-// TestUserRetrievalAfterAuth tests user is properly set after authentication
+// TestUserRetrievalAfterAuth tests that a wrong password is rejected
+// against a live, seeded database.
 func TestUserRetrievalAfterAuth(t *testing.T) {
-	db := NewMockDatabase()
+	db := connectTestDB(t)
 	lookup := NewMockRoleAndPermissionLookup()
 
-	lookup.Roles["user-1"] = []string{"admin"}
-	lookup.Permissions["user-1"] = []string{"artifact:read", "artifact:write", "user:admin"}
-
-	db.Users["user-1"] = &UserRepository{
-		UserID:       "user-1",
-		Username:     "admin",
-		Email:        "admin@example.com",
-		PasswordHash: "$2a$10$testpasswordhash",
-		Roles:        []string{"admin"},
-		IsActive:     true,
-	}
+	user := seedTestUser(t, db, "correct-password")
+	lookup.Roles[user.UserID] = []string{"admin"}
+	lookup.Permissions[user.UserID] = []string{"artifact:read", "artifact:write", "user:admin"}
 
 	middleware := NewAuthMiddleware(db, lookup)
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		user := GetUser(r)
-		if user == nil {
+		authedUser := GetUser(r)
+		if authedUser == nil {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
-		assert.Equal(t, "admin", user.Username)
-		assert.Contains(t, user.Roles, "admin")
-		assert.Contains(t, user.Permissions, "user:admin")
 		w.WriteHeader(http.StatusOK)
 	})
 
 	next := middleware(handler)
 
+	authString := user.Username + ":wrong-password"
+	encodedAuth := base64.StdEncoding.EncodeToString([]byte(authString))
+
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.Header.Set("Authorization", "Basic YWRtaW46cGFzc3dvcmQ=") // admin:password (invalid hash but won't be verified)
+	req.Header.Set("Authorization", "Basic "+encodedAuth)
 	rec := httptest.NewRecorder()
 
 	next.ServeHTTP(rec, req)
 
-	// Should return unauthorized because password doesn't match hash
+	// Should return unauthorized because the password doesn't match
 	assert.Equal(t, http.StatusUnauthorized, rec.Code)
 }
 
-// TestUserRetrievalAfterAuth tests user is properly set after authentication with correct password
+// TestUserRetrievalAfterAuthWithPassword tests that a correct password is
+// accepted and the user is populated in context, against a live, seeded
+// database.
 func TestUserRetrievalAfterAuthWithPassword(t *testing.T) {
-	db := NewMockDatabase()
+	db := connectTestDB(t)
 	lookup := NewMockRoleAndPermissionLookup()
 
-	lookup.Roles["user-1"] = []string{"admin"}
-	lookup.Permissions["user-1"] = []string{"artifact:read", "artifact:write", "user:admin"}
-
-	// Use a valid bcrypt hash for "password"
-	hashedPassword := "$2a$10$abcdefghijklmnopqrstuvwxyz1234567890123456789012345678901234"
-
-	db.Users["user-1"] = &UserRepository{
-		UserID:       "user-1",
-		Username:     "admin",
-		Email:        "admin@example.com",
-		PasswordHash: hashedPassword,
-		Roles:        []string{"admin"},
-		IsActive:     true,
-	}
+	password := "correct-password"
+	user := seedTestUser(t, db, password)
+	lookup.Roles[user.UserID] = []string{"admin"}
+	lookup.Permissions[user.UserID] = []string{"artifact:read", "artifact:write", "user:admin"}
 
 	middleware := NewAuthMiddleware(db, lookup)
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		user := GetUser(r)
-		if user == nil {
+		authedUser := GetUser(r)
+		if authedUser == nil {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
+		assert.Equal(t, user.Username, authedUser.Username)
+		assert.Contains(t, authedUser.Roles, "admin")
+		assert.Contains(t, authedUser.Permissions, "user:admin")
 		w.WriteHeader(http.StatusOK)
 	})
 
 	next := middleware(handler)
 
+	authString := user.Username + ":" + password
+	encodedAuth := base64.StdEncoding.EncodeToString([]byte(authString))
+
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.Header.Set("Authorization", "Basic YWRtaW46cGFzc3dvcmQ=") // admin:password
+	req.Header.Set("Authorization", "Basic "+encodedAuth)
 	rec := httptest.NewRecorder()
 
 	next.ServeHTTP(rec, req)
 
-	// Should return unauthorized because password hash doesn't match
-	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	assert.Equal(t, http.StatusOK, rec.Code)
 }

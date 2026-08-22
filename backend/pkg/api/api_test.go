@@ -1,863 +1,470 @@
 package api
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/simplylimitless/cargobay/backend/pkg/auth"
 	"github.com/simplylimitless/cargobay/backend/pkg/database"
+	"github.com/simplylimitless/cargobay/backend/pkg/middleware"
 	"github.com/simplylimitless/cargobay/backend/pkg/rbac"
+	"github.com/simplylimitless/cargobay/backend/pkg/storage"
 	"github.com/simplylimitless/cargobay/backend/pkg/vulnerability"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// MockDatabase is a mock implementation of the Database interface
-type MockDatabase struct{}
-
-// MockRBAC is a mock implementation of the RBAC interface
-type MockRBAC struct{}
-
-// MockVulnerabilityScanner is a mock implementation of the VulnerabilityScanner interface
-type MockVulnerabilityScanner struct{}
-
-// MockStorageAdapter is a mock implementation of the StorageAdapter interface
-type MockStorageAdapter struct{}
-
-// TestServer creates a test server for API testing
-func TestServer(t *testing.T) {
-	// Create mock dependencies
-	mockDB := &MockDatabase{}
-	mockRBAC := &MockRBAC{}
-	mockScanner := &MockVulnerabilityScanner{}
-
-	// Create the server
-	server := NewServer(mockDB, mockRBAC, mockScanner, nil)
-
-	assert.NotNil(t, server)
-	assert.NotNil(t, server.router)
+// connectTestDB connects to the docker-compose Postgres instance used by
+// this repo's test suite, skipping the test if it isn't reachable.
+func connectTestDB(t *testing.T) *database.Database {
+	t.Helper()
+	db := database.New("postgres://cargobay:password@localhost:5432/cargobay")
+	if err := db.Connect(); err != nil {
+		t.Skipf("no postgres available: %v", err)
+	}
+	t.Cleanup(func() { db.Disconnect() })
+	return db
 }
 
-// TestAPIHealthCheck tests the health check endpoint
+// newTestServer builds a real *Server against a live (but otherwise empty)
+// database, a real RBAC manager, a real vulnerability scanner, and a real
+// local storage adapter rooted at a temp dir.
+func newTestServer(t *testing.T, db *database.Database) *Server {
+	t.Helper()
+	rbacMgr := rbac.New(db)
+	scanner := vulnerability.New(db, "", false)
+	storageAdapter, err := storage.NewLocalAdapter(map[string]string{"path": t.TempDir()})
+	require.NoError(t, err)
+	return NewServer(db, rbacMgr, scanner, storageAdapter, nil, nil, nil, nil, nil)
+}
+
+// seedUser creates a real user row (optionally with roles) and schedules
+// its cleanup.
+func seedUser(t *testing.T, db *database.Database, roles ...string) *database.UserRepository {
+	t.Helper()
+	hash, err := auth.HashPassword("test-password-123")
+	require.NoError(t, err)
+	username := fmt.Sprintf("test-user-%d", time.Now().UnixNano())
+	user, err := db.CreateUser(username, username+"@example.com", hash, roles)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		db.Exec(context.Background(), "DELETE FROM users WHERE user_id = $1", user.UserID)
+	})
+	return user
+}
+
+// authedRequest returns req with the given user injected into its context,
+// mirroring what middleware.NewAuthMiddleware would have done — the auth
+// middleware itself is wired only in cmd/server/main.go, outside the
+// router this package tests directly.
+func authedRequest(req *http.Request, user *database.UserRepository, roles, permissions []string) *http.Request {
+	authUser := &middleware.User{
+		UserID:      user.UserID,
+		Username:    user.Username,
+		Email:       user.Email,
+		Roles:       roles,
+		Permissions: permissions,
+	}
+	ctx := context.WithValue(req.Context(), middleware.AuthUserKey, authUser)
+	return req.WithContext(ctx)
+}
+
+func seedRegistry(t *testing.T, db *database.Database, id string, private bool) *database.RegistryConfig {
+	t.Helper()
+	reg := &database.RegistryConfig{
+		ID:      id,
+		Name:    id,
+		URL:     "https://example.com/" + id,
+		Type:    "docker",
+		Enabled: true,
+		Private: private,
+	}
+	require.NoError(t, db.SaveRegistry(reg))
+	t.Cleanup(func() {
+		db.Exec(context.Background(), "DELETE FROM registries WHERE id = $1", id)
+	})
+	return reg
+}
+
+func decodeJSON(t *testing.T, w *httptest.ResponseRecorder, v interface{}) {
+	t.Helper()
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), v))
+}
+
+// --- Public, no-DB endpoints ---
+
 func TestAPIHealthCheck(t *testing.T) {
-	mockDB := &MockDatabase{}
-	mockRBAC := &MockRBAC{}
-	mockScanner := &MockVulnerabilityScanner{}
+	s := newTestServer(t, database.New("postgres://localhost:5432/test"))
 
-	server := NewServer(mockDB, mockRBAC, mockScanner, nil)
-
-	// Create request
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
-	rec := httptest.NewRecorder()
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
 
-	// Serve request
-	server.router.ServeHTTP(rec, req)
-
-	// Verify response
-	assert.Equal(t, http.StatusOK, rec.Code)
-	assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
-
-	var response map[string]string
-	err := json.NewDecoder(rec.Body).Decode(&response)
-	require.NoError(t, err)
-
-	assert.Equal(t, "ok", response["status"])
-	assert.Contains(t, response, "timestamp")
+	assert.Equal(t, http.StatusOK, w.Code)
+	var body map[string]string
+	decodeJSON(t, w, &body)
+	assert.Equal(t, "ok", body["status"])
 }
 
-// TestAPIVersion tests the version endpoint
 func TestAPIVersion(t *testing.T) {
-	mockDB := &MockDatabase{}
-	mockRBAC := &MockRBAC{}
-	mockScanner := &MockVulnerabilityScanner{}
+	s := newTestServer(t, database.New("postgres://localhost:5432/test"))
 
-	server := NewServer(mockDB, mockRBAC, mockScanner, nil)
-
-	// Create request
 	req := httptest.NewRequest(http.MethodGet, "/version", nil)
-	rec := httptest.NewRecorder()
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
 
-	// Serve request
-	server.router.ServeHTTP(rec, req)
-
-	// Verify response
-	assert.Equal(t, http.StatusOK, rec.Code)
-
-	var response map[string]string
-	err := json.NewDecoder(rec.Body).Decode(&response)
-	require.NoError(t, err)
-
-	assert.Contains(t, response, "version")
-	assert.Contains(t, response, "build")
+	assert.Equal(t, http.StatusOK, w.Code)
+	var body map[string]string
+	decodeJSON(t, w, &body)
+	assert.Equal(t, "1.0.0", body["version"])
 }
 
-// TestAPIListArtifacts tests the list artifacts endpoint
-func TestAPIListArtifacts(t *testing.T) {
-	mockDB := &MockDatabase{}
-	mockRBAC := &MockRBAC{}
-	mockScanner := &MockVulnerabilityScanner{}
-
-	server := NewServer(mockDB, mockRBAC, mockScanner, nil)
-
-	// Create request
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/artifacts", nil)
-	rec := httptest.NewRecorder()
-
-	// Serve request
-	server.router.ServeHTTP(rec, req)
-
-	// Verify response
-	assert.Equal(t, http.StatusOK, rec.Code)
-
-	var response map[string]interface{}
-	err := json.NewDecoder(rec.Body).Decode(&response)
-	require.NoError(t, err)
-
-	assert.Contains(t, response, "artifacts")
-	assert.Contains(t, response, "total")
-	assert.Contains(t, response, "hasMore")
-}
-
-// TestAPIGetArtifact tests the get artifact endpoint
-func TestAPIGetArtifact(t *testing.T) {
-	mockDB := &MockDatabase{}
-	mockRBAC := &MockRBAC{}
-	mockScanner := &MockVulnerabilityScanner{}
-
-	server := NewServer(mockDB, mockRBAC, mockScanner, nil)
-
-	// Create request
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/artifacts/artifact-123", nil)
-	rec := httptest.NewRecorder()
-
-	// Serve request
-	server.router.ServeHTTP(rec, req)
-
-	// Verify response
-	assert.Equal(t, http.StatusOK, rec.Code)
-
-	var response map[string]interface{}
-	err := json.NewDecoder(rec.Body).Decode(&response)
-	require.NoError(t, err)
-
-	assert.Contains(t, response, "id")
-	assert.Contains(t, response, "registryId")
-	assert.Contains(t, response, "artifactType")
-}
-
-// TestAPICreateArtifact tests the create artifact endpoint
-func TestAPICreateArtifact(t *testing.T) {
-	mockDB := &MockDatabase{}
-	mockRBAC := &MockRBAC{}
-	mockScanner := &MockVulnerabilityScanner{}
-
-	server := NewServer(mockDB, mockRBAC, mockScanner, nil)
-
-	// Create request body
-	body := map[string]interface{}{
-		"registryId":      "test-registry",
-		"artifactType":    "docker",
-		"namespace":       "library",
-		"artifactName":    "nginx",
-		"version":         "1.21.0",
-		"digest":          "sha256:abc123",
-		"digestAlgorithm": "sha256",
-		"size":            1024,
-		"metadata":        map[string]interface{}{"key": "value"},
-		"tags":            []string{"latest"},
-	}
-	jsonBody, _ := json.Marshal(body)
-
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/artifacts", bytes.NewBuffer(jsonBody))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-
-	// Serve request
-	server.router.ServeHTTP(rec, req)
-
-	// Verify response
-	assert.Equal(t, http.StatusCreated, rec.Code)
-
-	var response map[string]interface{}
-	err := json.NewDecoder(rec.Body).Decode(&response)
-	require.NoError(t, err)
-
-	assert.Contains(t, response, "id")
-}
-
-// TestAPIDeleteArtifact tests the delete artifact endpoint
-func TestAPIDeleteArtifact(t *testing.T) {
-	mockDB := &MockDatabase{}
-	mockRBAC := &MockRBAC{}
-	mockScanner := &MockVulnerabilityScanner{}
-
-	server := NewServer(mockDB, mockRBAC, mockScanner, nil)
-
-	// Create request
-	req := httptest.NewRequest(http.MethodDelete, "/api/v1/artifacts/artifact-123", nil)
-	rec := httptest.NewRecorder()
-
-	// Serve request
-	server.router.ServeHTTP(rec, req)
-
-	// Verify response
-	assert.Equal(t, http.StatusOK, rec.Code)
-
-	var response map[string]interface{}
-	err := json.NewDecoder(rec.Body).Decode(&response)
-	require.NoError(t, err)
-
-	assert.Contains(t, response, "message")
-}
-
-// TestAPISearchArtifacts tests the search artifacts endpoint
-func TestAPISearchArtifacts(t *testing.T) {
-	mockDB := &MockDatabase{}
-	mockRBAC := &MockRBAC{}
-	mockScanner := &MockVulnerabilityScanner{}
-
-	server := NewServer(mockDB, mockRBAC, mockScanner, nil)
-
-	// Create request with query
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/search?q=nginx", nil)
-	rec := httptest.NewRecorder()
-
-	// Serve request
-	server.router.ServeHTTP(rec, req)
-
-	// Verify response
-	assert.Equal(t, http.StatusOK, rec.Code)
-
-	var response map[string]interface{}
-	err := json.NewDecoder(rec.Body).Decode(&response)
-	require.NoError(t, err)
-
-	assert.Contains(t, response, "results")
-	assert.Contains(t, response, "total")
-}
-
-// TestAPIListRegistries tests the list registries endpoint
-func TestAPIListRegistries(t *testing.T) {
-	mockDB := &MockDatabase{}
-	mockRBAC := &MockRBAC{}
-	mockScanner := &MockVulnerabilityScanner{}
-
-	server := NewServer(mockDB, mockRBAC, mockScanner, nil)
-
-	// Create request
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/registries", nil)
-	rec := httptest.NewRecorder()
-
-	// Serve request
-	server.router.ServeHTTP(rec, req)
-
-	// Verify response
-	assert.Equal(t, http.StatusOK, rec.Code)
-
-	var response map[string]interface{}
-	err := json.NewDecoder(rec.Body).Decode(&response)
-	require.NoError(t, err)
-
-	assert.Contains(t, response, "registries")
-}
-
-// TestAPICreateRegistry tests the create registry endpoint
-func TestAPICreateRegistry(t *testing.T) {
-	mockDB := &MockDatabase{}
-	mockRBAC := &MockRBAC{}
-	mockScanner := &MockVulnerabilityScanner{}
-
-	server := NewServer(mockDB, mockRBAC, mockScanner, nil)
-
-	// Create request body
-	body := map[string]interface{}{
-		"id":       "npm-registry",
-		"name":     "NPM Registry",
-		"url":      "https://registry.npmjs.org",
-		"type":     "npm",
-		"proxy":    true,
-		"enabled":  true,
-		"priority": 1,
-	}
-	jsonBody, _ := json.Marshal(body)
-
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/registries", bytes.NewBuffer(jsonBody))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-
-	// Serve request
-	server.router.ServeHTTP(rec, req)
-
-	// Verify response
-	assert.Equal(t, http.StatusCreated, rec.Code)
-
-	var response map[string]interface{}
-	err := json.NewDecoder(rec.Body).Decode(&response)
-	require.NoError(t, err)
-
-	assert.Contains(t, response, "id")
-}
-
-// TestAPIListUsers tests the list users endpoint
-func TestAPIListUsers(t *testing.T) {
-	mockDB := &MockDatabase{}
-	mockRBAC := &MockRBAC{}
-	mockScanner := &MockVulnerabilityScanner{}
-
-	server := NewServer(mockDB, mockRBAC, mockScanner, nil)
-
-	// Create request
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/users", nil)
-	rec := httptest.NewRecorder()
-
-	// Serve request
-	server.router.ServeHTTP(rec, req)
-
-	// Verify response
-	assert.Equal(t, http.StatusOK, rec.Code)
-
-	var response map[string]interface{}
-	err := json.NewDecoder(rec.Body).Decode(&response)
-	require.NoError(t, err)
-
-	assert.Contains(t, response, "users")
-}
-
-// TestAPIListRoles tests the list roles endpoint
-func TestAPIListRoles(t *testing.T) {
-	mockDB := &MockDatabase{}
-	mockRBAC := &MockRBAC{}
-	mockScanner := &MockVulnerabilityScanner{}
-
-	server := NewServer(mockDB, mockRBAC, mockScanner, nil)
-
-	// Create request
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/roles", nil)
-	rec := httptest.NewRecorder()
-
-	// Serve request
-	server.router.ServeHTTP(rec, req)
-
-	// Verify response
-	assert.Equal(t, http.StatusOK, rec.Code)
-
-	var response map[string]interface{}
-	err := json.NewDecoder(rec.Body).Decode(&response)
-	require.NoError(t, err)
-
-	assert.Contains(t, response, "roles")
-}
-
-// TestAPIGetRole tests the get role endpoint
-func TestAPIGetRole(t *testing.T) {
-	mockDB := &MockDatabase{}
-	mockRBAC := &MockRBAC{}
-	mockScanner := &MockVulnerabilityScanner{}
-
-	server := NewServer(mockDB, mockRBAC, mockScanner, nil)
-
-	// Create request
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/roles/admin", nil)
-	rec := httptest.NewRecorder()
-
-	// Serve request
-	server.router.ServeHTTP(rec, req)
-
-	// Verify response
-	assert.Equal(t, http.StatusOK, rec.Code)
-
-	var response map[string]interface{}
-	err := json.NewDecoder(rec.Body).Decode(&response)
-	require.NoError(t, err)
-
-	assert.Contains(t, response, "id")
-	assert.Contains(t, response, "name")
-}
-
-// TestAPIListPermissions tests the list permissions endpoint
-func TestAPIListPermissions(t *testing.T) {
-	mockDB := &MockDatabase{}
-	mockRBAC := &MockRBAC{}
-	mockScanner := &MockVulnerabilityScanner{}
-
-	server := NewServer(mockDB, mockRBAC, mockScanner, nil)
-
-	// Create request
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/permissions", nil)
-	rec := httptest.NewRecorder()
-
-	// Serve request
-	server.router.ServeHTTP(rec, req)
-
-	// Verify response
-	assert.Equal(t, http.StatusOK, rec.Code)
-
-	var response map[string]interface{}
-	err := json.NewDecoder(rec.Body).Decode(&response)
-	require.NoError(t, err)
-
-	assert.Contains(t, response, "permissions")
-}
-
-// TestAPIGetPermission tests the get permission endpoint
-func TestAPIGetPermission(t *testing.T) {
-	mockDB := &MockDatabase{}
-	mockRBAC := &MockRBAC{}
-	mockScanner := &MockVulnerabilityScanner{}
-
-	server := NewServer(mockDB, mockRBAC, mockScanner, nil)
-
-	// Create request
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/permissions/artifact:read", nil)
-	rec := httptest.NewRecorder()
-
-	// Serve request
-	server.router.ServeHTTP(rec, req)
-
-	// Verify response
-	assert.Equal(t, http.StatusOK, rec.Code)
-
-	var response map[string]interface{}
-	err := json.NewDecoder(rec.Body).Decode(&response)
-	require.NoError(t, err)
-
-	assert.Contains(t, response, "id")
-	assert.Contains(t, response, "name")
-}
-
-// TestAPIGetUserRoles tests the get user roles endpoint
-func TestAPIGetUserRoles(t *testing.T) {
-	mockDB := &MockDatabase{}
-	mockRBAC := &MockRBAC{}
-	mockScanner := &MockVulnerabilityScanner{}
-
-	server := NewServer(mockDB, mockRBAC, mockScanner, nil)
-
-	// Create request
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/users/user-123/roles", nil)
-	rec := httptest.NewRecorder()
-
-	// Serve request
-	server.router.ServeHTTP(rec, req)
-
-	// Verify response
-	assert.Equal(t, http.StatusOK, rec.Code)
-
-	var response map[string]interface{}
-	err := json.NewDecoder(rec.Body).Decode(&response)
-	require.NoError(t, err)
-
-	assert.Contains(t, response, "roles")
-}
-
-// TestAPIGetUserPermissions tests the get user permissions endpoint
-func TestAPIGetUserPermissions(t *testing.T) {
-	mockDB := &MockDatabase{}
-	mockRBAC := &MockRBAC{}
-	mockScanner := &MockVulnerabilityScanner{}
-
-	server := NewServer(mockDB, mockRBAC, mockScanner, nil)
-
-	// Create request
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/users/user-123/permissions", nil)
-	rec := httptest.NewRecorder()
-
-	// Serve request
-	server.router.ServeHTTP(rec, req)
-
-	// Verify response
-	assert.Equal(t, http.StatusOK, rec.Code)
-
-	var response map[string]interface{}
-	err := json.NewDecoder(rec.Body).Decode(&response)
-	require.NoError(t, err)
-
-	assert.Contains(t, response, "permissions")
-}
-
-// TestAPIScanArtifact tests the scan artifact endpoint
-func TestAPIScanArtifact(t *testing.T) {
-	mockDB := &MockDatabase{}
-	mockRBAC := &MockRBAC{}
-	mockScanner := &MockVulnerabilityScanner{}
-
-	server := NewServer(mockDB, mockRBAC, mockScanner, nil)
-
-	// Create request
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/artifacts/artifact-123/scan", nil)
-	rec := httptest.NewRecorder()
-
-	// Serve request
-	server.router.ServeHTTP(rec, req)
-
-	// Verify response
-	assert.Equal(t, http.StatusOK, rec.Code)
-
-	var response map[string]interface{}
-	err := json.NewDecoder(rec.Body).Decode(&response)
-	require.NoError(t, err)
-
-	assert.Contains(t, response, "artifactId")
-	assert.Contains(t, response, "severity")
-}
-
-// TestAPIReplicationStatus tests the replication status endpoint
-func TestAPIReplicationStatus(t *testing.T) {
-	mockDB := &MockDatabase{}
-	mockRBAC := &MockRBAC{}
-	mockScanner := &MockVulnerabilityScanner{}
-
-	server := NewServer(mockDB, mockRBAC, mockScanner, nil)
-
-	// Create request
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/replication/status", nil)
-	rec := httptest.NewRecorder()
-
-	// Serve request
-	server.router.ServeHTTP(rec, req)
-
-	// Verify response
-	assert.Equal(t, http.StatusOK, rec.Code)
-
-	var response map[string]interface{}
-	err := json.NewDecoder(rec.Body).Decode(&response)
-	require.NoError(t, err)
-
-	assert.Contains(t, response, "status")
-	assert.Contains(t, response, "regions")
-}
-
-// TestAPIReplicationSync tests the replication sync endpoint
-func TestAPIReplicationSync(t *testing.T) {
-	mockDB := &MockDatabase{}
-	mockRBAC := &MockRBAC{}
-	mockScanner := &MockVulnerabilityScanner{}
-
-	server := NewServer(mockDB, mockRBAC, mockScanner, nil)
-
-	// Create request
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/replication/sync", nil)
-	rec := httptest.NewRecorder()
-
-	// Serve request
-	server.router.ServeHTTP(rec, req)
-
-	// Verify response
-	assert.Equal(t, http.StatusOK, rec.Code)
-
-	var response map[string]interface{}
-	err := json.NewDecoder(rec.Body).Decode(&response)
-	require.NoError(t, err)
-
-	assert.Contains(t, response, "message")
-}
-
-// TestAPIMetrics tests the metrics endpoint
 func TestAPIMetrics(t *testing.T) {
-	mockDB := &MockDatabase{}
-	mockRBAC := &MockRBAC{}
-	mockScanner := &MockVulnerabilityScanner{}
+	s := newTestServer(t, database.New("postgres://localhost:5432/test"))
 
-	server := NewServer(mockDB, mockRBAC, mockScanner, nil)
-
-	// Create request
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
-	rec := httptest.NewRecorder()
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
 
-	// Serve request
-	server.router.ServeHTTP(rec, req)
-
-	// Verify response
-	assert.Equal(t, http.StatusOK, rec.Code)
-
-	// Metrics should return Prometheus-style format
-	assert.Contains(t, rec.Body.String(), "cargobay_")
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), "cargobay_")
 }
 
-// TestAPIRateLimiting tests rate limiting middleware
-func TestAPIRateLimiting(t *testing.T) {
-	mockDB := &MockDatabase{}
-	mockRBAC := &MockRBAC{}
-	mockScanner := &MockVulnerabilityScanner{}
+func TestAPIReplicationStatus(t *testing.T) {
+	s := newTestServer(t, database.New("postgres://localhost:5432/test"))
 
-	server := NewServer(mockDB, mockRBAC, mockScanner, nil)
+	req := httptest.NewRequest(http.MethodGet, "/replication/status", nil)
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
 
-	// Create multiple requests
-	for i := 0; i < 10; i++ {
-		req := httptest.NewRequest(http.MethodGet, "/health", nil)
-		rec := httptest.NewRecorder()
-
-		server.router.ServeHTTP(rec, req)
-
-		// Should all succeed with 200
-		assert.Equal(t, http.StatusOK, rec.Code)
-	}
+	assert.Equal(t, http.StatusOK, w.Code)
+	var body map[string]interface{}
+	decodeJSON(t, w, &body)
+	assert.Equal(t, "running", body["status"])
 }
 
-// TestAPIErrorHandling tests error handling
-func TestAPIErrorHandling(t *testing.T) {
-	mockDB := &MockDatabase{}
-	mockRBAC := &MockRBAC{}
-	mockScanner := &MockVulnerabilityScanner{}
+func TestAPIListRegions(t *testing.T) {
+	s := newTestServer(t, database.New("postgres://localhost:5432/test"))
 
-	server := NewServer(mockDB, mockRBAC, mockScanner, nil)
+	req := httptest.NewRequest(http.MethodGet, "/replication/regions", nil)
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
 
-	// Test with invalid method
-	req := httptest.NewRequest(http.MethodPatch, "/api/v1/artifacts/artifact-123", nil)
-	rec := httptest.NewRecorder()
-
-	server.router.ServeHTTP(rec, req)
-
-	// Should return 404 or 405
-	assert.Contains(t, []int{http.StatusNotFound, http.StatusMethodNotAllowed}, rec.Code)
+	assert.Equal(t, http.StatusOK, w.Code)
+	var body map[string][]string
+	decodeJSON(t, w, &body)
+	assert.NotEmpty(t, body["regions"])
 }
 
-// TestAPIContentType tests content type headers
-func TestAPIContentType(t *testing.T) {
-	mockDB := &MockDatabase{}
-	mockRBAC := &MockRBAC{}
-	mockScanner := &MockVulnerabilityScanner{}
+// --- RBAC read endpoints (static, no DB) ---
 
-	server := NewServer(mockDB, mockRBAC, mockScanner, nil)
+func TestAPIListRoles(t *testing.T) {
+	s := newTestServer(t, database.New("postgres://localhost:5432/test"))
 
-	// Create request
-	req := httptest.NewRequest(http.MethodGet, "/health", nil)
-	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/roles", nil)
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
 
-	server.router.ServeHTTP(rec, req)
-
-	// Verify content type
-	assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+	assert.Equal(t, http.StatusOK, w.Code)
+	var body map[string][]rbac.RoleDefinition
+	decodeJSON(t, w, &body)
+	assert.GreaterOrEqual(t, len(body["roles"]), 3)
 }
 
-// TestAPIPagination tests pagination support
-func TestAPIPagination(t *testing.T) {
-	mockDB := &MockDatabase{}
-	mockRBAC := &MockRBAC{}
-	mockScanner := &MockVulnerabilityScanner{}
+func TestAPIGetRole(t *testing.T) {
+	s := newTestServer(t, database.New("postgres://localhost:5432/test"))
 
-	server := NewServer(mockDB, mockRBAC, mockScanner, nil)
+	req := httptest.NewRequest(http.MethodGet, "/roles/admin", nil)
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
 
-	// Create request with pagination params
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/artifacts?limit=10&offset=20", nil)
-	rec := httptest.NewRecorder()
-
-	server.router.ServeHTTP(rec, req)
-
-	// Should succeed
-	assert.Equal(t, http.StatusOK, rec.Code)
+	req = httptest.NewRequest(http.MethodGet, "/roles/does-not-exist", nil)
+	w = httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusNotFound, w.Code)
 }
 
-// TestAPISorting tests sorting support
-func TestAPISorting(t *testing.T) {
-	mockDB := &MockDatabase{}
-	mockRBAC := &MockRBAC{}
-	mockScanner := &MockVulnerabilityScanner{}
+func TestAPIListPermissions(t *testing.T) {
+	s := newTestServer(t, database.New("postgres://localhost:5432/test"))
 
-	server := NewServer(mockDB, mockRBAC, mockScanner, nil)
+	req := httptest.NewRequest(http.MethodGet, "/permissions", nil)
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
 
-	// Create request with sorting params
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/artifacts?orderBy=created&order=desc", nil)
-	rec := httptest.NewRecorder()
-
-	server.router.ServeHTTP(rec, req)
-
-	// Should succeed
-	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, http.StatusOK, w.Code)
+	var body map[string][]rbac.PermissionDefinition
+	decodeJSON(t, w, &body)
+	assert.GreaterOrEqual(t, len(body["permissions"]), 15)
 }
 
-// TestAPIFiltering tests filtering support
-func TestAPIFiltering(t *testing.T) {
-	mockDB := &MockDatabase{}
-	mockRBAC := &MockRBAC{}
-	mockScanner := &MockVulnerabilityScanner{}
+func TestAPIGetPermission(t *testing.T) {
+	s := newTestServer(t, database.New("postgres://localhost:5432/test"))
 
-	server := NewServer(mockDB, mockRBAC, mockScanner, nil)
+	req := httptest.NewRequest(http.MethodGet, "/permissions/artifact:read", nil)
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
 
-	// Create request with filter params
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/artifacts?artifactType=docker&namespace=library", nil)
-	rec := httptest.NewRecorder()
-
-	server.router.ServeHTTP(rec, req)
-
-	// Should succeed
-	assert.Equal(t, http.StatusOK, rec.Code)
+	req = httptest.NewRequest(http.MethodGet, "/permissions/does-not-exist", nil)
+	w = httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusNotFound, w.Code)
 }
 
-// TestAPIServerRoutes tests that all expected routes are registered
-func TestAPIServerRoutes(t *testing.T) {
-	mockDB := &MockDatabase{}
-	mockRBAC := &MockRBAC{}
-	mockScanner := &MockVulnerabilityScanner{}
+// --- Live-DB endpoints ---
 
-	server := NewServer(mockDB, mockRBAC, mockScanner, nil)
+func TestAPISetupStatus(t *testing.T) {
+	db := connectTestDB(t)
+	s := newTestServer(t, db)
 
-	// Test that the server has a router
-	assert.NotNil(t, server.router)
+	req := httptest.NewRequest(http.MethodGet, "/setup/status", nil)
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
 
-	// Test that all expected routes are accessible
-	routes := []struct {
-		method string
-		path   string
-	}{
-		{http.MethodGet, "/health"},
-		{http.MethodGet, "/version"},
-		{http.MethodGet, "/api/v1/artifacts"},
-		{http.MethodPost, "/api/v1/artifacts"},
-		{http.MethodGet, "/api/v1/artifacts/artifact-123"},
-		{http.MethodDelete, "/api/v1/artifacts/artifact-123"},
-		{http.MethodGet, "/api/v1/search"},
-		{http.MethodGet, "/api/v1/registries"},
-		{http.MethodPost, "/api/v1/registries"},
-		{http.MethodGet, "/api/v1/users"},
-		{http.MethodGet, "/api/v1/roles"},
-		{http.MethodGet, "/api/v1/roles/admin"},
-		{http.MethodGet, "/api/v1/permissions"},
-		{http.MethodGet, "/api/v1/permissions/artifact:read"},
-		{http.MethodGet, "/metrics"},
-	}
-
-	for _, route := range routes {
-		req := httptest.NewRequest(route.method, route.path, nil)
-		rec := httptest.NewRecorder()
-
-		server.router.ServeHTTP(rec, req)
-
-		// Should not return 404 for registered routes
-		assert.NotEqual(t, http.StatusNotFound, rec.Code,
-			"Route %s %s should be registered", route.method, route.path)
-	}
+	assert.Equal(t, http.StatusOK, w.Code)
+	var body map[string]bool
+	decodeJSON(t, w, &body)
+	// Some other test/seed data may already exist, so we only assert the
+	// field is present and well-formed, not its value.
+	_, ok := body["needsSetup"]
+	assert.True(t, ok)
 }
 
-// TestAPIServerMiddleware tests middleware chain
-func TestAPIServerMiddleware(t *testing.T) {
-	mockDB := &MockDatabase{}
-	mockRBAC := &MockRBAC{}
-	mockScanner := &MockVulnerabilityScanner{}
+func TestAPIListArtifacts(t *testing.T) {
+	db := connectTestDB(t)
+	s := newTestServer(t, db)
 
-	server := NewServer(mockDB, mockRBAC, mockScanner, nil)
+	req := httptest.NewRequest(http.MethodGet, "/artifacts", nil)
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
 
-	// Test health check (should pass through all middleware)
-	req := httptest.NewRequest(http.MethodGet, "/health", nil)
-	rec := httptest.NewRecorder()
-
-	server.router.ServeHTTP(rec, req)
-
-	// Should succeed
-	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, http.StatusOK, w.Code)
+	var body PaginationResponse
+	decodeJSON(t, w, &body)
 }
 
-// TestAPIServerOptions tests CORS preflight handling
-func TestAPIServerOptions(t *testing.T) {
-	mockDB := &MockDatabase{}
-	mockRBAC := &MockRBAC{}
-	mockScanner := &MockVulnerabilityScanner{}
+func TestAPISearchArtifacts(t *testing.T) {
+	db := connectTestDB(t)
+	s := newTestServer(t, db)
 
-	server := NewServer(mockDB, mockRBAC, mockScanner, nil)
+	// Missing 'q' is a 400.
+	req := httptest.NewRequest(http.MethodGet, "/search", nil)
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
 
-	// Create OPTIONS request (CORS preflight)
-	req := httptest.NewRequest(http.MethodOptions, "/api/v1/artifacts", nil)
-	req.Header.Set("Origin", "http://localhost:3000")
-	req.Header.Set("Access-Control-Request-Method", "GET")
-	rec := httptest.NewRecorder()
-
-	server.router.ServeHTTP(rec, req)
-
-	// Should handle preflight
-	assert.Contains(t, []int{http.StatusOK, http.StatusNoContent}, rec.Code)
+	// A real query returns a bare JSON array.
+	req = httptest.NewRequest(http.MethodGet, "/search?q=nginx", nil)
+	w = httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	var results []database.ArtifactMetadata
+	decodeJSON(t, w, &results)
 }
 
-// TestAPIServerHead tests HEAD method handling
-func TestAPIServerHead(t *testing.T) {
-	mockDB := &MockDatabase{}
-	mockRBAC := &MockRBAC{}
-	mockScanner := &MockVulnerabilityScanner{}
+func TestAPIListRegistries(t *testing.T) {
+	db := connectTestDB(t)
+	s := newTestServer(t, db)
+	seedRegistry(t, db, fmt.Sprintf("test-registry-%d", time.Now().UnixNano()), false)
 
-	server := NewServer(mockDB, mockRBAC, mockScanner, nil)
+	req := httptest.NewRequest(http.MethodGet, "/registries", nil)
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
 
-	// Create HEAD request
-	req := httptest.NewRequest(http.MethodHead, "/health", nil)
-	rec := httptest.NewRecorder()
-
-	server.router.ServeHTTP(rec, req)
-
-	// Should return headers without body
-	assert.Equal(t, http.StatusOK, rec.Code)
-	assert.Empty(t, rec.Body.String())
+	assert.Equal(t, http.StatusOK, w.Code)
+	var body map[string][]database.RegistryConfig
+	decodeJSON(t, w, &body)
+	assert.NotEmpty(t, body["registries"])
 }
 
-// TestAPIJSONResponse tests JSON response formatting
-func TestAPIJSONResponse(t *testing.T) {
-	mockDB := &MockDatabase{}
-	mockRBAC := &MockRBAC{}
-	mockScanner := &MockVulnerabilityScanner{}
+func TestAPIListUsers(t *testing.T) {
+	db := connectTestDB(t)
+	s := newTestServer(t, db)
+	seedUser(t, db)
 
-	server := NewServer(mockDB, mockRBAC, mockScanner, nil)
+	req := httptest.NewRequest(http.MethodGet, "/users", nil)
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
 
-	// Create request
-	req := httptest.NewRequest(http.MethodGet, "/health", nil)
-	rec := httptest.NewRecorder()
-
-	server.router.ServeHTTP(rec, req)
-
-	// Verify response is valid JSON
-	var response map[string]interface{}
-	err := json.NewDecoder(rec.Body).Decode(&response)
-	require.NoError(t, err)
-
-	// Should have required fields
-	assert.Contains(t, response, "status")
+	assert.Equal(t, http.StatusOK, w.Code)
+	var body map[string][]database.UserRepository
+	decodeJSON(t, w, &body)
+	assert.NotEmpty(t, body["users"])
 }
 
-// TestAPIErrorResponse tests error response formatting
-func TestAPIErrorResponse(t *testing.T) {
-	mockDB := &MockDatabase{}
-	mockRBAC := &MockRBAC{}
-	mockScanner := &MockVulnerabilityScanner{}
+func TestAPIGetUserRoles(t *testing.T) {
+	db := connectTestDB(t)
+	s := newTestServer(t, db)
+	user := seedUser(t, db, "viewer")
 
-	server := NewServer(mockDB, mockRBAC, mockScanner, nil)
+	req := httptest.NewRequest(http.MethodGet, "/users/"+user.UserID+"/roles", nil)
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
 
-	// Test with non-existent resource
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/artifacts/non-existent", nil)
-	rec := httptest.NewRecorder()
-
-	server.router.ServeHTTP(rec, req)
-
-	// Verify error response
-	assert.Equal(t, http.StatusNotFound, rec.Code)
-
-	var response map[string]interface{}
-	err := json.NewDecoder(rec.Body).Decode(&response)
-	require.NoError(t, err)
-
-	assert.Contains(t, response, "error")
-	assert.Contains(t, response, "message")
+	assert.Equal(t, http.StatusOK, w.Code)
+	var body map[string][]string
+	decodeJSON(t, w, &body)
+	assert.Contains(t, body["roles"], "viewer")
 }
 
-// Connect implements StorageAdapter interface
-func (m *MockStorageAdapter) Connect() error { return nil }
+func TestAPIGetUserPermissions(t *testing.T) {
+	db := connectTestDB(t)
+	s := newTestServer(t, db)
+	user := seedUser(t, db, "viewer")
 
-// Disconnect implements StorageAdapter interface
-func (m *MockStorageAdapter) Disconnect() error { return nil }
+	req := httptest.NewRequest(http.MethodGet, "/users/"+user.UserID+"/permissions", nil)
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
 
-// SaveArtifact implements StorageAdapter interface
-func (m *MockStorageAdapter) SaveArtifact(registryID, namespace, artifactName, version string, data []byte) (string, error) {
-	return "test-key", nil
+	assert.Equal(t, http.StatusOK, w.Code)
+	var body map[string][]string
+	decodeJSON(t, w, &body)
+	assert.Contains(t, body["permissions"], "artifact:read")
 }
 
-// GetArtifact implements StorageAdapter interface
-func (m *MockStorageAdapter) GetArtifact(registryID, namespace, artifactName, version string) ([]byte, error) {
-	return []byte("test data"), nil
+func TestAPIListAuditLogs(t *testing.T) {
+	db := connectTestDB(t)
+	s := newTestServer(t, db)
+
+	req := httptest.NewRequest(http.MethodGet, "/audit/logs", nil)
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var body map[string]interface{}
+	decodeJSON(t, w, &body)
+	_, ok := body["logs"]
+	assert.True(t, ok)
 }
 
-// DeleteArtifact implements StorageAdapter interface
-func (m *MockStorageAdapter) DeleteArtifact(registryID, namespace, artifactName, version string) error {
-	return nil
+// --- Mutating endpoints: auth/permission gating ---
+
+func TestAPICreateArtifactRequiresAuth(t *testing.T) {
+	db := connectTestDB(t)
+	s := newTestServer(t, db)
+
+	req := httptest.NewRequest(http.MethodPost, "/artifacts", nil)
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
-// ArtifactExists implements StorageAdapter interface
-func (m *MockStorageAdapter) ArtifactExists(registryID, namespace, artifactName, version string) (bool, error) {
-	return true, nil
+func TestAPICreateArtifactRequiresPermission(t *testing.T) {
+	db := connectTestDB(t)
+	s := newTestServer(t, db)
+	user := seedUser(t, db, "viewer") // no artifact:write
+
+	body := `{"artifactName":"nginx","version":"1.0.0"}`
+	req := httptest.NewRequest(http.MethodPost, "/artifacts", strings.NewReader(body))
+	req = authedRequest(req, user, []string{"viewer"}, []string{"artifact:read"})
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusForbidden, w.Code)
+}
+
+func TestAPICreateAndDeleteArtifact(t *testing.T) {
+	db := connectTestDB(t)
+	s := newTestServer(t, db)
+	registry := seedRegistry(t, db, fmt.Sprintf("test-registry-%d", time.Now().UnixNano()), false)
+	user := seedUser(t, db, "publisher") // publisher has artifact:write
+
+	artifactBody := fmt.Sprintf(`{"registryId":%q,"artifactType":"docker","namespace":"library","artifactName":"nginx","version":"1.0.0","tags":[]}`, registry.ID)
+	req := httptest.NewRequest(http.MethodPost, "/artifacts", strings.NewReader(artifactBody))
+	req = authedRequest(req, user, []string{"publisher"}, []string{"artifact:write", "artifact:read"})
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	require.Equal(t, http.StatusCreated, w.Code)
+
+	var created database.ArtifactMetadata
+	decodeJSON(t, w, &created)
+	require.NotEmpty(t, created.ID)
+	t.Cleanup(func() {
+		db.Exec(context.Background(), "DELETE FROM artifacts WHERE id = $1", created.ID)
+	})
+
+	// Fetching it back should succeed.
+	req = httptest.NewRequest(http.MethodGet, "/artifacts/"+created.ID, nil)
+	w = httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	// Deleting without auth is rejected.
+	req = httptest.NewRequest(http.MethodDelete, "/artifacts/"+created.ID, nil)
+	w = httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+
+	// The original uploader may delete it even without artifact:delete.
+	req = httptest.NewRequest(http.MethodDelete, "/artifacts/"+created.ID, nil)
+	req = authedRequest(req, user, []string{"publisher"}, []string{"artifact:write", "artifact:read"})
+	w = httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestAPICreateRegistryRequiresPermission(t *testing.T) {
+	db := connectTestDB(t)
+	s := newTestServer(t, db)
+	user := seedUser(t, db, "viewer")
+
+	req := httptest.NewRequest(http.MethodPost, "/registries", strings.NewReader(`{"id":"r1","name":"r1"}`))
+	req = authedRequest(req, user, []string{"viewer"}, []string{"artifact:read"})
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusForbidden, w.Code)
+}
+
+func TestAPICreateRegistry(t *testing.T) {
+	db := connectTestDB(t)
+	s := newTestServer(t, db)
+	user := seedUser(t, db, "admin")
+	id := fmt.Sprintf("test-registry-%d", time.Now().UnixNano())
+	t.Cleanup(func() {
+		db.Exec(context.Background(), "DELETE FROM registries WHERE id = $1", id)
+	})
+
+	body := fmt.Sprintf(`{"id":%q,"name":"test","url":"https://example.com","type":"docker","enabled":true}`, id)
+	req := httptest.NewRequest(http.MethodPost, "/registries", strings.NewReader(body))
+	req = authedRequest(req, user, []string{"admin"}, []string{"registry:write"})
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusCreated, w.Code)
+}
+
+func TestAPIReplicationSyncAlwaysForbidden(t *testing.T) {
+	// "replication:sync" is not among the static RBAC permissions, so no
+	// real role — including admin — ever grants it; this endpoint is
+	// effectively unreachable via the current RBAC configuration.
+	db := connectTestDB(t)
+	s := newTestServer(t, db)
+	user := seedUser(t, db, "admin")
+
+	req := httptest.NewRequest(http.MethodPost, "/replication/sync", nil)
+	req = authedRequest(req, user, []string{"admin"}, rbac.New(db).GetRolePermissions("admin"))
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusForbidden, w.Code)
+}
+
+func TestAPIScanArtifactRequiresAuth(t *testing.T) {
+	db := connectTestDB(t)
+	s := newTestServer(t, db)
+
+	req := httptest.NewRequest(http.MethodPost, "/artifacts/some-id/scan", nil)
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }

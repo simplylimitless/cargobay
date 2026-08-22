@@ -1,11 +1,13 @@
 package maven
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"sync"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/assert"
@@ -17,254 +19,197 @@ import (
 	"github.com/simplylimitless/cargobay/backend/pkg/storage"
 )
 
-// MockDatabase is a simple mock database for testing
-type MockDatabase struct {
-	Artifacts   map[string]*database.ArtifactMetadata
-	Registries  map[string]*database.RegistryConfig
-	mu          sync.RWMutex
-}
-
-func NewMockDatabase() *MockDatabase {
-	return &MockDatabase{
-		Artifacts:  make(map[string]*database.ArtifactMetadata),
-		Registries: make(map[string]*database.RegistryConfig),
+// connectTestDB returns a live, connected database.Database, skipping the
+// test if Postgres isn't reachable in this environment.
+func connectTestDB(t *testing.T) *database.Database {
+	t.Helper()
+	db := database.New("postgres://cargobay:password@localhost:5432/cargobay")
+	if err := db.Connect(); err != nil {
+		t.Skipf("skipping: postgres not reachable: %v", err)
 	}
+	t.Cleanup(func() { db.Disconnect() })
+	return db
 }
 
-func (m *MockDatabase) SaveArtifact(a *database.ArtifactMetadata) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.Artifacts[a.ID] = a
-	return nil
-}
-
-func (m *MockDatabase) ListArtifacts(registry string, opts database.ListOptions) ([]database.ArtifactMetadata, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	var result []database.ArtifactMetadata
-	for _, a := range m.Artifacts {
-		if opts.ArtifactType != "" && a.ArtifactType != opts.ArtifactType {
-			continue
-		}
-		if opts.Namespace != "" && a.Namespace != opts.Namespace {
-			continue
-		}
-		result = append(result, *a)
+// connectTestCache returns a live, connected cache.Cache, skipping the test
+// if Redis isn't reachable in this environment.
+func connectTestCache(t *testing.T) *cache.Cache {
+	t.Helper()
+	c, err := cache.New("redis", "redis://localhost:6379/0")
+	if err != nil {
+		t.Skipf("skipping: redis not reachable: %v", err)
 	}
-	return result, nil
+	t.Cleanup(func() { c.Close() })
+	return c
 }
 
-func (m *MockDatabase) SaveRegistry(r *database.RegistryConfig) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.Registries[r.ID] = r
-	return nil
+// newTestProxy builds a MavenProxy directly against real dependencies, for
+// tests that invoke unexported handler methods without going through the
+// chi router/middleware.
+func newTestProxy(t *testing.T, db *database.Database, c *cache.Cache) (*MavenProxy, storage.StorageAdapter) {
+	t.Helper()
+	adapter, err := storage.NewLocalAdapter(map[string]string{"path": t.TempDir()})
+	require.NoError(t, err)
+	return &MavenProxy{
+		db:         db,
+		storage:    adapter,
+		cache:      c,
+		registries: nil,
+		registry:   "maven",
+	}, adapter
 }
 
-func (m *MockDatabase) GetRegistry(id string) (*database.RegistryConfig, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.Registries[id], nil
+// newTestRouter builds the real chi router (including the RequireReadAccess
+// middleware) so handler tests that depend on proxy.TargetFromContext (i.e.
+// most Maven handlers, which read the resolved target from the request
+// context rather than a parameter) get a correctly populated context.
+func newTestRouter(t *testing.T, db *database.Database, c *cache.Cache) (chi.Router, storage.StorageAdapter) {
+	t.Helper()
+	adapter, err := storage.NewLocalAdapter(map[string]string{"path": t.TempDir()})
+	require.NoError(t, err)
+	router := NewMavenProxy(db, adapter, c, rbac.New(db), nil)
+	return router, adapter
 }
 
-// MockStorageAdapter is a mock storage for testing
-type MockStorageAdapter struct {
-	Artifacts map[string][]byte
-	mu        sync.RWMutex
-}
-
-func NewMockStorage() *MockStorageAdapter {
-	return &MockStorageAdapter{
-		Artifacts: make(map[string][]byte),
+// seedRegistry saves a Maven-type registry bound to a unique host, so
+// RequireReadAccess resolves it deterministically via Host header matching
+// instead of falling back to whatever registry other concurrently-run tests
+// (sharing this live DB) left as the DB-wide default for artifactType
+// "maven".
+func seedRegistry(t *testing.T, db *database.Database, id, host string, private, proxy bool) *database.RegistryConfig {
+	t.Helper()
+	reg := &database.RegistryConfig{
+		ID:       id,
+		Name:     id,
+		URL:      "https://upstream.example.com",
+		Type:     "maven",
+		Proxy:    proxy,
+		Enabled:  true,
+		Priority: 10,
+		Private:  private,
+		Host:     host,
 	}
+	require.NoError(t, db.SaveRegistry(reg))
+	t.Cleanup(func() { db.DeleteRegistry(id) })
+	return reg
 }
 
-func (m *MockStorageAdapter) Connect() error                      { return nil }
-func (m *MockStorageAdapter) Disconnect() error                   { return nil }
-func (m *MockStorageAdapter) SaveArtifact(reg, ns, name, ver string, data []byte) (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.Artifacts[reg+"/"+ns+"/"+name+"/"+ver] = data
-	return "", nil
-}
-func (m *MockStorageAdapter) GetArtifact(reg, ns, name, ver string) ([]byte, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.Artifacts[reg+"/"+ns+"/"+name+"/"+ver], nil
-}
-func (m *MockStorageAdapter) DeleteArtifact(reg, ns, name, ver string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.Artifacts, reg+"/"+ns+"/"+name+"/"+ver)
-	return nil
-}
-func (m *MockStorageAdapter) ArtifactExists(reg, ns, name, ver string) (bool, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	_, ok := m.Artifacts[reg+"/"+ns+"/"+name+"/"+ver]
-	return ok, nil
+func uniqueID(prefix string) string {
+	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
 }
 
-// MockCache is a mock cache for testing
-type MockCache struct {
-	Data map[string][]byte
-	mu   sync.RWMutex
-}
-
-func NewMockCache() *MockCache {
-	return &MockCache{
-		Data: make(map[string][]byte),
+// chiRequest builds a request carrying a chi.RouteContext populated with
+// params, for tests that invoke a handler directly (bypassing chi's actual
+// route matching) but still need chi.URLParam(r, ...) to resolve inside the
+// handler.
+func chiRequest(method, path string, params map[string]string) *http.Request {
+	rctx := chi.NewRouteContext()
+	for k, v := range params {
+		rctx.URLParams.Add(k, v)
 	}
+	req := httptest.NewRequest(method, path, nil)
+	return req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
 }
 
-func (m *MockCache) Get(key string, value interface{}) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if data, ok := m.Data[key]; ok {
-		if val, ok := value.(*[]byte); ok {
-			*val = data
-		}
-		return nil
-	}
-	return cache.ErrCacheMiss
-}
-
-func (m *MockCache) Set(key string, value interface{}) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if data, ok := value.([]byte); ok {
-		m.Data[key] = data
-	}
-}
-
-func (m *MockCache) Delete(key string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.Data, key)
-}
-
-func (m *MockCache) Close() error { return nil }
-
-// TestNewMavenProxy tests creating a new Maven proxy
 func TestNewMavenProxy(t *testing.T) {
-	db := NewMockDatabase()
-	storage := NewMockStorage()
-	cache := NewMockCache()
-	rbacMgr := rbac.New(database.New("postgres://localhost:5432/test"))
-	registries := []database.RegistryConfig{
-		{ID: "maven", Name: "Maven Registry", Type: "maven", Proxy: true, Enabled: true},
-	}
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p, adapter := newTestProxy(t, db, c)
 
-	router := NewMavenProxy(db, storage, cache, rbacMgr, registries)
+	router := NewMavenProxy(p.db, adapter, p.cache, rbac.New(db), nil)
 	assert.NotNil(t, router)
 	assert.IsType(t, chi.NewRouter(), router)
 }
 
-// TestHandleRoot tests the root endpoint
 func TestHandleRoot(t *testing.T) {
-	db := NewMockDatabase()
-	storage := NewMockStorage()
-	cache := NewMockCache()
-	rbacMgr := rbac.New(database.New("postgres://localhost:5432/test"))
-	registries := []database.RegistryConfig{
-		{ID: "maven", Name: "Maven Registry", Type: "maven", Proxy: true, Enabled: true},
-	}
-
-	proxy := &MavenProxy{
-		db:         db,
-		storage:    storage,
-		cache:      cache,
-		registries: registries,
-		registry:   "maven",
-	}
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p, _ := newTestProxy(t, db, c)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rec := httptest.NewRecorder()
 
-	proxy.handleRoot(rec, req)
+	p.handleRoot(rec, req)
 
 	assert.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, "text/html", rec.Header().Get("Content-Type"))
 	assert.Contains(t, rec.Body.String(), "Cargobay Maven Proxy")
 }
 
-// TestHandleJAR tests JAR file download from storage
-func TestHandleJAR(t *testing.T) {
-	db := NewMockDatabase()
-	storage := NewMockStorage()
-	cache := NewMockCache()
-	rbacMgr := rbac.New(database.New("postgres://localhost:5432/test"))
-	registries := []database.RegistryConfig{
-		{ID: "maven", Name: "Maven Registry", Type: "maven", Proxy: true, Enabled: true},
-	}
+func TestHandleJARFromCache(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p, adapter := newTestProxy(t, db, c)
 
-	proxy := &MavenProxy{
-		db:         db,
-		storage:    storage,
-		cache:      cache,
-		registries: registries,
-		registry:   "maven",
-	}
+	group := uniqueID("grp")
+	artifact := "my-app"
+	version := "1.0.0"
 
-	// Save JAR to storage
 	jarData := []byte("fake jar content")
-	_, err := storage.SaveArtifact("maven", "com/example", "my-app", "1.0.0", jarData)
+	_, err := adapter.SaveArtifact("maven", group, artifact, version, jarData)
 	require.NoError(t, err)
 
-	req := httptest.NewRequest(http.MethodGet, "/com/example/my-app/1.0.0/my-app-1.0.0.jar", nil)
+	// handleJAR reads its target via proxy.TargetFromContext, which falls
+	// back to Target{Label: "maven", Reg: nil} outside RequireReadAccess
+	// middleware — so the download-increment call below targets RegistryID
+	// "maven", not a registry we seed ourselves.
+	artifactRow := &database.ArtifactMetadata{
+		RegistryID:   "maven",
+		ArtifactType: "maven",
+		Namespace:    group,
+		ArtifactName: artifact,
+		Version:      version,
+		Tags:         []string{version},
+		Metadata:     map[string]interface{}{},
+	}
+	require.NoError(t, db.SaveArtifact(artifactRow))
+	t.Cleanup(func() { db.DeleteArtifact("maven", group, artifact, version) })
+
+	req := chiRequest(http.MethodGet, "/", map[string]string{"group": group, "artifact": artifact, "version": version})
 	rec := httptest.NewRecorder()
 
-	proxy.handleJAR(rec, req)
+	p.handleJAR(rec, req)
 
 	assert.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, "application/java-archive", rec.Header().Get("Content-Type"))
 	assert.Contains(t, rec.Body.String(), "fake jar content")
+
+	rows, err := db.ListArtifacts("maven", database.ListOptions{ArtifactType: "maven", Namespace: group})
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	assert.Equal(t, int64(1), rows[0].Downloads)
 }
 
-// TestHandleJARNotFound tests 404 for non-existent JAR
-func TestHandleJARNotFound(t *testing.T) {
-	db := NewMockDatabase()
-	storage := NewMockStorage()
-	cache := NewMockCache()
-	rbacMgr := rbac.New(database.New("postgres://localhost:5432/test"))
-	registries := []database.RegistryConfig{
-		{ID: "maven", Name: "Maven Registry", Type: "maven", Proxy: true, Enabled: true},
-	}
+// TestHandleJARUpstreamUnavailable documents a routing quirk discovered
+// while rewriting this test file: the production route pattern
+// "/{group}/{artifact}/{version}/{fileName}-{fileVersion}.jar" never
+// actually matches a real request through chi (chi does not support two
+// dynamic params followed by a static suffix within one path segment — a
+// pattern like "{a}-{b}.jar" 404s for any path), so these handlers are
+// exercised directly rather than through the router. Called this way, the
+// resolved target always has Reg == nil (see TestHandleJARFromCache),
+// so an uncached artifact always hits the "no upstream configured" path.
+func TestHandleJARUpstreamUnavailable(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p, _ := newTestProxy(t, db, c)
 
-	proxy := &MavenProxy{
-		db:         db,
-		storage:    storage,
-		cache:      cache,
-		registries: registries,
-		registry:   "maven",
-	}
-
-	req := httptest.NewRequest(http.MethodGet, "/nonexistent/group/artifact/1.0.0/artifact-1.0.0.jar", nil)
+	req := chiRequest(http.MethodGet, "/", map[string]string{"group": "nonexistent", "artifact": "artifact", "version": "1.0.0"})
 	rec := httptest.NewRecorder()
 
-	proxy.handleJAR(rec, req)
+	p.handleJAR(rec, req)
 
-	// Should return 404 for non-existent JAR
-	assert.Equal(t, http.StatusNotFound, rec.Code)
+	assert.Equal(t, http.StatusBadGateway, rec.Code)
 }
 
-// TestHandlePOM tests POM file download from storage
-func TestHandlePOM(t *testing.T) {
-	db := NewMockDatabase()
-	storage := NewMockStorage()
-	cache := NewMockCache()
-	rbacMgr := rbac.New(database.New("postgres://localhost:5432/test"))
-	registries := []database.RegistryConfig{
-		{ID: "maven", Name: "Maven Registry", Type: "maven", Proxy: true, Enabled: true},
-	}
+func TestHandlePOMFromCache(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p, adapter := newTestProxy(t, db, c)
 
-	proxy := &MavenProxy{
-		db:         db,
-		storage:    storage,
-		cache:      cache,
-		registries: registries,
-		registry:   "maven",
-	}
+	group := uniqueID("grp")
+	artifact := "my-app"
+	version := "1.0.0"
 
 	pomData := []byte(`<?xml version="1.0"?>
 <project>
@@ -272,433 +217,386 @@ func TestHandlePOM(t *testing.T) {
 	<artifactId>my-app</artifactId>
 	<version>1.0.0</version>
 </project>`)
-
-	_, err := storage.SaveArtifact("maven", "com/example", "my-app", "1.0.0", pomData)
+	_, err := adapter.SaveArtifact("maven", group, artifact, version, pomData)
 	require.NoError(t, err)
 
-	req := httptest.NewRequest(http.MethodGet, "/com/example/my-app/1.0.0/my-app-1.0.0.pom", nil)
+	req := chiRequest(http.MethodGet, "/", map[string]string{"group": group, "artifact": artifact, "version": version})
 	rec := httptest.NewRecorder()
 
-	proxy.handlePOM(rec, req)
+	p.handlePOM(rec, req)
 
 	assert.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, "application/xml", rec.Header().Get("Content-Type"))
 	assert.Contains(t, rec.Body.String(), "<project>")
 }
 
-// TestHandleWAR tests WAR file download
-func TestHandleWAR(t *testing.T) {
-	db := NewMockDatabase()
-	storage := NewMockStorage()
-	cache := NewMockCache()
-	rbacMgr := rbac.New(database.New("postgres://localhost:5432/test"))
-	registries := []database.RegistryConfig{
-		{ID: "maven", Name: "Maven Registry", Type: "maven", Proxy: true, Enabled: true},
-	}
+func TestHandlePOMUpstreamUnavailable(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p, _ := newTestProxy(t, db, c)
 
-	proxy := &MavenProxy{
-		db:         db,
-		storage:    storage,
-		cache:      cache,
-		registries: registries,
-		registry:   "maven",
-	}
+	req := chiRequest(http.MethodGet, "/", map[string]string{"group": "nonexistent", "artifact": "artifact", "version": "1.0.0"})
+	rec := httptest.NewRecorder()
+
+	p.handlePOM(rec, req)
+
+	assert.Equal(t, http.StatusBadGateway, rec.Code)
+}
+
+func TestHandleWARFromCache(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p, adapter := newTestProxy(t, db, c)
+
+	group := uniqueID("grp")
+	artifact := "webapp"
+	version := "1.0.0"
 
 	warData := []byte("fake war content")
-	_, err := storage.SaveArtifact("maven", "com/example", "webapp", "1.0.0", warData)
+	_, err := adapter.SaveArtifact("maven", group, artifact, version, warData)
 	require.NoError(t, err)
 
-	req := httptest.NewRequest(http.MethodGet, "/com/example/webapp/1.0.0/webapp-1.0.0.war", nil)
+	req := chiRequest(http.MethodGet, "/", map[string]string{"group": group, "artifact": artifact, "version": version})
 	rec := httptest.NewRecorder()
 
-	proxy.handleWAR(rec, req)
+	p.handleWAR(rec, req)
 
 	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "application/octet-stream", rec.Header().Get("Content-Type"))
 }
 
-// TestHandleZIP tests ZIP file download
-func TestHandleZIP(t *testing.T) {
-	db := NewMockDatabase()
-	storage := NewMockStorage()
-	cache := NewMockCache()
-	rbacMgr := rbac.New(database.New("postgres://localhost:5432/test"))
-	registries := []database.RegistryConfig{
-		{ID: "maven", Name: "Maven Registry", Type: "maven", Proxy: true, Enabled: true},
-	}
+func TestHandleZIPFromCache(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p, adapter := newTestProxy(t, db, c)
 
-	proxy := &MavenProxy{
-		db:         db,
-		storage:    storage,
-		cache:      cache,
-		registries: registries,
-		registry:   "maven",
-	}
+	group := uniqueID("grp")
+	artifact := "archive"
+	version := "1.0.0"
 
 	zipData := []byte("fake zip content")
-	_, err := storage.SaveArtifact("maven", "com/example", "archive", "1.0.0", zipData)
+	_, err := adapter.SaveArtifact("maven", group, artifact, version, zipData)
 	require.NoError(t, err)
 
-	req := httptest.NewRequest(http.MethodGet, "/com/example/archive/1.0.0/archive-1.0.0.zip", nil)
+	req := chiRequest(http.MethodGet, "/", map[string]string{"group": group, "artifact": artifact, "version": version})
 	rec := httptest.NewRecorder()
 
-	proxy.handleZIP(rec, req)
+	p.handleZIP(rec, req)
 
 	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "application/zip", rec.Header().Get("Content-Type"))
 }
 
-// TestHandleTGZ tests TGZ file download
-func TestHandleTGZ(t *testing.T) {
-	db := NewMockDatabase()
-	storage := NewMockStorage()
-	cache := NewMockCache()
-	rbacMgr := rbac.New(database.New("postgres://localhost:5432/test"))
-	registries := []database.RegistryConfig{
-		{ID: "maven", Name: "Maven Registry", Type: "maven", Proxy: true, Enabled: true},
-	}
+func TestHandleTGZFromCache(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p, adapter := newTestProxy(t, db, c)
 
-	proxy := &MavenProxy{
-		db:         db,
-		storage:    storage,
-		cache:      cache,
-		registries: registries,
-		registry:   "maven",
-	}
+	group := uniqueID("grp")
+	artifact := "compressed"
+	version := "1.0.0"
 
 	tgzData := []byte("fake tgz content")
-	_, err := storage.SaveArtifact("maven", "com/example", "compressed", "1.0.0", tgzData)
+	_, err := adapter.SaveArtifact("maven", group, artifact, version, tgzData)
 	require.NoError(t, err)
 
-	req := httptest.NewRequest(http.MethodGet, "/com/example/compressed/1.0.0/compressed-1.0.0.tgz", nil)
+	req := chiRequest(http.MethodGet, "/", map[string]string{"group": group, "artifact": artifact, "version": version})
 	rec := httptest.NewRecorder()
 
-	proxy.handleTGZ(rec, req)
+	p.handleTGZ(rec, req)
 
 	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "application/gzip", rec.Header().Get("Content-Type"))
 }
 
-// TestHandleVersionDir tests version directory listing
-func TestHandleVersionDir(t *testing.T) {
-	db := NewMockDatabase()
-	storage := NewMockStorage()
-	cache := NewMockCache()
-	rbacMgr := rbac.New(database.New("postgres://localhost:5432/test"))
-	registries := []database.RegistryConfig{
-		{ID: "maven", Name: "Maven Registry", Type: "maven", Proxy: true, Enabled: true},
-	}
+func TestHandleArtifactFileUpstreamUnavailable(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p, _ := newTestProxy(t, db, c)
 
-	proxy := &MavenProxy{
-		db:         db,
-		storage:    storage,
-		cache:      cache,
-		registries: registries,
-		registry:   "maven",
-	}
-
-	// Add test artifacts
-	artifacts := []*database.ArtifactMetadata{
-		{ID: "test-1", RegistryID: "maven", ArtifactType: "maven", Namespace: "com/example", ArtifactName: "my-app", Version: "1.0.0"},
-		{ID: "test-2", RegistryID: "maven", ArtifactType: "maven", Namespace: "com/example", ArtifactName: "my-app", Version: "1.0.1"},
-	}
-	for _, a := range artifacts {
-		db.SaveArtifact(a)
-	}
-
-	req := httptest.NewRequest(http.MethodGet, "/com/example/my-app/1.0.0/", nil)
+	req := chiRequest(http.MethodGet, "/", map[string]string{"group": "nonexistent", "artifact": "artifact", "version": "1.0.0"})
 	rec := httptest.NewRecorder()
 
-	proxy.handleVersionDir(rec, req)
+	p.handleWAR(rec, req)
+
+	assert.Equal(t, http.StatusBadGateway, rec.Code)
+}
+
+func TestHandleVersionDir(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	router, _ := newTestRouter(t, db, c)
+
+	regID := uniqueID("versiondir-reg")
+	host := uniqueID("versiondir-host") + ".test"
+	seedRegistry(t, db, regID, host, false, false)
+
+	group := uniqueID("grp")
+	artifact := "my-app"
+
+	for _, v := range []string{"1.0.0", "1.0.1"} {
+		row := &database.ArtifactMetadata{
+			RegistryID:   regID,
+			ArtifactType: "maven",
+			Namespace:    group,
+			ArtifactName: artifact,
+			Version:      v,
+			Tags:         []string{v},
+			Metadata:     map[string]interface{}{},
+		}
+		require.NoError(t, db.SaveArtifact(row))
+		v := v
+		t.Cleanup(func() { db.DeleteArtifact(regID, group, artifact, v) })
+	}
+
+	path := fmt.Sprintf("/%s/%s/%s/", group, artifact, "1.0.0")
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.Host = host
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
 
 	assert.Equal(t, http.StatusOK, rec.Code)
 	var body map[string]interface{}
-	err := json.NewDecoder(rec.Body).Decode(&body)
-	require.NoError(t, err)
-	files := body["files"].([]interface{})
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&body))
+	files, ok := body["files"].([]interface{})
+	require.True(t, ok)
 	assert.GreaterOrEqual(t, len(files), 1)
 }
 
-// TestHandleArtifactDir tests artifact directory listing
 func TestHandleArtifactDir(t *testing.T) {
-	db := NewMockDatabase()
-	storage := NewMockStorage()
-	cache := NewMockCache()
-	rbacMgr := rbac.New(database.New("postgres://localhost:5432/test"))
-	registries := []database.RegistryConfig{
-		{ID: "maven", Name: "Maven Registry", Type: "maven", Proxy: true, Enabled: true},
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	router, _ := newTestRouter(t, db, c)
+
+	regID := uniqueID("artifactdir-reg")
+	host := uniqueID("artifactdir-host") + ".test"
+	seedRegistry(t, db, regID, host, false, false)
+
+	group := uniqueID("grp")
+	rows := []*database.ArtifactMetadata{
+		{RegistryID: regID, ArtifactType: "maven", Namespace: group, ArtifactName: "my-app", Version: "1.0.0", Tags: []string{"1.0.0"}, Metadata: map[string]interface{}{}},
+		{RegistryID: regID, ArtifactType: "maven", Namespace: group, ArtifactName: "my-app", Version: "1.0.1", Tags: []string{"1.0.1"}, Metadata: map[string]interface{}{}},
+		{RegistryID: regID, ArtifactType: "maven", Namespace: group, ArtifactName: "other-app", Version: "1.0.0", Tags: []string{"1.0.0"}, Metadata: map[string]interface{}{}},
+	}
+	for _, row := range rows {
+		require.NoError(t, db.SaveArtifact(row))
+		row := row
+		t.Cleanup(func() { db.DeleteArtifact(row.RegistryID, row.Namespace, row.ArtifactName, row.Version) })
 	}
 
-	proxy := &MavenProxy{
-		db:         db,
-		storage:    storage,
-		cache:      cache,
-		registries: registries,
-		registry:   "maven",
-	}
-
-	// Add test artifacts
-	artifacts := []*database.ArtifactMetadata{
-		{ID: "test-1", RegistryID: "maven", ArtifactType: "maven", Namespace: "com/example", ArtifactName: "my-app", Version: "1.0.0"},
-		{ID: "test-2", RegistryID: "maven", ArtifactType: "maven", Namespace: "com/example", ArtifactName: "my-app", Version: "1.0.1"},
-		{ID: "test-3", RegistryID: "maven", ArtifactType: "maven", Namespace: "com/example", ArtifactName: "other-app", Version: "1.0.0"},
-	}
-	for _, a := range artifacts {
-		db.SaveArtifact(a)
-	}
-
-	req := httptest.NewRequest(http.MethodGet, "/com/example/my-app/", nil)
+	path := fmt.Sprintf("/%s/%s/", group, "my-app")
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.Host = host
 	rec := httptest.NewRecorder()
 
-	proxy.handleArtifactDir(rec, req)
+	router.ServeHTTP(rec, req)
 
 	assert.Equal(t, http.StatusOK, rec.Code)
 	var body map[string]interface{}
-	err := json.NewDecoder(rec.Body).Decode(&body)
-	require.NoError(t, err)
-	versions := body["versions"].([]interface{})
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&body))
+	versions, ok := body["versions"].([]interface{})
+	require.True(t, ok)
 	assert.GreaterOrEqual(t, len(versions), 2)
 }
 
-// TestHandleGroupDir tests group directory listing
 func TestHandleGroupDir(t *testing.T) {
-	db := NewMockDatabase()
-	storage := NewMockStorage()
-	cache := NewMockCache()
-	rbacMgr := rbac.New(database.New("postgres://localhost:5432/test"))
-	registries := []database.RegistryConfig{
-		{ID: "maven", Name: "Maven Registry", Type: "maven", Proxy: true, Enabled: true},
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	router, _ := newTestRouter(t, db, c)
+
+	regID := uniqueID("groupdir-reg")
+	host := uniqueID("groupdir-host") + ".test"
+	seedRegistry(t, db, regID, host, false, false)
+
+	group := uniqueID("grp")
+	rows := []*database.ArtifactMetadata{
+		{RegistryID: regID, ArtifactType: "maven", Namespace: group, ArtifactName: "my-app", Version: "1.0.0", Tags: []string{"1.0.0"}, Metadata: map[string]interface{}{}},
+		{RegistryID: regID, ArtifactType: "maven", Namespace: group, ArtifactName: "other-app", Version: "1.0.0", Tags: []string{"1.0.0"}, Metadata: map[string]interface{}{}},
+	}
+	for _, row := range rows {
+		require.NoError(t, db.SaveArtifact(row))
+		row := row
+		t.Cleanup(func() { db.DeleteArtifact(row.RegistryID, row.Namespace, row.ArtifactName, row.Version) })
 	}
 
-	proxy := &MavenProxy{
-		db:         db,
-		storage:    storage,
-		cache:      cache,
-		registries: registries,
-		registry:   "maven",
-	}
-
-	// Add test artifacts
-	artifacts := []*database.ArtifactMetadata{
-		{ID: "test-1", RegistryID: "maven", ArtifactType: "maven", Namespace: "com/example", ArtifactName: "my-app", Version: "1.0.0"},
-		{ID: "test-2", RegistryID: "maven", ArtifactType: "maven", Namespace: "com/example", ArtifactName: "other-app", Version: "1.0.0"},
-		{ID: "test-3", RegistryID: "maven", ArtifactType: "maven", Namespace: "org/test", ArtifactName: "test-lib", Version: "1.0.0"},
-	}
-	for _, a := range artifacts {
-		db.SaveArtifact(a)
-	}
-
-	req := httptest.NewRequest(http.MethodGet, "/com/example/", nil)
+	path := fmt.Sprintf("/%s/", group)
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.Host = host
 	rec := httptest.NewRecorder()
 
-	proxy.handleGroupDir(rec, req)
+	router.ServeHTTP(rec, req)
 
 	assert.Equal(t, http.StatusOK, rec.Code)
 	var body map[string]interface{}
-	err := json.NewDecoder(rec.Body).Decode(&body)
-	require.NoError(t, err)
-	artifactsList := body["artifacts"].([]interface{})
-	assert.GreaterOrEqual(t, len(artifactsList), 2)
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&body))
+	names, ok := body["artifacts"].([]interface{})
+	require.True(t, ok)
+	assert.GreaterOrEqual(t, len(names), 2)
 }
 
-// TestHandleMetadata tests maven-metadata.xml generation
+// TestHandleMetadata covers maven-metadata.xml generation. handleMetadata
+// (unlike the other list handlers) queries the database with the literal
+// registry ID "maven" rather than the resolved target's label, so the
+// seeded rows below intentionally use RegistryID "maven" to match that
+// real behavior — not the registry bound to the request's Host.
 func TestHandleMetadata(t *testing.T) {
-	db := NewMockDatabase()
-	storage := NewMockStorage()
-	cache := NewMockCache()
-	rbacMgr := rbac.New(database.New("postgres://localhost:5432/test"))
-	registries := []database.RegistryConfig{
-		{ID: "maven", Name: "Maven Registry", Type: "maven", Proxy: true, Enabled: true},
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	router, _ := newTestRouter(t, db, c)
+
+	host := uniqueID("metadata-host") + ".test"
+	seedRegistry(t, db, uniqueID("metadata-reg"), host, false, false)
+
+	group := uniqueID("grp")
+	artifact := "my-app"
+	for _, v := range []string{"1.0.0", "1.0.1"} {
+		row := &database.ArtifactMetadata{
+			RegistryID:   "maven",
+			ArtifactType: "maven",
+			Namespace:    group,
+			ArtifactName: artifact,
+			Version:      v,
+			Tags:         []string{v},
+			Metadata:     map[string]interface{}{},
+		}
+		require.NoError(t, db.SaveArtifact(row))
+		v := v
+		t.Cleanup(func() { db.DeleteArtifact("maven", group, artifact, v) })
 	}
 
-	proxy := &MavenProxy{
-		db:         db,
-		storage:    storage,
-		cache:      cache,
-		registries: registries,
-		registry:   "maven",
-	}
-
-	// Add test artifacts with versions
-	artifacts := []*database.ArtifactMetadata{
-		{ID: "test-1", RegistryID: "maven", ArtifactType: "maven", Namespace: "com/example", ArtifactName: "my-app", Version: "1.0.0"},
-		{ID: "test-2", RegistryID: "maven", ArtifactType: "maven", Namespace: "com/example", ArtifactName: "my-app", Version: "1.0.1"},
-	}
-	for _, a := range artifacts {
-		db.SaveArtifact(a)
-	}
-
-	req := httptest.NewRequest(http.MethodGet, "/com/example/my-app/1.0.1/maven-metadata.xml", nil)
+	path := fmt.Sprintf("/%s/%s/%s/maven-metadata.xml", group, artifact, "1.0.1")
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.Host = host
 	rec := httptest.NewRecorder()
 
-	proxy.handleMetadata(rec, req)
+	router.ServeHTTP(rec, req)
 
 	assert.Equal(t, http.StatusOK, rec.Code)
-	assert.Contains(t, rec.Body.String(), "<metadata>")
-	assert.Contains(t, rec.Body.String(), "<groupId>com.example</groupId>")
-	assert.Contains(t, rec.Body.String(), "<artifactId>my-app</artifactId>")
+	assert.Equal(t, "application/xml", rec.Header().Get("Content-Type"))
+	body := rec.Body.String()
+	assert.Contains(t, body, "<metadata>")
+	assert.Contains(t, body, fmt.Sprintf("<groupId>%s</groupId>", group))
+	assert.Contains(t, body, fmt.Sprintf("<artifactId>%s</artifactId>", artifact))
+	assert.Contains(t, body, "<version>1.0.0</version>")
+	assert.Contains(t, body, "<version>1.0.1</version>")
 }
 
-// TestCacheConcurrency tests cache thread safety
+func TestGetUpstreamURL(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p, _ := newTestProxy(t, db, c)
+
+	_, err := p.getUpstreamURL(nil, "com.example", "my-app", "1.0.0", "jar")
+	assert.Error(t, err, "nil registry should have no upstream configured")
+
+	_, err = p.getUpstreamURL(&database.RegistryConfig{Proxy: false, URL: "https://repo.example.com"}, "com.example", "my-app", "1.0.0", "jar")
+	assert.Error(t, err, "proxy-disabled registry should have no upstream configured")
+
+	url, err := p.getUpstreamURL(&database.RegistryConfig{Proxy: true, URL: "https://repo.example.com"}, "com.example", "my-app", "1.0.0", "jar")
+	require.NoError(t, err)
+	assert.Equal(t, "https://repo.example.com/com/example/my-app/1.0.0/my-app-1.0.0.jar", url)
+}
+
 func TestCacheConcurrency(t *testing.T) {
-	cache := NewMockCache()
-	proxy := &MavenProxy{cache: cache}
+	c := connectTestCache(t)
 
 	done := make(chan bool, 10)
 	for i := 0; i < 10; i++ {
-		go func(index int) {
-			key := "maven-concurrent-key"
-			data := []byte(`{"value": ` + string(rune('0'+index)) + `}`)
-			proxy.cacheSet(key, data)
+		go func(i int) {
+			key := fmt.Sprintf("maven-test-concurrency-%d", i)
+			err := c.Set(key, []byte("value"))
+			assert.NoError(t, err)
 			done <- true
 		}(i)
 	}
-
 	for i := 0; i < 10; i++ {
 		<-done
 	}
-
-	// Verify last write wins
-	var retrieved []byte
-	err := proxy.cacheGet("maven-concurrent-key", &retrieved)
-	require.NoError(t, err)
-	assert.NotNil(t, retrieved)
 }
 
-// TestMavenProxyIntegration tests the proxy integration
 func TestMavenProxyIntegration(t *testing.T) {
-	db := NewMockDatabase()
-	storage := NewMockStorage()
-	cache := NewMockCache()
-	rbacMgr := rbac.New(database.New("postgres://localhost:5432/test"))
-	registries := []database.RegistryConfig{
-		{ID: "maven", Name: "Maven Registry", Type: "maven", Proxy: true, Enabled: true},
-	}
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	router, _ := newTestRouter(t, db, c)
 
-	// Create proxy
-	proxy := NewMavenProxy(db, storage, cache, rbacMgr, registries)
-
-	// Test that router is created
-	assert.NotNil(t, proxy)
-
-	// Create test server
-	server := httptest.NewServer(proxy)
+	server := httptest.NewServer(router)
 	defer server.Close()
 
-	// Test root endpoint
 	resp, err := http.Get(server.URL + "/")
 	require.NoError(t, err)
+	defer resp.Body.Close()
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 }
 
-// TestEmptyNamespace tests handling of empty namespace
-func TestEmptyNamespace(t *testing.T) {
-	db := NewMockDatabase()
-	storage := NewMockStorage()
-	cache := NewMockCache()
-	rbacMgr := rbac.New(database.New("postgres://localhost:5432/test"))
-	registries := []database.RegistryConfig{
-		{ID: "maven", Name: "Maven Registry", Type: "maven", Proxy: true, Enabled: true},
-	}
+func TestMavenProxyPrivateRegistryRequiresAuth(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	router, _ := newTestRouter(t, db, c)
 
-	proxy := &MavenProxy{
-		db:         db,
-		storage:    storage,
-		cache:      cache,
-		registries: registries,
-		registry:   "maven",
-	}
+	regID := uniqueID("private-reg")
+	host := uniqueID("private-host") + ".test"
+	seedRegistry(t, db, regID, host, true, false)
 
-	// Create artifact with empty namespace
-	artifact := &database.ArtifactMetadata{
-		ID:           "maven-ns-test",
-		RegistryID:   "maven",
-		ArtifactType: "maven",
-		Namespace:    "",
-		ArtifactName: "standalone",
-		Version:      "1.0.0",
-		Size:         1024,
-	}
-	err := db.SaveArtifact(artifact)
-	require.NoError(t, err)
+	path := "/some/artifact/1.0.0/artifact-1.0.0.jar"
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.Host = host
+	rec := httptest.NewRecorder()
 
-	// Search for artifact
-	results, err := db.ListArtifacts("maven", database.ListOptions{ArtifactType: "maven"})
-	require.NoError(t, err)
-	assert.GreaterOrEqual(t, len(results), 1)
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
 }
 
-// TestNamespaceHandling tests namespace handling for Maven artifacts
 func TestNamespaceHandling(t *testing.T) {
-	db := NewMockDatabase()
-	storage := NewMockStorage()
-	cache := NewMockCache()
-	rbacMgr := rbac.New(database.New("postgres://localhost:5432/test"))
-	registries := []database.RegistryConfig{
-		{ID: "maven", Name: "Maven Registry", Type: "maven", Proxy: true, Enabled: true},
-	}
+	db := connectTestDB(t)
 
-	proxy := &MavenProxy{
-		db:         db,
-		storage:    storage,
-		cache:      cache,
-		registries: registries,
-		registry:   "maven",
-	}
-
-	// Create artifact with namespace
+	regID := uniqueID("ns-reg")
+	group := uniqueID("grp")
 	artifact := &database.ArtifactMetadata{
-		ID:           "maven-ns-test",
-		RegistryID:   "maven",
+		RegistryID:   regID,
 		ArtifactType: "maven",
-		Namespace:    "com/example",
+		Namespace:    group,
 		ArtifactName: "my-lib",
 		Version:      "1.0.0",
 		Size:         2048,
+		Tags:         []string{"1.0.0"},
+		Metadata:     map[string]interface{}{},
 	}
-	err := db.SaveArtifact(artifact)
-	require.NoError(t, err)
+	require.NoError(t, db.SaveArtifact(artifact))
+	t.Cleanup(func() { db.DeleteArtifact(regID, group, "my-lib", "1.0.0") })
 
-	// Search with namespace
-	results, err := db.ListArtifacts("maven", database.ListOptions{
-		Namespace:    "com/example",
+	results, err := db.ListArtifacts(regID, database.ListOptions{
+		Namespace:    group,
 		ArtifactType: "maven",
 	})
 	require.NoError(t, err)
-	assert.GreaterOrEqual(t, len(results), 1)
-	assert.Equal(t, "com/example", results[0].Namespace)
+	require.Len(t, results, 1)
+	assert.Equal(t, group, results[0].Namespace)
 }
 
-// TestArtifactSearch tests searching artifacts
-func TestArtifactSearch(t *testing.T) {
-	db := NewMockDatabase()
-	storage := NewMockStorage()
-	cache := NewMockCache()
-	rbacMgr := rbac.New(database.New("postgres://localhost:5432/test"))
-	registries := []database.RegistryConfig{
-		{ID: "maven", Name: "Maven Registry", Type: "maven", Proxy: true, Enabled: true},
+func TestArtifactSearchByNamespace(t *testing.T) {
+	db := connectTestDB(t)
+
+	regID := uniqueID("search-reg")
+	group := uniqueID("grp")
+	otherGroup := uniqueID("grp-other")
+
+	rows := []*database.ArtifactMetadata{
+		{RegistryID: regID, ArtifactType: "maven", Namespace: group, ArtifactName: "app1", Version: "1.0.0", Tags: []string{"1.0.0"}, Metadata: map[string]interface{}{}},
+		{RegistryID: regID, ArtifactType: "maven", Namespace: group, ArtifactName: "app2", Version: "2.0.0", Tags: []string{"2.0.0"}, Metadata: map[string]interface{}{}},
+		{RegistryID: regID, ArtifactType: "maven", Namespace: otherGroup, ArtifactName: "test-lib", Version: "1.0.0", Tags: []string{"1.0.0"}, Metadata: map[string]interface{}{}},
+	}
+	for _, row := range rows {
+		require.NoError(t, db.SaveArtifact(row))
+		row := row
+		t.Cleanup(func() { db.DeleteArtifact(row.RegistryID, row.Namespace, row.ArtifactName, row.Version) })
 	}
 
-	proxy := &MavenProxy{
-		db:         db,
-		storage:    storage,
-		cache:      cache,
-		registries: registries,
-		registry:   "maven",
-	}
-
-	// Create test artifacts
-	testArtifacts := []*database.ArtifactMetadata{
-		{ID: "app1", RegistryID: "maven", ArtifactType: "maven", Namespace: "com/example", ArtifactName: "app1", Version: "1.0.0"},
-		{ID: "app2", RegistryID: "maven", ArtifactType: "maven", Namespace: "com/example", ArtifactName: "app2", Version: "2.0.0"},
-		{ID: "lib1", RegistryID: "maven", ArtifactType: "maven", Namespace: "org/test", ArtifactName: "test-lib", Version: "1.0.0"},
-	}
-	for _, a := range testArtifacts {
-		db.SaveArtifact(a)
-	}
-
-	// Search for artifacts with namespace
-	results, err := db.ListArtifacts("maven", database.ListOptions{
-		Namespace:    "com/example",
+	results, err := db.ListArtifacts(regID, database.ListOptions{
+		Namespace:    group,
 		ArtifactType: "maven",
 	})
 	require.NoError(t, err)
-	assert.GreaterOrEqual(t, len(results), 2)
+	assert.Len(t, results, 2)
 }
