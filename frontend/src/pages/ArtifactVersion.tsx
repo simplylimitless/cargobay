@@ -1,8 +1,9 @@
 import { useState, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { useAuth } from '../context/AuthContext'
+import { useAuth, useTimezone } from '../context/AuthContext'
 import { useConfirm } from '../hooks/useConfirm'
 import { getArtifactTypeConfig, isContainerType } from '../lib/artifactTypes'
+import { formatDateTime } from '../lib/datetime'
 
 interface Artifact {
   ID: string
@@ -41,6 +42,7 @@ export function ArtifactVersion() {
   }>()
   const navigate = useNavigate()
   const { canManage, token } = useAuth()
+  const timezone = useTimezone()
   const { confirm, ConfirmDialog } = useConfirm()
   const [artifact, setArtifact] = useState<Artifact | null>(null)
   const [loading, setLoading] = useState(true)
@@ -84,7 +86,7 @@ export function ArtifactVersion() {
   }
 
   const formatTimestamp = (ts: string) => {
-    return new Date(ts).toLocaleString('en-US', {
+    return formatDateTime(ts, timezone, {
       year: 'numeric',
       month: 'short',
       day: 'numeric',

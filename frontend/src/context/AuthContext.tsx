@@ -6,6 +6,7 @@ export interface User {
   id: string
   username: string
   email: string
+  timezone: string
   roles: Role[]
   permissions: string[]
 }
@@ -20,8 +21,8 @@ interface AuthContextValue {
   login: (username: string, password: string) => Promise<void>
   logout: () => void
   canManage: (uploadedBy: string | null | undefined) => boolean
-  updateProfile: (username: string, email: string) => void
-  setSession: (accessToken: string, user: { userId: string; username: string; email: string; roles?: string[]; permissions?: string[] }) => void
+  updateProfile: (username: string, email: string, timezone: string) => void
+  setSession: (accessToken: string, user: { userId: string; username: string; email: string; timezone?: string; roles?: string[]; permissions?: string[] }) => void
 }
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined)
@@ -75,6 +76,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             id: data.user.userId,
             username: data.user.username,
             email: data.user.email,
+            timezone: data.user.timezone || '',
             roles: data.user.roles || [],
             permissions: data.user.permissions || [],
           }
@@ -113,6 +115,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       id: user.userId,
       username: user.username,
       email: user.email,
+      timezone: user.timezone || '',
       roles: (user.roles || []) as Role[],
       permissions: user.permissions || [],
     }
@@ -122,10 +125,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     localStorage.setItem(STORAGE_USER_KEY, JSON.stringify(newUser))
   }
 
-  const updateProfile = (username: string, email: string) => {
+  const updateProfile = (username: string, email: string, timezone: string) => {
     setCurrentUser((prev) => {
       if (!prev) return prev
-      const updated = { ...prev, username, email }
+      const updated = { ...prev, username, email, timezone }
       localStorage.setItem(STORAGE_USER_KEY, JSON.stringify(updated))
       return updated
     })
@@ -149,4 +152,9 @@ export function useAuth() {
   const ctx = useContext(AuthContext)
   if (!ctx) throw new Error('useAuth must be used within an AuthProvider')
   return ctx
+}
+
+export function useTimezone(): string {
+  const { currentUser } = useAuth()
+  return currentUser?.timezone ?? ''
 }

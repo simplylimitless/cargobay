@@ -28,7 +28,7 @@ type Reindexer struct {
 }
 
 // NewReindexer creates a Reindexer.
-func NewReindexer(db *database.Database) *Reindexer {
+func NewReindexer(db settingsStore) *Reindexer {
 	return &Reindexer{db: db}
 }
 

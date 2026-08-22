@@ -1,5 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
+import { useTimezone } from '../context/AuthContext'
+import { formatDate } from '../lib/datetime'
 
 // Shape returned by GET /api/v1/artifacts — database.ArtifactMetadata has
 // no json tags, so it serializes using its Go field names verbatim.
@@ -27,6 +29,7 @@ interface Registry {
 export function ArtifactBrowse() {
   const { registryId, artifactType, namespace } = useParams()
   const navigate = useNavigate()
+  const timezone = useTimezone()
   const [artifacts, setArtifacts] = useState<Artifact[]>([])
   const [registries, setRegistries] = useState<Registry[]>([])
   const [loading, setLoading] = useState(true)
@@ -114,7 +117,7 @@ export function ArtifactBrowse() {
     if (days === 0) return 'Today'
     if (days === 1) return '1 day ago'
     if (days < 7) return `${days} days ago`
-    return date.toLocaleDateString()
+    return formatDate(date, timezone)
   }
 
   const getNamespaceList = (type: string): string[] => {

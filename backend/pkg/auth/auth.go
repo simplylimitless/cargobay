@@ -23,6 +23,7 @@ type LoginOutput struct {
 	UserID       string    `json:"userId"`
 	Username     string    `json:"username"`
 	Email        string    `json:"email"`
+	Timezone     string    `json:"timezone"`
 	Roles        []string  `json:"roles"`
 	Permissions  []string  `json:"permissions"`
 }
@@ -103,6 +104,7 @@ func Login(db *database.Database, username, password string) (*LoginOutput, erro
 		UserID:       user.UserID,
 		Username:     user.Username,
 		Email:        user.Email,
+		Timezone:     user.Timezone,
 		Roles:        roles,
 		Permissions:  permissions,
 	}, nil

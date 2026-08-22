@@ -65,17 +65,17 @@ backend-run: backend-build ## Run the backend server
 
 backend-test: ## Run backend unit tests
 	@echo "${BLUE}Running backend tests...${RESET}"
-	cd backend && go test -v ./pkg/... ./cmd/... ./tests/...
+	cd backend && go test -v ./pkg/... ./cmd/...
 
 backend-test-cover: ## Run backend tests with coverage
 	@echo "${BLUE}Running backend tests with coverage...${RESET}"
-	cd backend && go test -v -coverprofile=coverage.out ./pkg/... ./cmd/... ./tests/...
+	cd backend && go test -v -coverprofile=coverage.out ./pkg/... ./cmd/...
 	@go tool cover -html=coverage.out -o coverage.html
 	@echo "${GREEN}Coverage report generated: coverage.html${RESET}"
 
 backend-test-short: ## Run backend tests without output buffering
 	@echo "${BLUE}Running backend tests (short output)...${RESET}"
-	cd backend && go test -short ./pkg/... ./cmd/... ./tests/...
+	cd backend && go test -short ./pkg/... ./cmd/...
 
 backend-test-package: ## Run tests for a specific package (use PKG=package/path)
 	@echo "${BLUE}Running tests for $(PKG)...${RESET}"
@@ -213,7 +213,7 @@ security: ## Run security scan
 
 format: ## Format Go code
 	@echo "${BLUE}Formatting Go code...${RESET}"
-	@cd backend && gofmt -w ./pkg/... ./cmd/... ./tests/...
+	@cd backend && gofmt -w ./pkg ./cmd
 
 tidy: ## Tidy Go dependencies
 	@echo "${BLUE}Tidying Go dependencies...${RESET}"

@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS users (
     roles         TEXT[] NOT NULL DEFAULT '{}',
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_login    TIMESTAMPTZ,
-    is_active     BOOLEAN NOT NULL DEFAULT TRUE
+    is_active     BOOLEAN NOT NULL DEFAULT TRUE,
+    timezone      TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS access_keys (

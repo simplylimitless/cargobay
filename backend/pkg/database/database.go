@@ -660,7 +660,7 @@ func (db *Database) GetBandwidthSaved() (int64, error) {
 func (db *Database) GetUserByID(userID string) (*UserRepository, error) {
 	row := db.pool.QueryRow(
 		context.Background(),
-		`SELECT u.user_id, u.username, u.email, u.password_hash, u.created_at, u.last_login, u.is_active,
+		`SELECT u.user_id, u.username, u.email, u.password_hash, u.created_at, u.last_login, u.is_active, u.timezone,
 			 COALESCE(json_agg(ur.role_id) FILTER (WHERE ur.role_id IS NOT NULL), '[]'::json) as roles
 		 FROM users u
 		 LEFT JOIN user_roles ur ON u.user_id = ur.user_id
@@ -671,7 +671,7 @@ func (db *Database) GetUserByID(userID string) (*UserRepository, error) {
 
 	var user UserRepository
 	err := row.Scan(&user.UserID, &user.Username, &user.Email, &user.PasswordHash,
-		&user.CreatedAt, &user.LastLogin, &user.IsActive, &user.Roles)
+		&user.CreatedAt, &user.LastLogin, &user.IsActive, &user.Timezone, &user.Roles)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -685,7 +685,7 @@ func (db *Database) GetUserByID(userID string) (*UserRepository, error) {
 func (db *Database) GetUserByUsername(username string) (*UserRepository, error) {
 	row := db.pool.QueryRow(
 		context.Background(),
-		`SELECT u.user_id, u.username, u.email, u.password_hash, u.created_at, u.last_login, u.is_active,
+		`SELECT u.user_id, u.username, u.email, u.password_hash, u.created_at, u.last_login, u.is_active, u.timezone,
 			 COALESCE(json_agg(ur.role_id) FILTER (WHERE ur.role_id IS NOT NULL), '[]'::json) as roles
 		 FROM users u
 		 LEFT JOIN user_roles ur ON u.user_id = ur.user_id
@@ -696,7 +696,7 @@ func (db *Database) GetUserByUsername(username string) (*UserRepository, error) 
 
 	var user UserRepository
 	err := row.Scan(&user.UserID, &user.Username, &user.Email, &user.PasswordHash,
-		&user.CreatedAt, &user.LastLogin, &user.IsActive, &user.Roles)
+		&user.CreatedAt, &user.LastLogin, &user.IsActive, &user.Timezone, &user.Roles)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -710,7 +710,7 @@ func (db *Database) GetUserByUsername(username string) (*UserRepository, error) 
 func (db *Database) GetUserByEmail(email string) (*UserRepository, error) {
 	row := db.pool.QueryRow(
 		context.Background(),
-		`SELECT u.user_id, u.username, u.email, u.password_hash, u.created_at, u.last_login, u.is_active,
+		`SELECT u.user_id, u.username, u.email, u.password_hash, u.created_at, u.last_login, u.is_active, u.timezone,
 			 COALESCE(json_agg(ur.role_id) FILTER (WHERE ur.role_id IS NOT NULL), '[]'::json) as roles
 		 FROM users u
 		 LEFT JOIN user_roles ur ON u.user_id = ur.user_id
@@ -721,7 +721,7 @@ func (db *Database) GetUserByEmail(email string) (*UserRepository, error) {
 
 	var user UserRepository
 	err := row.Scan(&user.UserID, &user.Username, &user.Email, &user.PasswordHash,
-		&user.CreatedAt, &user.LastLogin, &user.IsActive, &user.Roles)
+		&user.CreatedAt, &user.LastLogin, &user.IsActive, &user.Timezone, &user.Roles)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -789,11 +789,11 @@ func (db *Database) SetUserActive(userID string, isActive bool) error {
 }
 
 // UpdateUserProfile updates a user's username and email
-func (db *Database) UpdateUserProfile(userID, username, email string) error {
+func (db *Database) UpdateUserProfile(userID, username, email, timezone string) error {
 	_, err := db.pool.Exec(
 		context.Background(),
-		`UPDATE users SET username = $1, email = $2 WHERE user_id = $3`,
-		username, email, userID,
+		`UPDATE users SET username = $1, email = $2, timezone = $3 WHERE user_id = $4`,
+		username, email, timezone, userID,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to update user profile: %w", err)
@@ -1491,7 +1491,7 @@ func (db *Database) CountUsers() (int, error) {
 func (db *Database) ListUsers() ([]UserRepository, error) {
 	rows, err := db.pool.Query(
 		context.Background(),
-		`SELECT u.user_id, u.username, u.email, u.password_hash, u.created_at, u.last_login, u.is_active,
+		`SELECT u.user_id, u.username, u.email, u.password_hash, u.created_at, u.last_login, u.is_active, u.timezone,
 			 COALESCE(json_agg(ur.role_id) FILTER (WHERE ur.role_id IS NOT NULL), '[]'::json) as roles
 		 FROM users u
 		 LEFT JOIN user_roles ur ON u.user_id = ur.user_id
@@ -1507,7 +1507,7 @@ func (db *Database) ListUsers() ([]UserRepository, error) {
 	for rows.Next() {
 		var u UserRepository
 		err := rows.Scan(&u.UserID, &u.Username, &u.Email, &u.PasswordHash,
-			&u.CreatedAt, &u.LastLogin, &u.IsActive, &u.Roles)
+			&u.CreatedAt, &u.LastLogin, &u.IsActive, &u.Timezone, &u.Roles)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan user: %w", err)
 		}
@@ -1748,7 +1748,7 @@ func (db *Database) ListUsersCursor(opts CursorPaginationOptions) ([]UserReposit
 	}
 
 	query = fmt.Sprintf(`
-		SELECT u.user_id, u.username, u.email, u.password_hash, u.created_at, u.last_login, u.is_active,
+		SELECT u.user_id, u.username, u.email, u.password_hash, u.created_at, u.last_login, u.is_active, u.timezone,
 			   COALESCE(json_agg(ur.role_id) FILTER (WHERE ur.role_id IS NOT NULL), '[]'::json) as roles
 		FROM users u
 		LEFT JOIN user_roles ur ON u.user_id = ur.user_id
@@ -1770,7 +1770,7 @@ func (db *Database) ListUsersCursor(opts CursorPaginationOptions) ([]UserReposit
 	for rows.Next() {
 		var u UserRepository
 		err := rows.Scan(&u.UserID, &u.Username, &u.Email, &u.PasswordHash,
-			&u.CreatedAt, &u.LastLogin, &u.IsActive, &u.Roles)
+			&u.CreatedAt, &u.LastLogin, &u.IsActive, &u.Timezone, &u.Roles)
 		if err != nil {
 			return nil, "", false, fmt.Errorf("failed to scan user: %w", err)
 		}

@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { useAuth } from '../context/AuthContext'
+import { useAuth, useTimezone } from '../context/AuthContext'
+import { formatDateTime, formatTime } from '../lib/datetime'
 
 interface AuditLog {
   id: string
@@ -16,6 +17,7 @@ interface AuditLog {
 
 export function AuditLogs() {
   const { currentUser, isAdmin } = useAuth()
+  const timezone = useTimezone()
   const navigate = useNavigate()
   const [logs, setLogs] = useState<AuditLog[]>([])
   const [loading, setLoading] = useState(true)
@@ -252,7 +254,7 @@ export function AuditLogs() {
                     <td className="px-6 py-4 text-sm text-gray-300">
                       {formatRelativeTime(log.timestamp)}
                       <div className="text-xs text-gray-500">
-                        {new Date(log.timestamp).toLocaleTimeString()}
+                        {formatTime(log.timestamp, timezone)}
                       </div>
                     </td>
                     <td className="px-6 py-4">
@@ -339,7 +341,7 @@ export function AuditLogs() {
                 <div>
                   <h3 className="text-sm font-medium text-gray-300 mb-1">Timestamp</h3>
                   <div className="text-gray-400">
-                    {new Date(selectedLog.timestamp).toLocaleString()}
+                    {formatDateTime(selectedLog.timestamp, timezone)}
                   </div>
                 </div>
                 <div>

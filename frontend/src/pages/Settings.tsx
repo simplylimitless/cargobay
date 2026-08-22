@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { useAuth } from '../context/AuthContext'
+import { useAuth, useTimezone } from '../context/AuthContext'
 import { useConfirm } from '../hooks/useConfirm'
 import { AuditLogs } from './AuditLogs'
+import { formatDateTime, listTimezones } from '../lib/datetime'
 
 const REGISTRY_TYPE_GROUPS: [string, string[]][] = [
   ['Containers & Orchestration', ['docker', 'oci', 'helm']],
@@ -125,7 +126,8 @@ type SettingsTab = 'general' | 'registries' | 'users' | 'audit' | 'vulndb' | 'se
 const SETTINGS_TABS: SettingsTab[] = ['general', 'registries', 'users', 'vulndb', 'searchindex', 'backup', 'audit']
 
 export function Settings() {
-  const { currentUser, token, isAdmin } = useAuth()
+  const { currentUser, token, isAdmin, updateProfile } = useAuth()
+  const timezone = useTimezone()
   const navigate = useNavigate()
   const { confirm, ConfirmDialog } = useConfirm()
   const [config, setConfig] = useState<AdminConfig | null>(null)
@@ -233,6 +235,60 @@ export function Settings() {
     return () => clearTimeout(timer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [vulnDBForm])
+
+  const [timezoneForm, setTimezoneForm] = useState(currentUser?.timezone ?? '')
+  const [timezoneSaving, setTimezoneSaving] = useState(false)
+  const [timezoneSaved, setTimezoneSaved] = useState(false)
+  const [timezoneError, setTimezoneError] = useState<string | null>(null)
+  // Set right before syncing the form from currentUser, so the autosave
+  // effect below can tell "form changed because we just loaded it" apart
+  // from a real edit.
+  const timezoneSkipAutosave = useRef(true)
+
+  useEffect(() => {
+    timezoneSkipAutosave.current = true
+    setTimezoneForm(currentUser?.timezone ?? '')
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentUser?.id])
+
+  const saveTimezone = async (tz: string) => {
+    if (!token || !currentUser) return
+    setTimezoneSaving(true)
+    try {
+      const res = await fetch('/api/v1/users/me', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ username: currentUser.username, email: currentUser.email, timezone: tz }),
+      })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.error || `Request failed: ${res.status}`)
+      }
+      updateProfile(currentUser.username, currentUser.email, tz)
+      setTimezoneError(null)
+      setTimezoneSaved(true)
+    } catch (err: any) {
+      setTimezoneError(err.message)
+    } finally {
+      setTimezoneSaving(false)
+    }
+  }
+
+  useEffect(() => {
+    if (timezoneSkipAutosave.current) {
+      timezoneSkipAutosave.current = false
+      return
+    }
+    setTimezoneSaved(false)
+    const timer = setTimeout(() => {
+      saveTimezone(timezoneForm)
+    }, 800)
+    return () => clearTimeout(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [timezoneForm])
 
   const triggerVulnDBUpdate = async () => {
     if (!token) return
@@ -1208,6 +1264,31 @@ export function Settings() {
         </div>
       ) : (
         <>
+          <div className="card mb-6">
+            <h2 className="text-xl font-semibold text-gray-100 mb-4">Display Preferences</h2>
+            <div className="max-w-sm">
+              <label className="block text-sm font-medium text-gray-400 mb-1">Timezone</label>
+              <select
+                className="input w-full"
+                value={timezoneForm}
+                onChange={(e) => setTimezoneForm(e.target.value)}
+              >
+                <option value="">Browser default</option>
+                {listTimezones().map((tz) => (
+                  <option key={tz} value={tz}>{tz}</option>
+                ))}
+              </select>
+              <p className="text-xs text-gray-500 mt-1">
+                Controls how timestamps are displayed to you. Storage is always UTC.
+              </p>
+              {timezoneError && (
+                <p className="text-xs text-red-400 mt-1">Failed to save: {timezoneError}</p>
+              )}
+              {timezoneSaving && <p className="text-xs text-gray-500 mt-1">Saving...</p>}
+              {!timezoneSaving && timezoneSaved && <p className="text-xs text-green-400 mt-1">Saved</p>}
+            </div>
+          </div>
+
           <div className="card">
             <h2 className="text-xl font-semibold text-gray-100 mb-4">Settings</h2>
 
@@ -1338,13 +1419,13 @@ export function Settings() {
                     <div className="flex justify-between">
                       <dt className="text-gray-500">Last checked</dt>
                       <dd className="text-gray-200 font-mono">
-                        {vulnScanSettings?.lastCheckedAt ? new Date(vulnScanSettings.lastCheckedAt).toLocaleString() : 'never'}
+                        {vulnScanSettings?.lastCheckedAt ? formatDateTime(vulnScanSettings.lastCheckedAt, timezone) : 'never'}
                       </dd>
                     </div>
                     <div className="flex justify-between">
                       <dt className="text-gray-500">Last scanned</dt>
                       <dd className="text-gray-200 font-mono">
-                        {vulnScanSettings?.lastScanAt ? new Date(vulnScanSettings.lastScanAt).toLocaleString() : 'never'}
+                        {vulnScanSettings?.lastScanAt ? formatDateTime(vulnScanSettings.lastScanAt, timezone) : 'never'}
                       </dd>
                     </div>
                   </dl>
@@ -1411,13 +1492,13 @@ export function Settings() {
                   <div className="flex justify-between">
                     <dt className="text-gray-500">Last checked</dt>
                     <dd className="text-gray-200 font-mono">
-                      {vulnDBSettings?.lastCheckedAt ? new Date(vulnDBSettings.lastCheckedAt).toLocaleString() : 'never'}
+                      {vulnDBSettings?.lastCheckedAt ? formatDateTime(vulnDBSettings.lastCheckedAt, timezone) : 'never'}
                     </dd>
                   </div>
                   <div className="flex justify-between">
                     <dt className="text-gray-500">Last updated</dt>
                     <dd className="text-gray-200 font-mono">
-                      {vulnDBSettings?.lastUpdatedAt ? new Date(vulnDBSettings.lastUpdatedAt).toLocaleString() : 'never'}
+                      {vulnDBSettings?.lastUpdatedAt ? formatDateTime(vulnDBSettings.lastUpdatedAt, timezone) : 'never'}
                     </dd>
                   </div>
                 </dl>
@@ -1487,13 +1568,13 @@ export function Settings() {
                   <div className="flex justify-between">
                     <dt className="text-gray-500">Last checked</dt>
                     <dd className="text-gray-200 font-mono">
-                      {searchIndexSettings?.lastCheckedAt ? new Date(searchIndexSettings.lastCheckedAt).toLocaleString() : 'never'}
+                      {searchIndexSettings?.lastCheckedAt ? formatDateTime(searchIndexSettings.lastCheckedAt, timezone) : 'never'}
                     </dd>
                   </div>
                   <div className="flex justify-between">
                     <dt className="text-gray-500">Last reindexed</dt>
                     <dd className="text-gray-200 font-mono">
-                      {searchIndexSettings?.lastReindexedAt ? new Date(searchIndexSettings.lastReindexedAt).toLocaleString() : 'never'}
+                      {searchIndexSettings?.lastReindexedAt ? formatDateTime(searchIndexSettings.lastReindexedAt, timezone) : 'never'}
                     </dd>
                   </div>
                   <div className="flex justify-between">
@@ -1806,13 +1887,13 @@ export function Settings() {
                   <div className="flex justify-between">
                     <dt className="text-gray-500">Last checked</dt>
                     <dd className="text-gray-200 font-mono">
-                      {backupSettings?.lastCheckedAt ? new Date(backupSettings.lastCheckedAt).toLocaleString() : 'never'}
+                      {backupSettings?.lastCheckedAt ? formatDateTime(backupSettings.lastCheckedAt, timezone) : 'never'}
                     </dd>
                   </div>
                   <div className="flex justify-between">
                     <dt className="text-gray-500">Last backup</dt>
                     <dd className="text-gray-200 font-mono">
-                      {backupSettings?.lastBackupAt ? new Date(backupSettings.lastBackupAt).toLocaleString() : 'never'}
+                      {backupSettings?.lastBackupAt ? formatDateTime(backupSettings.lastBackupAt, timezone) : 'never'}
                     </dd>
                   </div>
                   <div className="flex justify-between">
@@ -1851,7 +1932,7 @@ export function Settings() {
                       <li key={b.path} className="flex items-center justify-between px-4 py-2 bg-gray-800/20">
                         <div>
                           <div className="text-sm text-gray-200 font-mono">{b.path}</div>
-                          <div className="text-xs text-gray-500">{new Date(b.createdAt).toLocaleString()}</div>
+                          <div className="text-xs text-gray-500">{formatDateTime(b.createdAt, timezone)}</div>
                         </div>
                         <button
                           onClick={() => restoreBackup(b.path)}

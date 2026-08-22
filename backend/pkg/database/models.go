@@ -41,6 +41,7 @@ type UserRepository struct {
 	CreatedAt    time.Time  `db:"created_at" json:"createdAt"`
 	LastLogin    *time.Time `db:"last_login" json:"lastLogin"`
 	IsActive     bool       `db:"is_active" json:"isActive"`
+	Timezone     string     `db:"timezone" json:"timezone"`
 }
 
 // AccessKey represents an API access key

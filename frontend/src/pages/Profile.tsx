@@ -1,11 +1,13 @@
 import { useState } from 'react'
 import { useAuth } from '../context/AuthContext'
+import { listTimezones } from '../lib/datetime'
 
 export function Profile() {
   const { currentUser, token, updateProfile } = useAuth()
 
   const [username, setUsername] = useState(currentUser?.username || '')
   const [email, setEmail] = useState(currentUser?.email || '')
+  const [timezone, setTimezone] = useState(currentUser?.timezone || '')
   const [profileSaving, setProfileSaving] = useState(false)
   const [profileError, setProfileError] = useState<string | null>(null)
   const [profileSuccess, setProfileSuccess] = useState<string | null>(null)
@@ -38,13 +40,13 @@ export function Profile() {
       const res = await fetch('/api/v1/users/me', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ username, email }),
+        body: JSON.stringify({ username, email, timezone }),
       })
       if (!res.ok) {
         const data = await res.json().catch(() => ({}))
         throw new Error(data.error || `Request failed: ${res.status}`)
       }
-      updateProfile(username, email)
+      updateProfile(username, email, timezone)
       setProfileSuccess('Profile updated successfully')
     } catch (err: any) {
       setProfileError(err.message)
@@ -130,6 +132,20 @@ export function Profile() {
             onChange={(e) => setEmail(e.target.value)}
             className="input w-full"
           />
+        </div>
+        <div>
+          <label className="block text-sm text-gray-400 mb-1">Timezone</label>
+          <select
+            value={timezone}
+            onChange={(e) => setTimezone(e.target.value)}
+            className="input w-full"
+          >
+            <option value="">Browser default</option>
+            {listTimezones().map((tz) => (
+              <option key={tz} value={tz}>{tz}</option>
+            ))}
+          </select>
+          <p className="text-xs text-gray-500 mt-1">Controls how timestamps are displayed to you. Storage is always UTC.</p>
         </div>
 
         <button type="submit" disabled={profileSaving} className="btn btn-primary">

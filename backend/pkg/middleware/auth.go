@@ -34,6 +34,14 @@ type RoleAndPermissionLookup interface {
 	GetUserRolePermissions(userID string) []string
 }
 
+// authStore is the subset of *database.Database's methods NewAuthMiddleware
+// depends on. Narrowed to an interface so tests can substitute a fake.
+type authStore interface {
+	GetUserByUsername(username string) (*database.UserRepository, error)
+	GetUserByID(userID string) (*database.UserRepository, error)
+	ValidateAccessKey(keyHash string) (*database.AccessKey, error)
+}
+
 // NewAuthMiddleware validates the caller's credentials — either a bearer
 // token against access_keys, or HTTP Basic username/password against the
 // users table (used by `docker login`/`docker push`, which speak Basic
@@ -42,7 +50,7 @@ type RoleAndPermissionLookup interface {
 // context. Requests without (valid) credentials proceed unauthenticated —
 // routes that require a user should be wrapped in RequireAuth or
 // rbac.RequirePermission.
-func NewAuthMiddleware(db *database.Database, roles RoleAndPermissionLookup) func(http.Handler) http.Handler {
+func NewAuthMiddleware(db authStore, roles RoleAndPermissionLookup) func(http.Handler) http.Handler {
 	loadUser := func(dbUser *database.UserRepository) *User {
 		userRoles, _ := roles.GetUserRoles(dbUser.UserID)
 		return &User{

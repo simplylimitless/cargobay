@@ -1584,7 +1584,7 @@ func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := s.db.UpdateUserProfile(id, input.Username, input.Email); err != nil {
+	if err := s.db.UpdateUserProfile(id, input.Username, input.Email, user.Timezone); err != nil {
 		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to update profile: %v", err))
 		return
 	}
@@ -1767,6 +1767,7 @@ func (s *Server) handleUpdateCurrentUser(w http.ResponseWriter, r *http.Request)
 	var input struct {
 		Username string `json:"username"`
 		Email    string `json:"email"`
+		Timezone string `json:"timezone"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 		s.writeJSONError(w, http.StatusBadRequest, "Invalid request body")
@@ -1781,7 +1782,7 @@ func (s *Server) handleUpdateCurrentUser(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if err := s.db.UpdateUserProfile(user.UserID, input.Username, input.Email); err != nil {
+	if err := s.db.UpdateUserProfile(user.UserID, input.Username, input.Email, input.Timezone); err != nil {
 		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to update profile: %v", err))
 		return
 	}
@@ -2012,6 +2013,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			"userId":      output.UserID,
 			"username":    output.Username,
 			"email":       output.Email,
+			"timezone":    output.Timezone,
 			"roles":       output.Roles,
 			"permissions": output.Permissions,
 		},
@@ -2123,6 +2125,7 @@ func (s *Server) handleSetupInit(w http.ResponseWriter, r *http.Request) {
 			"userId":      output.UserID,
 			"username":    output.Username,
 			"email":       output.Email,
+			"timezone":    output.Timezone,
 			"roles":       output.Roles,
 			"permissions": output.Permissions,
 		},
