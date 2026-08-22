@@ -9,6 +9,14 @@ interface SearchResult {
   description?: string
 }
 
+interface ArtifactMetadata {
+  RegistryID: string
+  ArtifactType: string
+  ArtifactName: string
+  Namespace: string
+  Metadata: Record<string, any> | null
+}
+
 export function SearchResults() {
   const navigate = useNavigate()
   const [query, setQuery] = useState('')
@@ -27,28 +35,28 @@ export function SearchResults() {
   const performSearch = (q: string) => {
     setLoading(true)
 
-    setTimeout(() => {
-      const mockResults: Record<string, SearchResult[]> = {
-        docker: [
-          { registry: 'dockerhub', artifactType: 'docker', name: 'nginx', namespace: 'library', description: 'Official Nginx image' },
-          { registry: 'dockerhub', artifactType: 'docker', name: 'redis', namespace: 'library', description: 'Official Redis image' },
-          { registry: 'dockerhub', artifactType: 'docker', name: 'postgres', namespace: 'library', description: 'Official PostgreSQL image' },
-          { registry: 'dockerhub', artifactType: 'docker', name: 'node', namespace: 'library', description: 'Official Node.js image' },
-        ],
-        maven: [
-          { registry: 'maven-central', artifactType: 'maven', name: 'spring-boot-starter-web', namespace: 'org.springframework.boot', description: 'Spring Boot Web Starter' },
-          { registry: 'maven-central', artifactType: 'maven', name: 'guava', namespace: 'com.google.guava', description: 'Google Core Libraries' },
-        ],
-        npm: [
-          { registry: 'npm', artifactType: 'npm', name: 'react', description: 'A JavaScript library for building user interfaces' },
-          { registry: 'npm', artifactType: 'npm', name: 'lodash', description: 'Lodash modular utilities' },
-          { registry: 'npm', artifactType: 'npm', name: 'axios', description: 'Promise based HTTP client' },
-        ],
-      }
-
-      setResults(mockResults)
-      setLoading(false)
-    }, 300)
+    fetch(`/api/v1/search?q=${encodeURIComponent(q)}`)
+      .then((res) => {
+        if (!res.ok) throw new Error(`Request failed: ${res.status}`)
+        return res.json()
+      })
+      .then((data: ArtifactMetadata[] | null) => {
+        const grouped: Record<string, SearchResult[]> = {}
+        for (const a of data || []) {
+          const result: SearchResult = {
+            registry: a.RegistryID,
+            artifactType: a.ArtifactType,
+            name: a.ArtifactName,
+            namespace: a.Namespace || undefined,
+            description: a.Metadata?.description,
+          }
+          grouped[a.ArtifactType] = grouped[a.ArtifactType] || []
+          grouped[a.ArtifactType].push(result)
+        }
+        setResults(grouped)
+      })
+      .catch(() => setResults({}))
+      .finally(() => setLoading(false))
   }
 
   const handleSearch = (e: React.FormEvent) => {

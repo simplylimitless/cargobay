@@ -247,6 +247,9 @@ func (p *NPMProxy) handleTarball(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s-%s.tgz", pkgName, version))
+		if err := p.db.IncrementArtifactDownloads(t.Label, "", pkgName, version); err != nil {
+			fmt.Printf("failed to record download for %s@%s: %v\n", pkgName, version, err)
+		}
 		w.Write(data)
 		return
 	}
@@ -286,11 +289,15 @@ func (p *NPMProxy) handleTarball(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s-%s.tgz", pkgName, version))
+	if err := p.db.IncrementArtifactDownloads(t.Label, "", pkgName, version); err != nil {
+		fmt.Printf("failed to record download for %s@%s: %v\n", pkgName, version, err)
+	}
 	w.Write(data)
 }
 
 // handleScopedTarball handles scoped pkgName tarball downloads
 func (p *NPMProxy) handleScopedTarball(w http.ResponseWriter, r *http.Request) {
+	t := proxypkg.TargetFromContext(r, "npm")
 	scope := chi.URLParam(r, "scope")
 	pkgName := chi.URLParam(r, "pkgName")
 	version := chi.URLParam(r, "version")
@@ -300,6 +307,9 @@ func (p *NPMProxy) handleScopedTarball(w http.ResponseWriter, r *http.Request) {
 	if data, err := p.storage.GetArtifact("npm", scope, pkgName, version); err == nil && data != nil {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s-%s.tgz", packageName, version))
+		if err := p.db.IncrementArtifactDownloads(t.Label, scope, pkgName, version); err != nil {
+			fmt.Printf("failed to record download for %s@%s: %v\n", packageName, version, err)
+		}
 		w.Write(data)
 		return
 	}
@@ -325,19 +335,21 @@ func (p *NPMProxy) handleScopedTarball(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s-%s.tgz", packageName, version))
+	if err := p.db.IncrementArtifactDownloads(t.Label, scope, pkgName, version); err != nil {
+		fmt.Printf("failed to record download for %s@%s: %v\n", packageName, version, err)
+	}
 	w.Write(data)
 }
 
-// fetchFromUpstream fetches data from the upstream npm registry for the
-// resolved registry (or the default public npm registry if reg is nil or
-// doesn't proxy an upstream).
+// fetchFromUpstream fetches data from the resolved registry's configured
+// upstream. Returns an error if reg has no upstream proxy configured — it
+// never silently falls back to the public npm registry.
 func (p *NPMProxy) fetchFromUpstream(reg *database.RegistryConfig, path string) ([]byte, error) {
-	upstream := "https://registry.npmjs.org"
-	if reg != nil && reg.Proxy && reg.URL != "" {
-		upstream = reg.URL
+	if reg == nil || !reg.Proxy || reg.URL == "" {
+		return nil, fmt.Errorf("no upstream proxy configured for this registry")
 	}
 
-	req, err := http.NewRequest(http.MethodGet, upstream+path, nil)
+	req, err := http.NewRequest(http.MethodGet, reg.URL+path, nil)
 	if err != nil {
 		return nil, err
 	}

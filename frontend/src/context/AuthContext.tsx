@@ -19,7 +19,7 @@ interface AuthContextValue {
   isAdmin: boolean
   login: (username: string, password: string) => Promise<void>
   logout: () => void
-  canManage: (uploadedBy: string) => boolean
+  canManage: (uploadedBy: string | null | undefined) => boolean
   updateProfile: (username: string, email: string) => void
   setSession: (accessToken: string, user: { userId: string; username: string; email: string; roles?: string[]; permissions?: string[] }) => void
 }
@@ -133,9 +133,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const isAdmin = currentUser?.roles.includes('admin') || false
 
-  const canManage = (uploadedBy: string) => {
+  const canManage = (uploadedBy: string | null | undefined) => {
     if (!currentUser) return false
-    return isAdmin || currentUser.id === uploadedBy
+    return isAdmin || (!!uploadedBy && currentUser.username === uploadedBy)
   }
 
   return (

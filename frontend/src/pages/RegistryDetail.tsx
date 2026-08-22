@@ -82,16 +82,6 @@ export function RegistryDetail() {
 
   return (
     <div className="space-y-8">
-      <button
-        onClick={() => navigate('/')}
-        className="flex items-center gap-2 text-gray-400 hover:text-gray-100 transition-colors"
-      >
-        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-        </svg>
-        Back to registries
-      </button>
-
       <div className="card">
         <div className="flex items-start gap-6">
           <div className="w-20 h-20 bg-gradient-to-br from-blue-600 to-purple-600 rounded-2xl flex items-center justify-center flex-shrink-0 text-5xl shadow-lg shadow-blue-600/20">

@@ -2,6 +2,14 @@
 
 This document outlines the planned features and improvements for cargobay.
 
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [Architecture](architecture.md) | Internal architecture, components, and data flows |
+| [Configuration](configuration.md) | Configuration options and environment variables |
+| [API Reference](api.md) | Complete API endpoint documentation |
+
 ## Completed Features
 
 ### Core Functionality
@@ -18,17 +26,10 @@ This document outlines the planned features and improvements for cargobay.
 - [x] PyPI Proxy (PEP 503)
 - [x] NuGet Proxy (V2/V3)
 - [x] CLI Tool
-- [x] Elasticsearch Integration
 - [x] Helm Chart
 - [x] E2E Tests
 - [x] CI/CD Pipeline
 - [x] Documentation Site
-
-## Current Status
-
-**v1.0.0** - Complete and ready for deployment
-
-All core features implemented and tested. Production-ready with Kubernetes support.
 
 ## Planned Enhancements
 
@@ -95,7 +96,6 @@ All core features implemented and tested. Production-ready with Kubernetes suppo
 
 - Docker manifest list support is limited to v2 schema
 - Large file uploads (>1GB) may require proxy configuration
-- Elasticsearch integration requires manual setup
 
 ## Migration Path
 

@@ -1,18 +1,19 @@
 import { useState, useEffect } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { useAuth } from '../context/AuthContext'
 
+// Shape returned by GET /api/v1/artifacts — database.ArtifactMetadata has
+// no json tags, so it serializes using its Go field names verbatim.
 interface Artifact {
-  id: string
-  name: string
-  version: string
-  type: string
-  namespace: string
-  size: number
-  registryId: string
-  uploadedAt: string
-  downloads: number
-  tags: string[]
+  ID: string
+  RegistryID: string
+  ArtifactType: string
+  Namespace: string
+  ArtifactName: string
+  Version: string
+  Digest: string
+  Size: number
+  Created: string
+  Tags: string[] | null
 }
 
 interface Registry {
@@ -20,12 +21,11 @@ interface Registry {
   name: string
   type: string
   url: string
-  status: string
+  private: boolean
 }
 
 export function ArtifactBrowse() {
   const { registryId, artifactType, namespace } = useParams()
-  const { currentUser } = useAuth()
   const navigate = useNavigate()
   const [artifacts, setArtifacts] = useState<Artifact[]>([])
   const [registries, setRegistries] = useState<Registry[]>([])
@@ -42,40 +42,28 @@ export function ArtifactBrowse() {
   useEffect(() => {
     const fetchRegistries = async () => {
       try {
-        // Simulated registries
-        const mockRegistries: Registry[] = [
-          { id: 'dockerhub', name: 'Docker Hub', type: 'docker', url: 'https://registry.hub.docker.com', status: 'active' },
-          { id: 'npm', name: 'NPM Registry', type: 'npm', url: 'https://registry.npmjs.org', status: 'active' },
-          { id: 'maven-central', name: 'Maven Central', type: 'maven', url: 'https://repo.maven.apache.org', status: 'active' },
-          { id: 'pypi', name: 'PyPI', type: 'pypi', url: 'https://pypi.org', status: 'active' },
-          { id: 'nuget', name: 'NuGet Gallery', type: 'nuget', url: 'https://api.nuget.org', status: 'active' },
-        ]
-        setRegistries(mockRegistries)
-        if (!selectedRegistry && mockRegistries.length > 0) {
-          setSelectedRegistry(mockRegistries[0].id)
+        const res = await fetch('/api/v1/registries')
+        if (!res.ok) throw new Error(`Request failed: ${res.status}`)
+        const data = await res.json()
+        const loaded: Registry[] = data.registries || []
+        setRegistries(loaded)
+        if (!selectedRegistry && loaded.length > 0) {
+          setSelectedRegistry(loaded[0].id)
         }
-      } catch (err) {
-        setError('Failed to load registries')
+      } catch (err: any) {
+        setError(err.message || 'Failed to load registries')
       }
     }
 
     const fetchArtifacts = async () => {
       try {
-        // Simulated artifacts
-        const mockArtifacts: Artifact[] = [
-          { id: '1', name: 'nginx', version: '1.25.3', type: 'docker', namespace: 'library', registryId: 'dockerhub', size: 145000000, uploadedAt: '2024-01-15T10:30:00Z', downloads: 1000000, tags: ['latest', 'stable'] },
-          { id: '2', name: 'nginx', version: '1.25.3-alpine', type: 'docker', namespace: 'library', registryId: 'dockerhub', size: 28000000, uploadedAt: '2024-01-15T10:30:00Z', downloads: 500000, tags: ['alpine', 'latest'] },
-          { id: '3', name: 'redis', version: '7.2.3', type: 'docker', namespace: 'library', registryId: 'dockerhub', size: 118000000, uploadedAt: '2024-01-14T08:20:00Z', downloads: 800000, tags: ['latest'] },
-          { id: '4', name: 'express', version: '4.18.2', type: 'npm', namespace: '@types', registryId: 'npm', size: 50000, uploadedAt: '2024-01-13T14:45:00Z', downloads: 25000000, tags: ['latest'] },
-          { id: '5', name: 'lodash', version: '4.17.21', type: 'npm', namespace: '', registryId: 'npm', size: 300000, uploadedAt: '2024-01-12T09:15:00Z', downloads: 35000000, tags: ['latest'] },
-          { id: '6', name: 'spring-core', version: '6.1.3', type: 'maven', namespace: 'org/springframework', registryId: 'maven-central', size: 600000, uploadedAt: '2024-01-11T11:00:00Z', downloads: 5000000, tags: ['latest'] },
-          { id: '7', name: 'requests', version: '2.31.0', type: 'pypi', namespace: '', registryId: 'pypi', size: 25000000, uploadedAt: '2024-01-10T16:30:00Z', downloads: 15000000, tags: ['latest'] },
-          { id: '8', name: 'Newtonsoft.Json', version: '13.0.3', type: 'nuget', namespace: '', registryId: 'nuget', size: 800000, uploadedAt: '2024-01-09T12:00:00Z', downloads: 3000000, tags: ['latest'] },
-        ]
-        setArtifacts(mockArtifacts)
-        setLoading(false)
-      } catch (err) {
-        setError('Failed to load artifacts')
+        const res = await fetch('/api/v1/artifacts?limit=200')
+        if (!res.ok) throw new Error(`Request failed: ${res.status}`)
+        const data = await res.json()
+        setArtifacts(data.artifacts || [])
+      } catch (err: any) {
+        setError(err.message || 'Failed to load artifacts')
+      } finally {
         setLoading(false)
       }
     }
@@ -88,20 +76,20 @@ export function ArtifactBrowse() {
     let result = artifacts
 
     if (selectedRegistry) {
-      result = result.filter(a => a.registryId === selectedRegistry)
+      result = result.filter(a => a.RegistryID === selectedRegistry)
     }
     if (selectedType !== 'all') {
-      result = result.filter(a => a.type === selectedType)
+      result = result.filter(a => a.ArtifactType === selectedType)
     }
     if (selectedNamespace) {
-      result = result.filter(a => a.namespace === selectedNamespace)
+      result = result.filter(a => a.Namespace === selectedNamespace)
     }
     if (searchQuery) {
       const query = searchQuery.toLowerCase()
       result = result.filter(a =>
-        a.name.toLowerCase().includes(query) ||
-        a.version.toLowerCase().includes(query) ||
-        a.tags.some(t => t.toLowerCase().includes(query))
+        a.ArtifactName.toLowerCase().includes(query) ||
+        a.Version.toLowerCase().includes(query) ||
+        (a.Tags || []).some(t => t.toLowerCase().includes(query))
       )
     }
 
@@ -132,23 +120,11 @@ export function ArtifactBrowse() {
   const getNamespaceList = (type: string): string[] => {
     const namespaces = new Set<string>()
     artifacts
-      .filter(a => a.type === type)
+      .filter(a => a.ArtifactType === type)
       .forEach(a => {
-        if (a.namespace) namespaces.add(a.namespace)
+        if (a.Namespace) namespaces.add(a.Namespace)
       })
     return Array.from(namespaces).sort()
-  }
-
-  if (!currentUser) {
-    return (
-      <div className="max-w-4xl mx-auto">
-        <div className="card text-center py-12">
-          <h2 className="text-2xl font-bold text-white mb-4">Please Log In</h2>
-          <p className="text-gray-400 mb-6">You need to be logged in to browse artifacts.</p>
-          <button onClick={() => navigate('/login')} className="btn btn-primary">Log In</button>
-        </div>
-      </div>
-    )
   }
 
   return (
@@ -157,6 +133,12 @@ export function ArtifactBrowse() {
         <h1 className="text-3xl font-bold text-white mb-2">Browse Artifacts</h1>
         <p className="text-gray-400">Explore and search artifacts from configured registries</p>
       </div>
+
+      {error && (
+        <div className="px-4 py-3 bg-red-500/10 border border-red-500/30 rounded-lg text-red-400 text-sm mb-4">
+          {error}
+        </div>
+      )}
 
       {/* Filters */}
       <div className="card p-6 mb-6 space-y-6">
@@ -221,21 +203,21 @@ export function ArtifactBrowse() {
           <div className="text-2xl font-bold text-white mt-1">{filteredArtifacts.length}</div>
         </div>
         <div className="card p-4">
-          <div className="text-sm text-gray-400">Total Downloads</div>
+          <div className="text-sm text-gray-400">Total Size</div>
           <div className="text-2xl font-bold text-white mt-1">
-            {filteredArtifacts.reduce((sum, a) => sum + a.downloads, 0).toLocaleString()}
+            {formatSize(filteredArtifacts.reduce((sum, a) => sum + a.Size, 0))}
           </div>
         </div>
         <div className="card p-4">
-          <div className="text-sm text-gray-400">Total Size</div>
+          <div className="text-sm text-gray-400">Namespaces</div>
           <div className="text-2xl font-bold text-white mt-1">
-            {formatSize(filteredArtifacts.reduce((sum, a) => sum + a.size, 0))}
+            {new Set(filteredArtifacts.map(a => a.Namespace).filter(Boolean)).size}
           </div>
         </div>
         <div className="card p-4">
           <div className="text-sm text-gray-400">Active Registries</div>
           <div className="text-2xl font-bold text-white mt-1">
-            {registries.filter(r => r.status === 'active').length}
+            {registries.length}
           </div>
         </div>
       </div>
@@ -267,41 +249,37 @@ export function ArtifactBrowse() {
                 <th className="text-left px-6 py-3 text-sm font-medium text-gray-300">Namespace</th>
                 <th className="text-left px-6 py-3 text-sm font-medium text-gray-300">Size</th>
                 <th className="text-left px-6 py-3 text-sm font-medium text-gray-300">Tags</th>
-                <th className="text-left px-6 py-3 text-sm font-medium text-gray-300">Uploaded</th>
-                <th className="text-left px-6 py-3 text-sm font-medium text-gray-300">Downloads</th>
+                <th className="text-left px-6 py-3 text-sm font-medium text-gray-300">Cached</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-700">
               {filteredArtifacts.map(artifact => (
                 <tr
-                  key={artifact.id}
+                  key={artifact.ID}
                   className="hover:bg-gray-800/50 transition-colors"
-                  onClick={() => navigate(`/artifacts/${artifact.registryId}/${artifact.type}/${artifact.namespace}/${artifact.name}/${artifact.version}`)}
+                  onClick={() => navigate(`/artifacts/${artifact.RegistryID}/${artifact.ArtifactType}/${artifact.Namespace}/${artifact.ArtifactName}/${artifact.Version}`)}
                 >
                   <td className="px-6 py-4">
-                    <div className="font-medium text-white">{artifact.name}</div>
+                    <div className="font-medium text-white">{artifact.ArtifactName}</div>
                   </td>
                   <td className="px-6 py-4">
                     <span className="px-2 py-1 text-xs rounded-full bg-blue-500/20 text-blue-300 capitalize">
-                      {artifact.type}
+                      {artifact.ArtifactType}
                     </span>
                   </td>
-                  <td className="px-6 py-4 text-gray-300">{artifact.version}</td>
-                  <td className="px-6 py-4 text-gray-300">{artifact.namespace || '-'}</td>
-                  <td className="px-6 py-4 text-gray-300">{formatSize(artifact.size)}</td>
+                  <td className="px-6 py-4 text-gray-300">{artifact.Version}</td>
+                  <td className="px-6 py-4 text-gray-300">{artifact.Namespace || '-'}</td>
+                  <td className="px-6 py-4 text-gray-300">{formatSize(artifact.Size)}</td>
                   <td className="px-6 py-4">
                     <div className="flex flex-wrap gap-1">
-                      {artifact.tags.map((tag, idx) => (
+                      {(artifact.Tags || []).map((tag, idx) => (
                         <span key={idx} className="px-2 py-0.5 text-xs rounded-full bg-gray-700 text-gray-300">
                           {tag}
                         </span>
                       ))}
                     </div>
                   </td>
-                  <td className="px-6 py-4 text-gray-300 text-sm">{formatRelativeTime(artifact.uploadedAt)}</td>
-                  <td className="px-6 py-4 text-gray-300">
-                    {artifact.downloads.toLocaleString()}
-                  </td>
+                  <td className="px-6 py-4 text-gray-300 text-sm">{formatRelativeTime(artifact.Created)}</td>
                 </tr>
               ))}
             </tbody>

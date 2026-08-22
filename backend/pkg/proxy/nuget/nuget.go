@@ -48,6 +48,12 @@ func NewNuGetProxy(db *database.Database, storage storage.StorageAdapter, cache 
 
 	r.Use(proxypkg.RequireReadAccess(db, rbacMgr, registries, "nuget"))
 
+	// V3 service index — the discovery document standard clients (dotnet,
+	// nuget.exe) fetch first to locate the routes below. Without this,
+	// pointing a client at this proxy fails before it ever reaches /query
+	// or /package/, even though those V3 routes are fully implemented.
+	r.Get("/v3/index.json", proxy.handleServiceIndex)
+
 	// NuGet V3 API routes (recommended)
 	// Search: /query?q={query}&skip={skip}&take={take}
 	r.Get("/query", proxy.handleQuery)
@@ -73,6 +79,31 @@ func NewNuGetProxy(db *database.Database, storage storage.StorageAdapter, cache 
 	r.Get("/registration/{packageId}/{version}.json", proxy.handleRegistrationVersion)
 
 	return r
+}
+
+// handleServiceIndex handles the V3 service index (discovery) document.
+func (n *NuGetProxy) handleServiceIndex(w http.ResponseWriter, r *http.Request) {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	} else if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+		scheme = proto
+	}
+	base := fmt.Sprintf("%s://%s/nuget", scheme, r.Host)
+
+	resp := map[string]interface{}{
+		"version": "3.0.0",
+		"resources": []map[string]string{
+			{"@id": base + "/query", "@type": "SearchQueryService"},
+			{"@id": base + "/query", "@type": "SearchQueryService/3.0.0-rc"},
+			{"@id": base + "/registration/", "@type": "RegistrationsBaseUrl"},
+			{"@id": base + "/registration/", "@type": "RegistrationsBaseUrl/3.0.0-rc"},
+			{"@id": base + "/package/", "@type": "PackageBaseAddress/3.0.0"},
+		},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }
 
 // handleQuery handles the V3 search query endpoint
@@ -210,6 +241,7 @@ func (n *NuGetProxy) handleDownload(w http.ResponseWriter, r *http.Request) {
 	packageId := chi.URLParam(r, "packageId")
 	version := chi.URLParam(r, "version")
 	fileName := fmt.Sprintf("%s.%s.nupkg", packageId, version)
+	t := proxypkg.TargetFromContext(r, "nuget")
 
 	// Try to get from storage first
 	data, err := n.storage.GetArtifact("nuget", "", packageId, version)
@@ -217,12 +249,15 @@ func (n *NuGetProxy) handleDownload(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", fileName))
 		w.Header().Set("X-NuGet-Protocol-Version", "3.0.0")
+		if err := n.db.IncrementArtifactDownloads(t.Label, "", packageId, version); err != nil {
+			fmt.Printf("failed to record download for %s %s: %v\n", packageId, version, err)
+		}
 		w.Write(data)
 		return
 	}
 
 	// Fetch from upstream
-	data, err = n.fetchPackageFileFromUpstream(proxypkg.TargetFromContext(r, "nuget").Reg, packageId, version, fileName)
+	data, err = n.fetchPackageFileFromUpstream(t.Reg, packageId, version, fileName)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to download package: %v", err), http.StatusBadGateway)
 		return
@@ -240,6 +275,9 @@ func (n *NuGetProxy) handleDownload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", fileName))
 	w.Header().Set("X-NuGet-Protocol-Version", "3.0.0")
+	if err := n.db.IncrementArtifactDownloads(t.Label, "", packageId, version); err != nil {
+		fmt.Printf("failed to record download for %s %s: %v\n", packageId, version, err)
+	}
 	w.Write(data)
 }
 
@@ -515,10 +553,10 @@ func (n *NuGetProxy) handleRegistrationVersion(w http.ResponseWriter, r *http.Re
 
 // fetchPackageFromUpstream fetches package metadata from NuGet
 func (n *NuGetProxy) fetchPackageFromUpstream(reg *database.RegistryConfig, registryLabel, packageId, version string) (*database.ArtifactMetadata, error) {
-	upstream := "https://api.nuget.org/v3/index.json"
-	if reg != nil && reg.Proxy && reg.URL != "" {
-		upstream = reg.URL
+	if reg == nil || !reg.Proxy || reg.URL == "" {
+		return nil, fmt.Errorf("no upstream proxy configured for this registry")
 	}
+	upstream := reg.URL
 
 	// Get catalog entry
 	catalogURL := fmt.Sprintf("%s/%s/%s.json", strings.TrimSuffix(upstream, "/v3/index.json"), packageId, version)
@@ -572,10 +610,10 @@ func (n *NuGetProxy) fetchPackageFromUpstream(reg *database.RegistryConfig, regi
 
 // fetchPackageFileFromUpstream fetches a .nupkg file from NuGet
 func (n *NuGetProxy) fetchPackageFileFromUpstream(reg *database.RegistryConfig, packageId, version, fileName string) ([]byte, error) {
-	upstream := "https://www.nuget.org"
-	if reg != nil && reg.Proxy && reg.URL != "" {
-		upstream = reg.URL
+	if reg == nil || !reg.Proxy || reg.URL == "" {
+		return nil, fmt.Errorf("no upstream proxy configured for this registry")
 	}
+	upstream := reg.URL
 
 	// NuGet package URL format
 	fileURL := fmt.Sprintf("%s/api/v2/package/%s/%s", upstream, packageId, version)

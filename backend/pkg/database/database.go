@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,9 +29,9 @@ type CacheAdapter interface {
 
 // Database implements PostgreSQL data access with connection pooling and caching
 type Database struct {
-	dsn     string
-	pool    *pgxpool.Pool
-	cache   CacheAdapter
+	dsn      string
+	pool     *pgxpool.Pool
+	cache    CacheAdapter
 	cacheTTL time.Duration
 }
 
@@ -45,9 +46,9 @@ type DatabaseConfig struct {
 // DefaultDatabaseConfig returns recommended settings for stateless deployments
 func DefaultDatabaseConfig() DatabaseConfig {
 	return DatabaseConfig{
-		MaxConnections:    10,          // Low for stateless - each pod holds few connections
-		MinConnections:    1,           // Minimum to keep pool warm
-		MaxConnectionAge:  time.Hour,   // Reconnect periodically
+		MaxConnections:    10,        // Low for stateless - each pod holds few connections
+		MinConnections:    1,         // Minimum to keep pool warm
+		MaxConnectionAge:  time.Hour, // Reconnect periodically
 		HealthCheckPeriod: 30 * time.Second,
 	}
 }
@@ -86,9 +87,9 @@ func (db *Database) Connect() error {
 		config.MaxConns = 10 // Low for stateless deployments
 	}
 	config.MinConns = 1
-	config.MaxConnLifetime = 1 * time.Hour        // Reconnect periodically
-	config.MaxConnIdleTime = 5 * time.Minute      // Close idle connections
-	config.HealthCheckPeriod = 30 * time.Second   // Frequent health checks
+	config.MaxConnLifetime = 1 * time.Hour      // Reconnect periodically
+	config.MaxConnIdleTime = 5 * time.Minute    // Close idle connections
+	config.HealthCheckPeriod = 30 * time.Second // Frequent health checks
 
 	pool, err := pgxpool.NewWithConfig(context.Background(), config)
 	if err != nil {
@@ -143,7 +144,7 @@ func (db *Database) GetArtifactByParams(registryID, namespace, artifactName, ver
 	row := db.pool.QueryRow(
 		context.Background(),
 		`SELECT id, registry_id, artifact_type, namespace, artifact_name, version,
-			 digest, digest_algorithm, size, created, updated, metadata, tags, signatures
+			 digest, digest_algorithm, size, created, updated, metadata, tags, signatures, downloads
 		 FROM artifacts
 		 WHERE registry_id = $1 AND namespace = $2 AND artifact_name = $3 AND version = $4`,
 		registryID, namespace, artifactName, version,
@@ -154,7 +155,7 @@ func (db *Database) GetArtifactByParams(registryID, namespace, artifactName, ver
 		&artifact.ID, &artifact.RegistryID, &artifact.ArtifactType,
 		&artifact.Namespace, &artifact.ArtifactName, &artifact.Version,
 		&artifact.Digest, &artifact.DigestAlgorithm, &artifact.Size,
-		&artifact.Created, &artifact.Updated, &artifact.Metadata, &artifact.Tags, &artifact.Signatures,
+		&artifact.Created, &artifact.Updated, &artifact.Metadata, &artifact.Tags, &artifact.Signatures, &artifact.Downloads,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -170,7 +171,7 @@ func (db *Database) GetArtifactByDigest(registryID, digest string) (*ArtifactMet
 	row := db.pool.QueryRow(
 		context.Background(),
 		`SELECT id, registry_id, artifact_type, namespace, artifact_name, version,
-			 digest, digest_algorithm, size, created, updated, metadata, tags, signatures
+			 digest, digest_algorithm, size, created, updated, metadata, tags, signatures, downloads
 		 FROM artifacts
 		 WHERE registry_id = $1 AND digest = $2
 		 ORDER BY created DESC`,
@@ -182,7 +183,7 @@ func (db *Database) GetArtifactByDigest(registryID, digest string) (*ArtifactMet
 		&artifact.ID, &artifact.RegistryID, &artifact.ArtifactType,
 		&artifact.Namespace, &artifact.ArtifactName, &artifact.Version,
 		&artifact.Digest, &artifact.DigestAlgorithm, &artifact.Size,
-		&artifact.Created, &artifact.Updated, &artifact.Metadata, &artifact.Tags, &artifact.Signatures,
+		&artifact.Created, &artifact.Updated, &artifact.Metadata, &artifact.Tags, &artifact.Signatures, &artifact.Downloads,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -207,7 +208,7 @@ type ListOptions struct {
 // ListArtifacts lists artifacts with optional filtering and pagination
 func (db *Database) ListArtifacts(registryID string, opts ListOptions) ([]ArtifactMetadata, error) {
 	query := `SELECT id, registry_id, artifact_type, namespace, artifact_name, version,
-				 digest, digest_algorithm, size, created, updated, metadata, tags, signatures
+				 digest, digest_algorithm, size, created, updated, metadata, tags, signatures, downloads
 			  FROM artifacts WHERE registry_id = $1`
 	params := []any{registryID}
 
@@ -253,7 +254,7 @@ func (db *Database) ListArtifacts(registryID string, opts ListOptions) ([]Artifa
 		var a ArtifactMetadata
 		err := rows.Scan(&a.ID, &a.RegistryID, &a.ArtifactType, &a.Namespace,
 			&a.ArtifactName, &a.Version, &a.Digest, &a.DigestAlgorithm, &a.Size,
-			&a.Created, &a.Updated, &a.Metadata, &a.Tags, &a.Signatures)
+			&a.Created, &a.Updated, &a.Metadata, &a.Tags, &a.Signatures, &a.Downloads)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan artifact: %w", err)
 		}
@@ -261,6 +262,99 @@ func (db *Database) ListArtifacts(registryID string, opts ListOptions) ([]Artifa
 	}
 
 	return artifacts, rows.Err()
+}
+
+// ListArtifactsMulti lists artifacts across a set of registry IDs — used for
+// the unscoped "browse everything the caller can read" listing, where the
+// caller has already filtered registryIDs down to what RBAC allows. An empty
+// slice means "no readable registries" and returns no rows, not "no filter".
+func (db *Database) ListArtifactsMulti(registryIDs []string, opts ListOptions) ([]ArtifactMetadata, error) {
+	if len(registryIDs) == 0 {
+		return nil, nil
+	}
+
+	query := `SELECT id, registry_id, artifact_type, namespace, artifact_name, version,
+				 digest, digest_algorithm, size, created, updated, metadata, tags, signatures, downloads
+			  FROM artifacts WHERE registry_id = ANY($1)`
+	params := []any{registryIDs}
+
+	if opts.Namespace != "" {
+		query += ` AND namespace = $` + fmt.Sprintf("%d", len(params)+1)
+		params = append(params, opts.Namespace)
+	}
+
+	if opts.ArtifactType != "" {
+		query += ` AND artifact_type = $` + fmt.Sprintf("%d", len(params)+1)
+		params = append(params, opts.ArtifactType)
+	}
+
+	order := opts.OrderBy
+	if order == "" {
+		order = "created"
+	}
+	dir := opts.Order
+	if dir == "" {
+		dir = "desc"
+	}
+	query += fmt.Sprintf(` ORDER BY %s %s`, order, dir)
+
+	if opts.Limit <= 0 {
+		opts.Limit = 100
+	}
+	query += ` LIMIT $` + fmt.Sprintf("%d", len(params)+1)
+	params = append(params, opts.Limit)
+
+	if opts.Offset > 0 {
+		query += ` OFFSET $` + fmt.Sprintf("%d", len(params)+1)
+		params = append(params, opts.Offset)
+	}
+
+	rows, err := db.pool.Query(context.Background(), query, params...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list artifacts: %w", err)
+	}
+	defer rows.Close()
+
+	var artifacts []ArtifactMetadata
+	for rows.Next() {
+		var a ArtifactMetadata
+		err := rows.Scan(&a.ID, &a.RegistryID, &a.ArtifactType, &a.Namespace,
+			&a.ArtifactName, &a.Version, &a.Digest, &a.DigestAlgorithm, &a.Size,
+			&a.Created, &a.Updated, &a.Metadata, &a.Tags, &a.Signatures, &a.Downloads)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan artifact: %w", err)
+		}
+		artifacts = append(artifacts, a)
+	}
+
+	return artifacts, rows.Err()
+}
+
+// CountArtifactsMulti is the counterpart to ListArtifactsMulti.
+func (db *Database) CountArtifactsMulti(registryIDs []string, opts ListOptions) (int, error) {
+	if len(registryIDs) == 0 {
+		return 0, nil
+	}
+
+	query := `SELECT COUNT(*) FROM artifacts WHERE registry_id = ANY($1)`
+	params := []any{registryIDs}
+
+	if opts.Namespace != "" {
+		query += ` AND namespace = $` + fmt.Sprintf("%d", len(params)+1)
+		params = append(params, opts.Namespace)
+	}
+
+	if opts.ArtifactType != "" {
+		query += ` AND artifact_type = $` + fmt.Sprintf("%d", len(params)+1)
+		params = append(params, opts.ArtifactType)
+	}
+
+	var count int
+	err := db.pool.QueryRow(context.Background(), query, params...).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count artifacts: %w", err)
+	}
+	return count, nil
 }
 
 // SearchOptions for artifact search
@@ -282,7 +376,7 @@ type SearchResults struct {
 // SearchArtifacts searches artifacts by query string using tsvector index
 func (db *Database) SearchArtifacts(query string, opts SearchOptions) ([]ArtifactMetadata, error) {
 	searchQuery := `SELECT id, registry_id, artifact_type, namespace, artifact_name, version,
-					 digest, digest_algorithm, size, created, updated, metadata, tags, signatures
+					 digest, digest_algorithm, size, created, updated, metadata, tags, signatures, downloads
 				  FROM artifacts
 				  WHERE to_tsvector('english', artifact_name || ' ' || namespace) @@ to_tsquery('english', $1)`
 
@@ -323,7 +417,7 @@ func (db *Database) SearchArtifacts(query string, opts SearchOptions) ([]Artifac
 		var a ArtifactMetadata
 		err := rows.Scan(&a.ID, &a.RegistryID, &a.ArtifactType, &a.Namespace,
 			&a.ArtifactName, &a.Version, &a.Digest, &a.DigestAlgorithm, &a.Size,
-			&a.Created, &a.Updated, &a.Metadata, &a.Tags, &a.Signatures)
+			&a.Created, &a.Updated, &a.Metadata, &a.Tags, &a.Signatures, &a.Downloads)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan artifact: %w", err)
 		}
@@ -359,12 +453,43 @@ func (db *Database) SearchCount(query string, opts SearchOptions) (int, error) {
 	return count, nil
 }
 
+// AutocompleteArtifacts returns distinct artifact names matching a prefix, for search-as-you-type suggestions
+func (db *Database) AutocompleteArtifacts(prefix string, limit int) ([]string, error) {
+	query := `
+		SELECT DISTINCT artifact_name
+		FROM artifacts
+		WHERE artifact_name ILIKE $1
+		ORDER BY artifact_name
+		LIMIT $2
+	`
+
+	rows, err := db.pool.Query(context.Background(), query, prefix+"%", limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to autocomplete artifacts: %w", err)
+	}
+	defer rows.Close()
+
+	suggestions := []string{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("failed to scan suggestion: %w", err)
+		}
+		suggestions = append(suggestions, name)
+	}
+
+	return suggestions, rows.Err()
+}
+
 // SaveArtifact inserts or updates artifact metadata with tsvector generation
 func (db *Database) SaveArtifact(metadata *ArtifactMetadata) error {
 	if metadata.ID == "" {
 		metadata.ID = generateUUID()
 	}
 	metadata.Updated = time.Now()
+	if metadata.Signatures == nil {
+		metadata.Signatures = []Signature{}
+	}
 
 	// Generate tsvector from artifact_name and namespace for full-text search
 	_, err := db.pool.Exec(
@@ -441,6 +566,94 @@ func (db *Database) UpdateArtifactTags(registryID, namespace, artifactName, vers
 		return fmt.Errorf("failed to update artifact tags: %w", err)
 	}
 	return nil
+}
+
+// IncrementArtifactDownloads atomically bumps the pull/download counter for
+// one artifact version. Called from proxy handlers at the point they serve
+// artifact bytes to a client.
+func (db *Database) IncrementArtifactDownloads(registryID, namespace, artifactName, version string) error {
+	_, err := db.pool.Exec(
+		context.Background(),
+		`UPDATE artifacts SET downloads = downloads + 1
+		 WHERE registry_id = $1 AND namespace = $2 AND artifact_name = $3 AND version = $4`,
+		registryID, namespace, artifactName, version,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to increment artifact downloads: %w", err)
+	}
+	return nil
+}
+
+// TopArtifactsByDownloads returns the N most-pulled artifact versions across
+// every registry, ordered by download count descending, for the Stats page
+// leaderboard.
+func (db *Database) TopArtifactsByDownloads(limit int) ([]ArtifactMetadata, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	rows, err := db.pool.Query(
+		context.Background(),
+		`SELECT id, registry_id, artifact_type, namespace, artifact_name, version,
+			 digest, digest_algorithm, size, created, updated, metadata, tags, signatures, downloads
+		 FROM artifacts
+		 WHERE downloads > 0
+		 ORDER BY downloads DESC
+		 LIMIT $1`,
+		limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list top artifacts: %w", err)
+	}
+	defer rows.Close()
+
+	var artifacts []ArtifactMetadata
+	for rows.Next() {
+		var a ArtifactMetadata
+		err := rows.Scan(&a.ID, &a.RegistryID, &a.ArtifactType, &a.Namespace,
+			&a.ArtifactName, &a.Version, &a.Digest, &a.DigestAlgorithm, &a.Size,
+			&a.Created, &a.Updated, &a.Metadata, &a.Tags, &a.Signatures, &a.Downloads)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan artifact: %w", err)
+		}
+		artifacts = append(artifacts, a)
+	}
+	return artifacts, rows.Err()
+}
+
+// TotalDownloads sums the download counter across every artifact version.
+func (db *Database) TotalDownloads() (int64, error) {
+	var total int64
+	err := db.pool.QueryRow(context.Background(), `SELECT COALESCE(SUM(downloads), 0) FROM artifacts`).Scan(&total)
+	if err != nil {
+		return 0, fmt.Errorf("failed to sum artifact downloads: %w", err)
+	}
+	return total, nil
+}
+
+// IncrementBandwidthSaved atomically adds to the running total of bytes
+// served from local storage on a cache hit — i.e. bytes that did not need to
+// be re-fetched from an upstream registry. Called by the storage tracking
+// adapter (see pkg/storage/tracking.go) on every successful GetArtifact.
+func (db *Database) IncrementBandwidthSaved(bytes int64) error {
+	_, err := db.pool.Exec(
+		context.Background(),
+		`UPDATE stats SET bandwidth_saved_bytes = bandwidth_saved_bytes + $1 WHERE id = 1`,
+		bytes,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to record bandwidth saved: %w", err)
+	}
+	return nil
+}
+
+// GetBandwidthSaved returns the cumulative bytes served from cache.
+func (db *Database) GetBandwidthSaved() (int64, error) {
+	var total int64
+	err := db.pool.QueryRow(context.Background(), `SELECT bandwidth_saved_bytes FROM stats WHERE id = 1`).Scan(&total)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get bandwidth saved: %w", err)
+	}
+	return total, nil
 }
 
 // GetUserByID retrieves a user by ID
@@ -688,11 +901,22 @@ func (db *Database) ListUserAccessKeys(userID string) ([]AccessKey, error) {
 
 // ListRegistries lists all enabled registries with ordering
 func (db *Database) ListRegistries() ([]RegistryConfig, error) {
+	return db.listRegistries("WHERE enabled = TRUE ")
+}
+
+// ListAllRegistries lists every registry regardless of enabled state, for
+// admin management UIs that need to show (and re-enable) disabled
+// registries rather than have them disappear entirely.
+func (db *Database) ListAllRegistries() ([]RegistryConfig, error) {
+	return db.listRegistries("")
+}
+
+func (db *Database) listRegistries(whereClause string) ([]RegistryConfig, error) {
 	rows, err := db.pool.Query(
 		context.Background(),
 		`SELECT id, name, url, type, enabled, priority, private, proxy, COALESCE(host, ''),
 		        upstream_auth_type, COALESCE(upstream_username, ''), (upstream_secret IS NOT NULL AND upstream_secret != '')
-		 FROM registries WHERE enabled = TRUE ORDER BY priority ASC`,
+		 FROM registries `+whereClause+`ORDER BY priority ASC`,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list registries: %w", err)
@@ -759,6 +983,33 @@ func (db *Database) GetRegistryByHost(host string) (*RegistryConfig, error) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("failed to get registry by host: %w", err)
+	}
+	r.HasUpstreamSecret = r.UpstreamSecret != ""
+	return &r, nil
+}
+
+// GetDefaultRegistry retrieves the highest-priority enabled, non-private,
+// proxy-enabled registry of the given type — the fallback target for
+// protocol-proxy requests that don't match any registry's bound Host.
+func (db *Database) GetDefaultRegistry(artifactType string) (*RegistryConfig, error) {
+	row := db.pool.QueryRow(
+		context.Background(),
+		`SELECT id, name, url, type, enabled, priority, private, proxy, COALESCE(host, ''),
+		        upstream_auth_type, COALESCE(upstream_username, ''), COALESCE(upstream_secret, '')
+		 FROM registries
+		 WHERE type = $1 AND enabled = TRUE AND private = FALSE AND proxy = TRUE
+		 ORDER BY priority ASC LIMIT 1`,
+		artifactType,
+	)
+
+	var r RegistryConfig
+	err := row.Scan(&r.ID, &r.Name, &r.URL, &r.Type, &r.Enabled, &r.Priority, &r.Private, &r.Proxy, &r.Host,
+		&r.UpstreamAuthType, &r.UpstreamUsername, &r.UpstreamSecret)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get default registry: %w", err)
 	}
 	r.HasUpstreamSecret = r.UpstreamSecret != ""
 	return &r, nil
@@ -1089,7 +1340,7 @@ func (db *Database) RemoveRolePermission(roleID, permission string) error {
 func (db *Database) GetPendingReplicationArtifacts(limit int) ([]ArtifactMetadata, error) {
 	query := `
 		SELECT id, registry_id, artifact_type, namespace, artifact_name, version,
-			   digest, digest_algorithm, size, created, updated, metadata, tags, signatures
+			   digest, digest_algorithm, size, created, updated, metadata, tags, signatures, downloads
 		FROM artifacts
 		WHERE id NOT IN (
 			SELECT artifact_id FROM replication_status WHERE status = 'complete'
@@ -1109,7 +1360,7 @@ func (db *Database) GetPendingReplicationArtifacts(limit int) ([]ArtifactMetadat
 		var a ArtifactMetadata
 		err := rows.Scan(&a.ID, &a.RegistryID, &a.ArtifactType, &a.Namespace,
 			&a.ArtifactName, &a.Version, &a.Digest, &a.DigestAlgorithm, &a.Size,
-			&a.Created, &a.Updated, &a.Metadata, &a.Tags, &a.Signatures)
+			&a.Created, &a.Updated, &a.Metadata, &a.Tags, &a.Signatures, &a.Downloads)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan artifact: %w", err)
 		}
@@ -1158,7 +1409,7 @@ func (db *Database) GetArtifact(id string) (*ArtifactMetadata, error) {
 	row := db.pool.QueryRow(
 		context.Background(),
 		`SELECT id, registry_id, artifact_type, namespace, artifact_name, version,
-			 digest, digest_algorithm, size, created, updated, metadata, tags, signatures
+			 digest, digest_algorithm, size, created, updated, metadata, tags, signatures, downloads
 		 FROM artifacts WHERE id = $1`,
 		id,
 	)
@@ -1168,7 +1419,7 @@ func (db *Database) GetArtifact(id string) (*ArtifactMetadata, error) {
 		&artifact.ID, &artifact.RegistryID, &artifact.ArtifactType,
 		&artifact.Namespace, &artifact.ArtifactName, &artifact.Version,
 		&artifact.Digest, &artifact.DigestAlgorithm, &artifact.Size,
-		&artifact.Created, &artifact.Updated, &artifact.Metadata, &artifact.Tags, &artifact.Signatures,
+		&artifact.Created, &artifact.Updated, &artifact.Metadata, &artifact.Tags, &artifact.Signatures, &artifact.Downloads,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -1373,36 +1624,58 @@ func (db *Database) ListArtifactsCursor(opts CursorPaginationOptions) ([]Artifac
 		opts.Order = "desc"
 	}
 
-	// Build query with cursor
-	var query string
-	var args []any
-	var cursorCondition string
+	// registryIDs == non-nil-but-empty means the caller has no readable
+	// registries at all (e.g. an anonymous caller with only private
+	// registries configured) — short-circuit rather than running an
+	// `= ANY($1)` with an empty array that Postgres would happily match zero
+	// rows against anyway, just without the early return.
+	if opts.RegistryIDs != nil && len(opts.RegistryIDs) == 0 {
+		return nil, "", false, nil
+	}
+
+	// args[0] is always the LIMIT; every other placeholder is numbered
+	// relative to its own append so this stays correct regardless of which
+	// optional filters are present.
+	args := []any{opts.Limit + 1}
+	var conditions string
+
+	if opts.RegistryIDs != nil {
+		args = append(args, opts.RegistryIDs)
+		conditions += fmt.Sprintf(" AND a.registry_id = ANY($%d)", len(args))
+	}
+
+	if opts.Namespace != "" {
+		args = append(args, opts.Namespace)
+		conditions += fmt.Sprintf(" AND a.namespace = $%d", len(args))
+	}
+
+	if opts.ArtifactType != "" {
+		args = append(args, opts.ArtifactType)
+		conditions += fmt.Sprintf(" AND a.artifact_type = $%d", len(args))
+	}
 
 	if opts.Cursor != "" {
 		// Decode cursor and add WHERE condition
 		cursorTime, _, err := decodeCursor(opts.Cursor)
 		if err == nil {
-			if opts.Order == "desc" {
-				cursorCondition = fmt.Sprintf(" AND a.%s < $%d", opts.OrderBy, len(args)+3)
-			} else {
-				cursorCondition = fmt.Sprintf(" AND a.%s > $%d", opts.OrderBy, len(args)+3)
-			}
 			args = append(args, cursorTime)
+			if opts.Order == "desc" {
+				conditions += fmt.Sprintf(" AND a.%s < $%d", opts.OrderBy, len(args))
+			} else {
+				conditions += fmt.Sprintf(" AND a.%s > $%d", opts.OrderBy, len(args))
+			}
 		}
 	}
 
 	// Main query with LIMIT + 1 for "has next" detection
-	query = fmt.Sprintf(`
+	query := fmt.Sprintf(`
 		SELECT a.id, a.registry_id, a.artifact_type, a.namespace, a.artifact_name, a.version,
 			   a.digest, a.digest_algorithm, a.size, a.created, a.updated, a.metadata, a.tags, a.signatures
 		FROM artifacts a
 		WHERE 1=1%s
 		ORDER BY a.%s %s
 		LIMIT $1`,
-		cursorCondition, opts.OrderBy, opts.Order)
-
-	// Add limit + 1 to detect if there are more results
-	args = append([]any{opts.Limit + 1}, args...)
+		conditions, opts.OrderBy, opts.Order)
 
 	rows, err := db.pool.Query(context.Background(), query, args...)
 	if err != nil {
@@ -1415,7 +1688,7 @@ func (db *Database) ListArtifactsCursor(opts CursorPaginationOptions) ([]Artifac
 		var a ArtifactMetadata
 		err := rows.Scan(&a.ID, &a.RegistryID, &a.ArtifactType, &a.Namespace,
 			&a.ArtifactName, &a.Version, &a.Digest, &a.DigestAlgorithm, &a.Size,
-			&a.Created, &a.Updated, &a.Metadata, &a.Tags, &a.Signatures)
+			&a.Created, &a.Updated, &a.Metadata, &a.Tags, &a.Signatures, &a.Downloads)
 		if err != nil {
 			return nil, "", false, fmt.Errorf("failed to scan artifact: %w", err)
 		}
@@ -1573,4 +1846,351 @@ func (db *Database) RecordVulnDBUpdateResult(checkedAt time.Time, succeeded bool
 		return fmt.Errorf("failed to record vulnerability DB update result: %w", err)
 	}
 	return nil
+}
+
+// GetVulnScanSettings returns the singleton vulnerability-scan settings row.
+func (db *Database) GetVulnScanSettings() (*VulnScanSettings, error) {
+	row := db.pool.QueryRow(
+		context.Background(),
+		`SELECT auto_scan_enabled, scan_interval_hours, last_checked_at, last_scan_at, last_error
+		 FROM vulnerability_scan_settings WHERE id = 1`,
+	)
+
+	var s VulnScanSettings
+	err := row.Scan(&s.AutoScanEnabled, &s.ScanIntervalHours, &s.LastCheckedAt, &s.LastScanAt, &s.LastError)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get vulnerability scan settings: %w", err)
+	}
+	return &s, nil
+}
+
+// UpdateVulnScanSettings persists the user-tunable fields (auto-scan toggle
+// and rescan interval). Status fields (last checked/scanned/error) are only
+// ever written by RecordVulnScanResult.
+func (db *Database) UpdateVulnScanSettings(autoScanEnabled bool, intervalHours int) error {
+	_, err := db.pool.Exec(
+		context.Background(),
+		`UPDATE vulnerability_scan_settings SET auto_scan_enabled = $1, scan_interval_hours = $2 WHERE id = 1`,
+		autoScanEnabled, intervalHours,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update vulnerability scan settings: %w", err)
+	}
+	return nil
+}
+
+// RecordVulnScanResult stamps the outcome of a rescan sweep.
+func (db *Database) RecordVulnScanResult(checkedAt time.Time, succeeded bool, errMsg string) error {
+	var err error
+	if succeeded {
+		_, err = db.pool.Exec(
+			context.Background(),
+			`UPDATE vulnerability_scan_settings SET last_checked_at = $1, last_scan_at = $1, last_error = '' WHERE id = 1`,
+			checkedAt,
+		)
+	} else {
+		_, err = db.pool.Exec(
+			context.Background(),
+			`UPDATE vulnerability_scan_settings SET last_checked_at = $1, last_error = $2 WHERE id = 1`,
+			checkedAt, errMsg,
+		)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to record vulnerability scan result: %w", err)
+	}
+	return nil
+}
+
+// GetSearchIndexSettings returns the singleton search-index reindex settings row.
+func (db *Database) GetSearchIndexSettings() (*SearchIndexSettings, error) {
+	row := db.pool.QueryRow(
+		context.Background(),
+		`SELECT auto_reindex_enabled, reindex_interval_hours, last_checked_at, last_reindexed_at, last_artifact_count, last_error
+		 FROM search_index_settings WHERE id = 1`,
+	)
+
+	var s SearchIndexSettings
+	err := row.Scan(&s.AutoReindexEnabled, &s.ReindexIntervalHours, &s.LastCheckedAt, &s.LastReindexedAt, &s.LastArtifactCount, &s.LastError)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get search index settings: %w", err)
+	}
+	return &s, nil
+}
+
+// UpdateSearchIndexSettings persists the user-tunable fields (auto-reindex
+// toggle and refresh interval). Status fields are only ever written by
+// RecordSearchIndexUpdateResult.
+func (db *Database) UpdateSearchIndexSettings(autoReindexEnabled bool, intervalHours int) error {
+	_, err := db.pool.Exec(
+		context.Background(),
+		`UPDATE search_index_settings SET auto_reindex_enabled = $1, reindex_interval_hours = $2 WHERE id = 1`,
+		autoReindexEnabled, intervalHours,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update search index settings: %w", err)
+	}
+	return nil
+}
+
+// RecordSearchIndexUpdateResult stamps the outcome of a reindex attempt.
+func (db *Database) RecordSearchIndexUpdateResult(checkedAt time.Time, succeeded bool, artifactCount int, errMsg string) error {
+	var err error
+	if succeeded {
+		_, err = db.pool.Exec(
+			context.Background(),
+			`UPDATE search_index_settings SET last_checked_at = $1, last_reindexed_at = $1, last_artifact_count = $2, last_error = '' WHERE id = 1`,
+			checkedAt, artifactCount,
+		)
+	} else {
+		_, err = db.pool.Exec(
+			context.Background(),
+			`UPDATE search_index_settings SET last_checked_at = $1, last_error = $2 WHERE id = 1`,
+			checkedAt, errMsg,
+		)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to record search index update result: %w", err)
+	}
+	return nil
+}
+
+// RebuildSearchIndex recomputes the search_vector tsvector for every
+// artifact row from its current artifact_name/namespace, then returns how
+// many rows were touched. Needed because rows written before search_vector
+// existed (or via the legacy no-tsvector fallback in SaveArtifact) never get
+// one populated otherwise.
+func (db *Database) RebuildSearchIndex() (int, error) {
+	tag, err := db.pool.Exec(
+		context.Background(),
+		`UPDATE artifacts SET search_vector = to_tsvector('english', artifact_name || ' ' || namespace)`,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("failed to rebuild search index: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
+// GetBackupSettings returns the singleton scheduled-backup settings row.
+func (db *Database) GetBackupSettings() (*BackupSettings, error) {
+	row := db.pool.QueryRow(
+		context.Background(),
+		`SELECT auto_backup_enabled, backup_interval_hours, last_checked_at, last_backup_at, last_backup_path, last_error, storage_type, storage_config
+		 FROM backup_settings WHERE id = 1`,
+	)
+
+	var s BackupSettings
+	var storageConfigRaw []byte
+	err := row.Scan(&s.AutoBackupEnabled, &s.BackupIntervalHours, &s.LastCheckedAt, &s.LastBackupAt, &s.LastBackupPath, &s.LastError, &s.StorageType, &storageConfigRaw)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get backup settings: %w", err)
+	}
+	s.StorageConfig = map[string]string{}
+	if len(storageConfigRaw) > 0 {
+		if err := json.Unmarshal(storageConfigRaw, &s.StorageConfig); err != nil {
+			return nil, fmt.Errorf("failed to parse backup storage config: %w", err)
+		}
+	}
+	return &s, nil
+}
+
+// UpdateBackupSettings persists the user-tunable fields (auto-backup toggle
+// and interval). Status fields are only ever written by RecordBackupResult.
+func (db *Database) UpdateBackupSettings(autoBackupEnabled bool, intervalHours int) error {
+	_, err := db.pool.Exec(
+		context.Background(),
+		`UPDATE backup_settings SET auto_backup_enabled = $1, backup_interval_hours = $2 WHERE id = 1`,
+		autoBackupEnabled, intervalHours,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update backup settings: %w", err)
+	}
+	return nil
+}
+
+// UpdateBackupStorageSettings persists the backup destination: storageType
+// ("" reuses the main artifact storage adapter, or "local"/"s3"/"gcs"/"azure")
+// and its config map (storage.New's key/value config for that type).
+func (db *Database) UpdateBackupStorageSettings(storageType string, storageConfig map[string]string) error {
+	if storageConfig == nil {
+		storageConfig = map[string]string{}
+	}
+	raw, err := json.Marshal(storageConfig)
+	if err != nil {
+		return fmt.Errorf("failed to encode backup storage config: %w", err)
+	}
+	_, err = db.pool.Exec(
+		context.Background(),
+		`UPDATE backup_settings SET storage_type = $1, storage_config = $2 WHERE id = 1`,
+		storageType, raw,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update backup storage settings: %w", err)
+	}
+	return nil
+}
+
+// RecordBackupResult stamps the outcome of a backup attempt.
+func (db *Database) RecordBackupResult(checkedAt time.Time, succeeded bool, path string, errMsg string) error {
+	var err error
+	if succeeded {
+		_, err = db.pool.Exec(
+			context.Background(),
+			`UPDATE backup_settings SET last_checked_at = $1, last_backup_at = $1, last_backup_path = $2, last_error = '' WHERE id = 1`,
+			checkedAt, path,
+		)
+	} else {
+		_, err = db.pool.Exec(
+			context.Background(),
+			`UPDATE backup_settings SET last_checked_at = $1, last_error = $2 WHERE id = 1`,
+			checkedAt, errMsg,
+		)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to record backup result: %w", err)
+	}
+	return nil
+}
+
+// backupTables lists every application table included in a full logical
+// backup, in FK-safe insert order (parents before children). There is no
+// schema introspection here -- a new table needs a line added -- which
+// keeps dump/restore behavior predictable and reviewable rather than
+// silently picking up whatever information_schema returns.
+var backupTables = []string{
+	"roles", "permissions", "role_permissions",
+	"users", "user_roles", "access_keys",
+	"registries", "registry_access",
+	"artifacts", "vulnerability_scans", "audit_log",
+	"vulnerability_db_settings", "search_index_settings",
+	"vulnerability_scan_settings", "backup_settings",
+}
+
+// DumpStatements returns cargobay's own logical database dump: a TRUNCATE
+// for every backupTables entry (child-to-parent order, so each succeeds
+// without needing CASCADE) followed by one INSERT per row, in backupTables
+// (parent-to-child) order. This is not pg_dump-compatible -- the runtime
+// image doesn't bundle the pg_dump/pg_restore client tools (see Dockerfile,
+// which only adds the trivy CLI) -- so backend/pkg/backup uses this instead
+// of shelling out, and writes the result through the existing
+// storage.StorageAdapter.
+func (db *Database) DumpStatements(ctx context.Context) ([]string, error) {
+	statements := make([]string, 0, len(backupTables)*2)
+
+	for i := len(backupTables) - 1; i >= 0; i-- {
+		statements = append(statements, fmt.Sprintf("TRUNCATE TABLE %s", backupTables[i]))
+	}
+
+	for _, table := range backupTables {
+		rows, err := db.pool.Query(ctx, fmt.Sprintf("SELECT * FROM %s", table))
+		if err != nil {
+			return nil, fmt.Errorf("failed to read table %s: %w", table, err)
+		}
+
+		fields := rows.FieldDescriptions()
+		columns := make([]string, len(fields))
+		for i, f := range fields {
+			columns[i] = string(f.Name)
+		}
+
+		for rows.Next() {
+			values, err := rows.Values()
+			if err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("failed to read row from %s: %w", table, err)
+			}
+			literals := make([]string, len(values))
+			for i, v := range values {
+				literals[i] = sqlLiteral(v)
+			}
+			statements = append(statements, fmt.Sprintf(
+				"INSERT INTO %s (%s) VALUES (%s)",
+				table, strings.Join(columns, ", "), strings.Join(literals, ", "),
+			))
+		}
+		rowErr := rows.Err()
+		rows.Close()
+		if rowErr != nil {
+			return nil, fmt.Errorf("failed to read table %s: %w", table, rowErr)
+		}
+	}
+
+	return statements, nil
+}
+
+// RestoreStatements runs every statement produced by DumpStatements (as
+// loaded from a stored backup) inside a single transaction, so a failure
+// partway through leaves the database exactly as it was rather than
+// half-restored.
+func (db *Database) RestoreStatements(ctx context.Context, statements []string) error {
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin restore transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	for _, stmt := range statements {
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			return fmt.Errorf("restore statement failed: %w", err)
+		}
+	}
+
+	return tx.Commit(ctx)
+}
+
+// sqlLiteral formats a single pgx-decoded column value as a SQL literal for
+// use in a generated INSERT statement. Untyped string/array literals are
+// implicitly cast to the target column's real type (jsonb, text[], etc.) by
+// Postgres, so this doesn't need to know each column's declared type.
+func sqlLiteral(v interface{}) string {
+	switch val := v.(type) {
+	case nil:
+		return "NULL"
+	case bool:
+		if val {
+			return "TRUE"
+		}
+		return "FALSE"
+	case string:
+		return quoteSQLString(val)
+	case []byte:
+		return quoteSQLString(string(val))
+	case int16:
+		return strconv.FormatInt(int64(val), 10)
+	case int32:
+		return strconv.FormatInt(int64(val), 10)
+	case int64:
+		return strconv.FormatInt(val, 10)
+	case int:
+		return strconv.Itoa(val)
+	case float32:
+		return strconv.FormatFloat(float64(val), 'f', -1, 32)
+	case float64:
+		return strconv.FormatFloat(val, 'f', -1, 64)
+	case time.Time:
+		return quoteSQLString(val.UTC().Format(time.RFC3339Nano))
+	case []string:
+		return quoteSQLString(pgTextArrayLiteral(val))
+	default:
+		encoded, err := json.Marshal(val)
+		if err != nil {
+			return "NULL"
+		}
+		return quoteSQLString(string(encoded))
+	}
+}
+
+func quoteSQLString(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+// pgTextArrayLiteral renders a Postgres array literal body (without the
+// surrounding SQL string quotes) for a text[] column value.
+func pgTextArrayLiteral(items []string) string {
+	parts := make([]string, len(items))
+	for i, item := range items {
+		esc := strings.ReplaceAll(item, `\`, `\\`)
+		esc = strings.ReplaceAll(esc, `"`, `\"`)
+		parts[i] = `"` + esc + `"`
+	}
+	return "{" + strings.Join(parts, ",") + "}"
 }

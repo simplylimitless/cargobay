@@ -3,19 +3,25 @@ package middleware
 import (
 	"fmt"
 	"net/http"
+	"runtime"
 	"sync"
 	"time"
 )
 
 // MetricsMiddleware tracks request metrics
 var (
-	requestsTotal   = make(map[string]int64)
-	requestDuration = make(map[string][]float64)
-	cacheHits       int64
-	cacheMisses     int64
-	startTime       = time.Now()
-	mu              sync.Mutex
+	requestsTotal      = make(map[string]int64)
+	requestDuration    = make(map[string][]float64)
+	startTime          = time.Now()
+	mu                 sync.Mutex
+	cacheStatsProvider func() (hits, misses, errors int64)
 )
+
+// RegisterCacheStatsProvider wires the cache package's real hit/miss/error
+// counters into /metrics. Called once at startup from main.go.
+func RegisterCacheStatsProvider(f func() (hits, misses, errors int64)) {
+	cacheStatsProvider = f
+}
 
 // PrometheusMiddleware is an HTTP middleware for Prometheus metrics
 func PrometheusMiddleware(next http.Handler) http.Handler {
@@ -82,13 +88,30 @@ func MetricsHandler(w http.ResponseWriter, r *http.Request) {
 	mu.Unlock()
 
 	// Cache metrics
-	lines = append(lines, "# HELP cargobay_cache_hits_total Cache hits")
-	lines = append(lines, "# TYPE cargobay_cache_hits_total counter")
-	lines = append(lines, fmt.Sprintf(`cargobay_cache_hits_total %d`, cacheHits))
+	if cacheStatsProvider != nil {
+		hits, misses, errs := cacheStatsProvider()
 
-	lines = append(lines, "# HELP cargobay_cache_misses_total Cache misses")
-	lines = append(lines, "# TYPE cargobay_cache_misses_total counter")
-	lines = append(lines, fmt.Sprintf(`cargobay_cache_misses_total %d`, cacheMisses))
+		lines = append(lines, "# HELP cargobay_cache_hits_total Cache hits")
+		lines = append(lines, "# TYPE cargobay_cache_hits_total counter")
+		lines = append(lines, fmt.Sprintf(`cargobay_cache_hits_total %d`, hits))
+
+		lines = append(lines, "# HELP cargobay_cache_misses_total Cache misses")
+		lines = append(lines, "# TYPE cargobay_cache_misses_total counter")
+		lines = append(lines, fmt.Sprintf(`cargobay_cache_misses_total %d`, misses))
+
+		lines = append(lines, "# HELP cargobay_cache_errors_total Cache errors")
+		lines = append(lines, "# TYPE cargobay_cache_errors_total counter")
+		lines = append(lines, fmt.Sprintf(`cargobay_cache_errors_total %d`, errs))
+
+		total := hits + misses
+		hitRate := 0.0
+		if total > 0 {
+			hitRate = float64(hits) / float64(total)
+		}
+		lines = append(lines, "# HELP cargobay_cache_hit_rate Cache hit rate (0-1)")
+		lines = append(lines, "# TYPE cargobay_cache_hit_rate gauge")
+		lines = append(lines, fmt.Sprintf(`cargobay_cache_hit_rate %.4f`, hitRate))
+	}
 
 	// Memory metrics
 	lines = append(lines, "# HELP cargobay_memory_usage_bytes Memory usage in bytes")
@@ -115,8 +138,9 @@ func joinLines(lines []string) string {
 }
 
 func memoryUsage() uint64 {
-	// In production, use gopsutil or similar
-	return 0
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return m.Alloc
 }
 
 // responseWriter wraps http.ResponseWriter to capture status code
@@ -130,16 +154,3 @@ func (w *responseWriter) WriteHeader(code int) {
 	w.ResponseWriter.WriteHeader(code)
 }
 
-// RecordCacheHit records a cache hit
-func RecordCacheHit() {
-	mu.Lock()
-	defer mu.Unlock()
-	cacheHits++
-}
-
-// RecordCacheMiss records a cache miss
-func RecordCacheMiss() {
-	mu.Lock()
-	defer mu.Unlock()
-	cacheMisses++
-}

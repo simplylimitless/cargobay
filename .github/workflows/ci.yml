@@ -1,42 +1,106 @@
-name: CI
+name: CI/CD
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, master]
     paths-ignore:
-      - '**.md'
-      - 'charts/**'
+      - 'docs/**'
+      - 'README.md'
+      - 'LICENSE'
   pull_request:
-    branches: [main]
+    branches: [main, master]
     paths-ignore:
-      - '**.md'
-      - 'charts/**'
+      - 'docs/**'
+      - 'README.md'
+      - 'LICENSE'
+  workflow_dispatch:
+
+env:
+  BACKEND_URL: http://localhost:4500
+  POSTGRES_HOST: localhost
+  POSTGRES_PORT: 5432
+  POSTGRES_DB: cargobay_test
+  POSTGRES_USER: cargobay
+  POSTGRES_PASSWORD: cargobay
+  REDIS_HOST: localhost
+  REDIS_PORT: 6379
 
 jobs:
-  test:
-    name: Run Tests
+  # Linting
+  lint:
+    name: Lint Code
     runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Run Go fmt
+        run: |
+          cd backend
+          gofmt -l ./pkg/... ./cmd/... ./tests/...
+
+      - name: Run Go vet
+        run: |
+          cd backend
+          go vet ./pkg/... ./cmd/... ./tests/...
+
+      - name: Run Go lint
+        uses: golangci/golangci-lint-action@v4
+        with:
+          version: latest
+          working-directory: backend
+          skip-cache: true
+          args: --timeout=5m
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci --ignore-scripts
+
+      - name: Run frontend lint
+        working-directory: frontend
+        run: npm run lint
+
+  # Backend tests
+  backend-test:
+    name: Backend Tests
+    runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:15-alpine
+        image: postgres:15
         env:
           POSTGRES_USER: cargobay
-          POSTGRES_PASSWORD: password
-          POSTGRES_DB: cargobay
+          POSTGRES_PASSWORD: cargobay
+          POSTGRES_DB: cargobay_test
         ports:
           - 5432:5432
         options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+          --health-cmd="pg_isready -U cargobay -d cargobay_test"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
 
       redis:
         image: redis:7-alpine
         ports:
           - 6379:6379
-        options: --health-cmd "redis-cli ping" --health-interval 10s --health-timeout 5s --health-retries 5
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
 
     steps:
       - name: Checkout code
@@ -46,95 +110,95 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.21'
+          cache: true
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
+      - name: Wait for PostgreSQL
+        run: |
+          until pg_isready -h localhost -p 5432 -U cargobay; do
+            echo "Waiting for PostgreSQL..."
+            sleep 2
+          done
 
-      - name: Cache Go modules
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
+      - name: Wait for Redis
+        run: |
+          until redis-cli -h localhost ping; do
+            echo "Waiting for Redis..."
+            sleep 2
+          done
 
-      - name: Download Go modules
-        working-directory: ./backend
+      - name: Install dependencies
+        working-directory: backend
         run: go mod download
 
-      - name: Run unit tests
-        working-directory: ./backend
-        run: go test -v ./pkg/... -timeout 60s
-
-      - name: Run integration tests
-        working-directory: ./backend
-        run: go test -tags=integration -v ./pkg/integration/... -timeout 120s
-
-      - name: Run E2E tests
-        working-directory: ./tests/e2e
-        run: go test -v ./... -timeout 120s
-
-      - name: Build backend
-        working-directory: ./backend
-        run: go build -o ../bin/cargobay ./cmd/server/main.go
-
-      - name: Build frontend
-        working-directory: ./frontend
+      - name: Run backend tests
+        working-directory: backend
+        env:
+          DATABASE_URL: "postgres://cargobay:cargobay@localhost:5432/cargobay_test?sslmode=disable"
+          REDIS_URL: "redis://localhost:6379"
         run: |
-          npm ci
-          npm run build
+          go test -v -race -coverprofile=coverage.out ./pkg/... ./cmd/... ./tests/...
+          go tool cover -func=coverage.out | tail -n +2 | awk '{sum += $3} END {print "Total coverage: " sum "%"}'
 
-  lint:
-    name: Lint Code
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./backend/coverage.out
+          flags: backend
+          name: backend-coverage
+          fail_ci_if_error: false
+
+  # Frontend tests
+  frontend-test:
+    name: Frontend Tests
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.21'
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
 
-      - name: Go fmt check
-        run: |
-          go fmt ./...
-          if [ -n "$(git status --porcelain)" ]; then
-            echo "Code not formatted. Run 'go fmt ./...' and commit changes."
-            exit 1
-          fi
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
 
-      - name: Go vet
-        working-directory: ./backend
-        run: go vet ./...
+      - name: Run frontend unit tests
+        working-directory: frontend
+        run: npm test -- --coverage --watch=false
 
-      - name: Install golangci-lint
-        run: |
-          go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.55.2
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
 
-      - name: Run golangci-lint
-        working-directory: ./backend
-        run: golangci-lint run -E gofmt,goimports,misspell
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-build
+          path: frontend/dist/
+          retention-days: 7
 
-      - name: ESLint
-        working-directory: ./frontend
-        run: |
-          npm ci
-          npm run lint
-
-  security:
-    name: Security Scan
+  # E2E tests
+  e2e-test:
+    name: E2E Tests
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: cargobay
+          POSTGRES_PASSWORD: cargobay
+          POSTGRES_DB: cargobay_test
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
 
     steps:
       - name: Checkout code
@@ -144,23 +208,95 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.21'
+          cache: true
 
-      - name: Run gosec security scanner
-        uses: securego/gosec@master
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
         with:
-          args: ./backend/...
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
 
-      - name: Run npm audit
-        working-directory: ./frontend
+      - name: Install dependencies
+        working-directory: backend
+        run: go mod download
+
+      - name: Build backend
+        working-directory: backend
+        run: go build -o ../bin/cargobay ./cmd/server/main.go
+
+      - name: Start services
         run: |
-          npm ci
-          npm audit --audit-level=high || true
+          docker compose up -d
+        working-directory: .
 
-  docker:
-    name: Build Docker Images
+      - name: Wait for services
+        run: |
+          until curl -s http://localhost:4500/api/v1/health | grep -q '"status":"ok"'; do
+            echo "Waiting for backend..."
+            sleep 2
+          done
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Install Playwright browsers
+        working-directory: frontend
+        run: npx playwright install --with-deps
+
+      - name: Run E2E tests
+        working-directory: frontend
+        env:
+          PLAYWRIGHT_TEST_BASE_URL: http://localhost:5173
+        run: npx playwright test
+
+      - name: Upload E2E test results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: frontend/playwright-report/
+          retention-days: 7
+
+  # Build matrix
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        go-version: ['1.21', '1.22']
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: true
+
+      - name: Install dependencies
+        working-directory: backend
+        run: go mod download
+
+      - name: Build backend
+        working-directory: backend
+        run: go build -o cargobay ./cmd/server/main.go
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargobay-${{ matrix.os }}-${{ matrix.go-version }}
+          path: backend/cargobay
+          retention-days: 7
+
+  # Docker build
+  docker-build:
+    name: Docker Build
     runs-on: ubuntu-latest
-    needs: [test, lint]
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -168,94 +304,41 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build backend image
+      - name: Build Docker image
         uses: docker/build-push-action@v5
         with:
-          context: ./backend
+          context: .
           push: false
-          tags: cargobay/backend:latest
+          tags: cargobay:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Build frontend image
-        uses: docker/build-push-action@v5
-        with:
-          context: ./frontend
-          push: false
-          tags: cargobay/frontend:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Validate docker-compose
+      - name: Test Docker image
         run: |
-          docker compose -f docker-compose.yml config > /dev/null
+          docker run --rm cargobay:latest ./cargobay --version
 
-  helm:
-    name: Validate Helm Chart
+  # Security scan
+  security:
+    name: Security Scan
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Helm
-        uses: azure/setup-helm@v3
+      - name: Run Gosec
+        uses: securego/gosec@v2
         with:
-          version: 'v3.13.0'
+          args: ./...
 
-      - name: Run helm lint
-        run: |
-          helm lint charts/cargobay
+      - name: Run Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
 
-      - name: Run helm template
-        run: |
-          helm template test charts/cargobay > /dev/null
-
-  e2e:
-    name: E2E Tests with Docker Compose
-    runs-on: ubuntu-latest
-    needs: [docker]
-
-    services:
-      postgres:
-        image: postgres:15-alpine
-        env:
-          POSTGRES_USER: cargobay
-          POSTGRES_PASSWORD: password
-          POSTGRES_DB: cargobay
-        ports:
-          - 5432:5432
-
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Compose
-        run: |
-          docker compose version
-          docker --version
-
-      - name: Start services
-        working-directory: .
-        run: docker compose up -d
-
-      - name: Wait for services
-        run: |
-          sleep 10
-          docker compose logs
-
-      - name: Run E2E tests
-        working-directory: ./tests/e2e
-        run: |
-          go mod download
-          go test -v ./...
-
-      - name: Cleanup
-        if: always()
-        working-directory: .
-        run: docker compose down -v
+      - name: Upload Trivy results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'

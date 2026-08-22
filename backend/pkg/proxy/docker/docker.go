@@ -14,18 +14,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/simplylimitless/cargobay/backend/pkg/cache"
 	"github.com/simplylimitless/cargobay/backend/pkg/database"
 	"github.com/simplylimitless/cargobay/backend/pkg/middleware"
 	"github.com/simplylimitless/cargobay/backend/pkg/proxy"
 	"github.com/simplylimitless/cargobay/backend/pkg/rbac"
 	"github.com/simplylimitless/cargobay/backend/pkg/storage"
-	"github.com/go-chi/chi/v5"
+	"github.com/simplylimitless/cargobay/backend/pkg/vulnerability"
 )
 
 // DockerProxy implements the Docker Registry v2 API proxy
@@ -36,10 +38,11 @@ type DockerProxy struct {
 	rbac       *rbac.RBAC
 	registries []database.RegistryConfig
 	registry   string
+	scanner    *vulnerability.VulnerabilityScanner
 }
 
 // NewDockerProxy creates a new Docker proxy instance
-func NewDockerProxy(db *database.Database, storage storage.StorageAdapter, cache *cache.Cache, rbacMgr *rbac.RBAC, registries []database.RegistryConfig) chi.Router {
+func NewDockerProxy(db *database.Database, storage storage.StorageAdapter, cache *cache.Cache, rbacMgr *rbac.RBAC, registries []database.RegistryConfig, scanner *vulnerability.VulnerabilityScanner) chi.Router {
 	r := chi.NewRouter()
 
 	p := &DockerProxy{
@@ -49,26 +52,24 @@ func NewDockerProxy(db *database.Database, storage storage.StorageAdapter, cache
 		rbac:       rbacMgr,
 		registries: registries,
 		registry:   "docker",
+		scanner:    scanner,
 	}
 
-	// Docker Registry v2 API endpoints
-
-	// Discovery endpoint
-	r.Get("/", p.handleDiscovery)
+	// Docker Registry v2 API endpoints (mounted under /v2 by the caller)
 
 	// Health check
-	r.Get("/v2/", p.handleHealth)
+	r.Get("/", p.handleHealth)
 
 	// List repositories
-	r.Get("/v2/_catalog", p.handleCatalog)
+	r.Get("/_catalog", p.handleCatalog)
 
 	// Repository names routinely span multiple path segments (e.g.
 	// "library/nginx", "someorg/someteam/someimage"), which chi's
 	// single-segment {repository} param can't capture. Reads/writes are
 	// dispatched through a wildcard and the repository/reference/digest are
 	// parsed out of the raw request path instead.
-	r.Get("/v2/*", p.handleV2Read)
-	r.Head("/v2/*", p.handleV2Head)
+	r.Get("/*", p.handleV2Read)
+	r.Head("/*", p.handleV2Head)
 
 	// Write operations (push/delete) require an authenticated user — anonymous
 	// requests may pull, but must not be able to upload or remove artifacts.
@@ -77,10 +78,10 @@ func NewDockerProxy(db *database.Database, storage storage.StorageAdapter, cache
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.RequireAuth)
 
-		r.Put("/v2/*", p.handleV2Put)
-		r.Post("/v2/*", p.handleV2Post)
-		r.Patch("/v2/*", p.handleV2Patch)
-		r.Delete("/v2/*", p.handleV2Delete)
+		r.Put("/*", p.handleV2Put)
+		r.Post("/*", p.handleV2Post)
+		r.Patch("/*", p.handleV2Patch)
+		r.Delete("/*", p.handleV2Delete)
 	})
 
 	return r
@@ -104,6 +105,65 @@ func trimSuffixSep(path, suffix string) (before string, ok bool) {
 		return "", false
 	}
 	return strings.TrimSuffix(path, suffix), true
+}
+
+// isDigestReference reports whether reference is a content digest
+// ("sha256:<hex>") rather than a human-readable tag. Docker clients resolve
+// a tag to a manifest (list) digest, then fetch each platform-specific
+// manifest referenced by that list via its own digest — those digest-only
+// fetches are children of the tag, not additional tags in their own right,
+// so they must not be persisted as separate top-level artifact versions.
+func isDigestReference(reference string) bool {
+	return strings.HasPrefix(reference, "sha256:")
+}
+
+// manifestList mirrors the subset of the Docker manifest-list / OCI image
+// index schema needed to surface each platform's digest, since cargobay's
+// artifacts table stores a single digest per row and this is otherwise the
+// only place that per-platform relationship is captured.
+type manifestList struct {
+	Manifests []struct {
+		Digest   string `json:"digest"`
+		Size     int64  `json:"size"`
+		Platform struct {
+			Architecture string `json:"architecture"`
+			OS           string `json:"os"`
+		} `json:"platform"`
+	} `json:"manifests"`
+}
+
+// childManifestsFromList parses body as a manifest list / OCI index and
+// returns a JSON-friendly summary of the platform-specific manifests it
+// references, or nil if body isn't a manifest list (e.g. a single-platform
+// manifest).
+func childManifestsFromList(body []byte) []map[string]interface{} {
+	var list manifestList
+	if err := json.Unmarshal(body, &list); err != nil || len(list.Manifests) == 0 {
+		return nil
+	}
+	children := make([]map[string]interface{}, 0, len(list.Manifests))
+	for _, m := range list.Manifests {
+		children = append(children, map[string]interface{}{
+			"digest": m.Digest,
+			"size":   m.Size,
+			"os":     m.Platform.OS,
+			"arch":   m.Platform.Architecture,
+		})
+	}
+	return children
+}
+
+// splitDockerRepository splits a Docker repository path like "library/nginx"
+// into its namespace ("library") and image name ("nginx"), so the two are
+// stored as distinct fields instead of duplicating the full path into both.
+// Repositories with no namespace segment use the whole path as the name and
+// leave namespace empty.
+func splitDockerRepository(repository string) (namespace, name string) {
+	idx := strings.Index(repository, "/")
+	if idx < 0 {
+		return "", repository
+	}
+	return repository[:idx], repository[idx+1:]
 }
 
 // target bundles the registry resolved for a request (by Host header, or
@@ -168,6 +228,10 @@ func (p *DockerProxy) handleV2Head(w http.ResponseWriter, r *http.Request) {
 	}
 	path := strings.TrimPrefix(r.URL.Path, "/v2/")
 
+	if repo, ref, ok := splitAtLast(path, "/manifests/"); ok {
+		p.handleHeadManifest(w, r, t, repo, ref)
+		return
+	}
 	if repo, digest, ok := splitAtLast(path, "/blobs/"); ok {
 		p.handleHeadBlob(w, r, t, repo, digest)
 		return
@@ -239,14 +303,6 @@ func (p *DockerProxy) handleV2Delete(w http.ResponseWriter, r *http.Request) {
 	http.NotFound(w, r)
 }
 
-// handleDiscovery handles the root discovery endpoint
-func (p *DockerProxy) handleDiscovery(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"message": "Welcome to cargobay Docker Registry Proxy",
-	})
-}
-
 // handleCatalog lists repositories in the registry resolved for this
 // request (by Host header) — a caller only ever sees repositories in the
 // registry they're actually talking to.
@@ -264,9 +320,13 @@ func (p *DockerProxy) handleCatalog(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		seen := make(map[string]bool)
 		for _, a := range artifacts {
-			if !seen[a.ArtifactName] {
-				repositories = append(repositories, a.ArtifactName)
-				seen[a.ArtifactName] = true
+			repo := a.ArtifactName
+			if a.Namespace != "" {
+				repo = a.Namespace + "/" + a.ArtifactName
+			}
+			if !seen[repo] {
+				repositories = append(repositories, repo)
+				seen[repo] = true
 			}
 		}
 	}
@@ -279,10 +339,12 @@ func (p *DockerProxy) handleCatalog(w http.ResponseWriter, r *http.Request) {
 
 // handleTags lists tags for a repository
 func (p *DockerProxy) handleTags(w http.ResponseWriter, r *http.Request, t target, repository string) {
+	namespace, name := splitDockerRepository(repository)
+
 	// Get tags from database
 	artifacts, err := p.db.ListArtifacts(t.label, database.ListOptions{
 		ArtifactType: "docker",
-		Namespace:    repository,
+		Namespace:    namespace,
 	})
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to get tags: %v", err), http.StatusBadGateway)
@@ -291,7 +353,9 @@ func (p *DockerProxy) handleTags(w http.ResponseWriter, r *http.Request, t targe
 
 	tags := make([]string, 0, len(artifacts))
 	for _, a := range artifacts {
-		tags = append(tags, a.Version)
+		if a.ArtifactName == name {
+			tags = append(tags, a.Version)
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -301,14 +365,86 @@ func (p *DockerProxy) handleTags(w http.ResponseWriter, r *http.Request, t targe
 	})
 }
 
+// cacheManifestFromUpstream pulls a manifest through from the upstream
+// registry and caches it under the reference the client actually requested.
+// This matters because containerd-backed Docker clients resolve a tag to a
+// digest via HEAD first, then fetch content with a second GET keyed by that
+// digest — if only the GET path cached artifacts, every cached row would be
+// keyed by the opaque digest instead of the human-readable tag ("latest").
+// Caching on the HEAD means the tag wins: the later GET-by-digest finds this
+// row via its Digest match and returns it as-is, without overwriting Version.
+func (p *DockerProxy) cacheManifestFromUpstream(t target, repository, reference string) (body []byte, digest, contentType string, err error) {
+	namespace, name := splitDockerRepository(repository)
+
+	body, contentType, err = p.fetchManifestFromUpstream(t.reg, repository, reference)
+	if err != nil {
+		return nil, "", "", err
+	}
+
+	digestBytes := sha256.Sum256(body)
+	digest = fmt.Sprintf("sha256:%x", digestBytes)
+
+	if _, err := p.storage.SaveArtifact("docker", repository, reference, "latest", body); err != nil {
+		return nil, "", "", err
+	}
+
+	if contentType == "" {
+		contentType = "application/vnd.docker.distribution.manifest.v2+json"
+	}
+
+	// A digest-only fetch is a client resolving one platform's manifest out
+	// of a tag's manifest list, not a new tag — persist the blob so it can
+	// be served again, but don't create a separate top-level artifact
+	// version for it (see isDigestReference).
+	if isDigestReference(reference) {
+		return body, digest, contentType, nil
+	}
+
+	metadata := map[string]interface{}{
+		// Stored as a string, not []byte: the metadata map is JSON-encoded
+		// for the database's JSONB column, and encoding/json base64-encodes
+		// []byte values, which would corrupt the manifest and desync its
+		// size from what's actually served.
+		"manifest":    string(body),
+		"contentType": contentType,
+	}
+	if children := childManifestsFromList(body); children != nil {
+		metadata["childManifests"] = children
+	}
+
+	cached := &database.ArtifactMetadata{
+		ID:              fmt.Sprintf("docker:%s:%s:%s", t.label, strings.ReplaceAll(repository, "/", "_"), reference),
+		RegistryID:      t.label,
+		ArtifactType:    "docker",
+		Namespace:       namespace,
+		ArtifactName:    name,
+		Version:         reference,
+		Digest:          digest,
+		DigestAlgorithm: "sha256",
+		Size:            int64(len(body)),
+		Created:         time.Now(),
+		Updated:         time.Now(),
+		Metadata:        metadata,
+		Tags:            []string{reference},
+	}
+	if err := p.db.SaveArtifact(cached); err != nil {
+		return nil, "", "", err
+	}
+	p.triggerAsyncScan(namespace, name, reference)
+
+	return body, digest, contentType, nil
+}
+
 // handleManifest retrieves a manifest, pulling it through from the
 // upstream registry and caching it on first request if it isn't already
 // stored locally.
 func (p *DockerProxy) handleManifest(w http.ResponseWriter, r *http.Request, t target, repository, reference string) {
+	namespace, name := splitDockerRepository(repository)
+
 	// Try to find artifact in database
 	artifacts, err := p.db.ListArtifacts(t.label, database.ListOptions{
 		ArtifactType: "docker",
-		Namespace:    repository,
+		Namespace:    namespace,
 	})
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to get manifest: %v", err), http.StatusBadGateway)
@@ -318,63 +454,135 @@ func (p *DockerProxy) handleManifest(w http.ResponseWriter, r *http.Request, t t
 	// Find matching artifact
 	var artifact *database.ArtifactMetadata
 	for _, a := range artifacts {
-		if a.Version == reference || a.Digest == reference {
+		if a.ArtifactName == name && (a.Version == reference || a.Digest == reference) {
 			artifact = &a
 			break
 		}
 	}
 
 	if artifact != nil {
-		w.Header().Set("Content-Type", "application/vnd.docker.distribution.manifest.v2+json")
+		// If proxy is disabled for this registry, don't serve cached content
+		// that came from upstream - return 404 so the client knows proxying
+		// is not available.
+		if t.reg != nil && !t.reg.Proxy {
+			http.Error(w, "upstream proxy disabled", http.StatusNotFound)
+			return
+		}
+
+		contentType := "application/vnd.docker.distribution.manifest.v2+json"
+		if ct, ok := artifact.Metadata["contentType"].(string); ok && ct != "" {
+			contentType = ct
+		}
+		w.Header().Set("Content-Type", contentType)
 		w.Header().Set("Docker-Content-Digest", artifact.Digest)
-		w.Header().Set("X-Docker-Size", fmt.Sprintf("%d", artifact.Size))
-		w.Write(artifact.Metadata["manifest"].([]byte))
+
+		manifest := artifact.Metadata["manifest"]
+		var body []byte
+		switch v := manifest.(type) {
+		case []byte:
+			body = v
+		case string:
+			body = []byte(v)
+		default:
+			http.Error(w, "internal error: invalid manifest type", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("X-Docker-Size", fmt.Sprintf("%d", len(body)))
+		if !isDigestReference(reference) {
+			if err := p.db.IncrementArtifactDownloads(t.label, namespace, name, artifact.Version); err != nil {
+				log.Printf("failed to record download for %s/%s:%s: %v", namespace, name, artifact.Version, err)
+			}
+		}
+		w.Write(body)
 		return
 	}
 
 	// Not cached — pull the manifest through from the upstream registry, if
 	// this registry has one configured.
-	body, contentType, err := p.fetchManifestFromUpstream(t.reg, repository, reference)
+	body, digest, contentType, err := p.cacheManifestFromUpstream(t, repository, reference)
 	if err != nil {
 		http.Error(w, "manifest unknown", http.StatusNotFound)
 		return
 	}
 
-	digestBytes := sha256.Sum256(body)
-	digest := fmt.Sprintf("sha256:%x", digestBytes)
-
-	if _, err := p.storage.SaveArtifact("docker", repository, reference, "latest", body); err != nil {
-		http.Error(w, fmt.Sprintf("Failed to cache manifest: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	cached := &database.ArtifactMetadata{
-		ID:              fmt.Sprintf("docker:%s:%s:%s", t.label, repository, reference),
-		RegistryID:      t.label,
-		ArtifactType:    "docker",
-		Namespace:       repository,
-		ArtifactName:    repository,
-		Version:         reference,
-		Digest:          digest,
-		DigestAlgorithm: "sha256",
-		Size:            int64(len(body)),
-		Created:         time.Now(),
-		Updated:         time.Now(),
-		Metadata:        map[string]interface{}{"manifest": body},
-		Tags:            []string{reference},
-	}
-	if err := p.db.SaveArtifact(cached); err != nil {
-		http.Error(w, fmt.Sprintf("Failed to save artifact: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	if contentType == "" {
-		contentType = "application/vnd.docker.distribution.manifest.v2+json"
-	}
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Docker-Content-Digest", digest)
 	w.Header().Set("X-Docker-Size", fmt.Sprintf("%d", len(body)))
+	if !isDigestReference(reference) {
+		if err := p.db.IncrementArtifactDownloads(t.label, namespace, name, reference); err != nil {
+			log.Printf("failed to record download for %s/%s:%s: %v", namespace, name, reference, err)
+		}
+	}
 	w.Write(body)
+}
+
+// handleHeadManifest resolves a manifest's digest/size without returning its
+// body — required by the Docker Registry v2 API, and relied on by clients
+// (e.g. containerd-backed Docker Desktop) to resolve a tag to a digest
+// before pulling. Without this, such clients fall back to fetching
+// manifests only by digest, which never records the original tag.
+func (p *DockerProxy) handleHeadManifest(w http.ResponseWriter, r *http.Request, t target, repository, reference string) {
+	namespace, name := splitDockerRepository(repository)
+
+	artifacts, err := p.db.ListArtifacts(t.label, database.ListOptions{
+		ArtifactType: "docker",
+		Namespace:    namespace,
+	})
+	if err == nil {
+		for _, a := range artifacts {
+			if a.ArtifactName == name && (a.Version == reference || a.Digest == reference) {
+				// If proxy is disabled for this registry, don't serve cached content
+				if t.reg != nil && !t.reg.Proxy {
+					http.Error(w, "upstream proxy disabled", http.StatusNotFound)
+					return
+				}
+
+				contentType := "application/vnd.docker.distribution.manifest.v2+json"
+				if ct, ok := a.Metadata["contentType"].(string); ok && ct != "" {
+					contentType = ct
+				}
+
+				manifest := a.Metadata["manifest"]
+				var body []byte
+				switch v := manifest.(type) {
+				case []byte:
+					body = v
+				case string:
+					body = []byte(v)
+				default:
+					http.Error(w, "internal error: invalid manifest type", http.StatusInternalServerError)
+					return
+				}
+
+				w.Header().Set("Content-Type", contentType)
+				w.Header().Set("Docker-Content-Digest", a.Digest)
+				w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+				if !isDigestReference(reference) {
+					if err := p.db.IncrementArtifactDownloads(t.label, namespace, name, a.Version); err != nil {
+						log.Printf("failed to record download for %s/%s:%s: %v", namespace, name, a.Version, err)
+					}
+				}
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+		}
+	}
+
+	body, digest, contentType, err := p.cacheManifestFromUpstream(t, repository, reference)
+	if err != nil {
+		http.Error(w, "manifest unknown", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Docker-Content-Digest", digest)
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+	if !isDigestReference(reference) {
+		if err := p.db.IncrementArtifactDownloads(t.label, namespace, name, reference); err != nil {
+			log.Printf("failed to record download for %s/%s:%s: %v", namespace, name, reference, err)
+		}
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 // handlePutManifest puts a manifest
@@ -402,20 +610,22 @@ func (p *DockerProxy) handlePutManifest(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
+	namespace, name := splitDockerRepository(repository)
+
 	// Save to database
 	artifact := &database.ArtifactMetadata{
-		ID:              fmt.Sprintf("docker:%s:%s:%s", t.label, repository, reference),
+		ID:              fmt.Sprintf("docker:%s:%s:%s", t.label, strings.ReplaceAll(repository, "/", "_"), reference),
 		RegistryID:      t.label,
 		ArtifactType:    "docker",
-		Namespace:       repository,
-		ArtifactName:    repository,
+		Namespace:       namespace,
+		ArtifactName:    name,
 		Version:         reference,
 		Digest:          digest,
 		DigestAlgorithm: "sha256",
 		Size:            int64(len(body)),
 		Created:         time.Now(),
 		Updated:         time.Now(),
-		Metadata:        map[string]interface{}{"manifest": body},
+		Metadata:        map[string]interface{}{"manifest": string(body)},
 		Tags:            []string{reference},
 	}
 
@@ -423,15 +633,47 @@ func (p *DockerProxy) handlePutManifest(w http.ResponseWriter, r *http.Request, 
 		http.Error(w, fmt.Sprintf("Failed to save artifact: %v", err), http.StatusInternalServerError)
 		return
 	}
+	p.triggerAsyncScan(namespace, name, reference)
 
 	w.Header().Set("Docker-Content-Digest", digest)
 	w.WriteHeader(http.StatusCreated)
+}
+
+// triggerAsyncScan fires a vulnerability scan for a just-cached docker/oci
+// artifact in the background, so it never adds latency to the push/pull
+// request that triggered it. The scanner pulls the image itself over
+// cargobay's own registry API, so no artifact data needs to be passed here.
+func (p *DockerProxy) triggerAsyncScan(namespace, name, reference string) {
+	if p.scanner == nil || isDigestReference(reference) {
+		return
+	}
+	artifact := &database.ArtifactMetadata{
+		ID:           fmt.Sprintf("docker:%s:%s:%s", p.registry, strings.ReplaceAll(namespace+"/"+name, "/", "_"), reference),
+		ArtifactType: "docker",
+		Namespace:    namespace,
+		ArtifactName: name,
+		Version:      reference,
+	}
+	go func() {
+		result, err := p.scanner.ScanArtifact(artifact, nil)
+		if err != nil {
+			return
+		}
+		_ = p.scanner.SaveScanResult(result)
+	}()
 }
 
 // handleGetBlob retrieves a blob (layer), pulling it through from the
 // upstream registry and caching it on first request if it isn't already
 // stored locally.
 func (p *DockerProxy) handleGetBlob(w http.ResponseWriter, r *http.Request, t target, repository, digest string) {
+	// If proxy is disabled, don't fetch from upstream - return 404 for
+	// uncached content since the user explicitly doesn't want proxying.
+	if t.reg != nil && !t.reg.Proxy {
+		http.Error(w, "upstream proxy disabled", http.StatusNotFound)
+		return
+	}
+
 	blob, err := p.storage.GetArtifact("docker", repository, "blob", digest)
 	if err == nil && blob != nil {
 		w.Header().Set("Content-Type", "application/octet-stream")
@@ -462,6 +704,13 @@ func (p *DockerProxy) handleGetBlob(w http.ResponseWriter, r *http.Request, t ta
 // from upstream if it isn't stored locally yet (docker push probes with
 // HEAD before uploading, to skip blobs the registry already has).
 func (p *DockerProxy) handleHeadBlob(w http.ResponseWriter, r *http.Request, t target, repository, digest string) {
+	// If proxy is disabled, don't fetch from upstream - return 404 for
+	// uncached content since the user explicitly doesn't want proxying.
+	if t.reg != nil && !t.reg.Proxy {
+		http.Error(w, "upstream proxy disabled", http.StatusNotFound)
+		return
+	}
+
 	exists, err := p.storage.ArtifactExists("docker", repository, "blob", digest)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to check blob: %v", err), http.StatusInternalServerError)
@@ -548,13 +797,13 @@ func (p *DockerProxy) handleDeleteManifest(w http.ResponseWriter, r *http.Reques
 }
 
 // upstreamBase returns the base URL to pull through from for the resolved
-// registry: its own configured URL if it proxies an upstream, otherwise
-// Docker Hub as the default.
-func upstreamBase(reg *database.RegistryConfig) string {
-	if reg != nil && reg.Proxy && reg.URL != "" {
-		return strings.TrimSuffix(reg.URL, "/")
+// registry. Returns an error if the registry has no upstream proxy
+// configured — it never silently falls back to Docker Hub.
+func upstreamBase(reg *database.RegistryConfig) (string, error) {
+	if reg == nil || !reg.Proxy || reg.URL == "" {
+		return "", fmt.Errorf("no upstream proxy configured for this registry")
 	}
-	return "https://registry-1.docker.io"
+	return strings.TrimSuffix(reg.URL, "/"), nil
 }
 
 // normalizeRepository expands unqualified Docker Hub image names (e.g.
@@ -672,7 +921,11 @@ func (p *DockerProxy) upstreamRequest(reg *database.RegistryConfig, reqURL strin
 // fetchManifestFromUpstream pulls a manifest through from the upstream
 // registry for a repository that isn't cached locally yet.
 func (p *DockerProxy) fetchManifestFromUpstream(reg *database.RegistryConfig, repository, reference string) ([]byte, string, error) {
-	reqURL := fmt.Sprintf("%s/v2/%s/manifests/%s", upstreamBase(reg), normalizeRepository(repository), reference)
+	base, err := upstreamBase(reg)
+	if err != nil {
+		return nil, "", err
+	}
+	reqURL := fmt.Sprintf("%s/v2/%s/manifests/%s", base, normalizeRepository(repository), reference)
 	resp, err := p.upstreamRequest(reg, reqURL, map[string]string{
 		"Accept": "application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json",
 	})
@@ -693,7 +946,11 @@ func (p *DockerProxy) fetchManifestFromUpstream(reg *database.RegistryConfig, re
 // fetchBlobFromUpstream pulls a blob (image layer or config) through from
 // the upstream registry for a repository that isn't cached locally yet.
 func (p *DockerProxy) fetchBlobFromUpstream(reg *database.RegistryConfig, repository, digest string) ([]byte, error) {
-	reqURL := fmt.Sprintf("%s/v2/%s/blobs/%s", upstreamBase(reg), normalizeRepository(repository), digest)
+	base, err := upstreamBase(reg)
+	if err != nil {
+		return nil, err
+	}
+	reqURL := fmt.Sprintf("%s/v2/%s/blobs/%s", base, normalizeRepository(repository), digest)
 	resp, err := p.upstreamRequest(reg, reqURL, nil)
 	if err != nil {
 		return nil, err

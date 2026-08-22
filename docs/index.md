@@ -2,19 +2,49 @@
 
 Welcome to cargobay, the Universal Binary Repository Manager.
 
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [Architecture](architecture.md) | Internal architecture, components, and data flows |
+| [Configuration](configuration.md) | Configuration options and environment variables |
+| [Roadmap](roadmap.md) | Planned features and improvements |
+
 ## Overview
 
-cargobay is a unified artifact registry that supports multiple package formats including Docker/OCI, npm, Maven, PyPI, NuGet, Helm, and more. It acts as a proxy cache for upstream registries while providing additional features like vulnerability scanning, access control, and audit logging.
+cargobay is a unified artifact registry that supports **21+ package formats** including Docker/OCI, npm, Maven, PyPI, NuGet, Helm, Cargo, Go Modules, Alpine, Debian, RPM, and more. It acts as a proxy cache for upstream registries while providing additional features like vulnerability scanning, access control, audit logging, and cross-region replication.
 
 ## Features
 
-- **Multi-format Support**: Docker/OCI, npm, Maven, PyPI, NuGet, Helm, and generic artifacts
-- **Proxy Caching**: Proxy and cache packages from upstream registries
-- **Vulnerability Scanning**: Automatic security scanning of uploaded artifacts
-- **Role-Based Access Control**: Fine-grained permissions with 5 roles
+### Proxy Support (21 Formats)
+- **Package Managers**: npm, Maven/Gradle/SBT, PyPI, NuGet, Cargo, Go Modules, Composer, Conda, Dart, CocoaPods, Swift
+- **Container**: Docker/OCI, Helm, Terraform
+- **Linux**: Alpine, Debian, RPM/YUM
+- **Other**: Conan (C/C++)
+
+### Core Features
+- **Universal Artifact Repository**: Upload, download, and manage artifacts across all formats
+- **Caching Proxy**: Transparent caching for all supported registries
+- **Vulnerability Scanning**: Automatic security scanning via Trivy/Grype
+- **Role-Based Access Control**: 5 roles (admin, operator, developer, viewer, auditor)
 - **Audit Logging**: Complete audit trail of all actions
+- **Full-Text Search**: With autocomplete suggestions
+- **Digital Signatures**: PGP signature verification support
+
+### Advanced Features
+- **Cross-Region Replication**: Multi-master replication with conflict resolution
 - **Multi-Storage Backends**: S3, GCS, Azure Blob Storage, and local storage
-- **Kubernetes Ready**: Helm charts for easy deployment
+- **Private Registry Support**: User grants and virtual host routing
+- **Upstream Authentication**: Basic and Bearer token support
+- **Cursor Pagination**: Efficient handling of large datasets
+- **Automatic Indexing**: Auto-updating vulnerability DB and search index
+
+### Developer Experience
+- **Embedded UI**: Single binary with React SPA (no separate frontend server)
+- **First-Run Setup**: Interactive wizard to create admin user
+- **Self-Service**: Users can manage their own profiles and API keys
+- **Session Authentication**: Cookies + Bearer tokens + HTTP Basic (Docker)
+- **Prometheus Metrics**: Built-in metrics endpoint at `/metrics`
 
 ## Quick Start
 
@@ -45,24 +75,30 @@ open http://localhost:3000
 
 ## Architecture
 
+For detailed architecture documentation including component breakdown, data flows, and deployment patterns, see [Architecture Documentation](architecture.md).
+
+### Overview
+
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        cargobay                             │
-├─────────────────────────────────────────────────────────────┤
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐         │
-│  │  Proxy      │  │  Storage    │  │  Redis      │         │
-│  │  Handlers   │  │  Adapters   │  │  Cache      │         │
-│  │  (npm,      │  │  (S3, GCS,  │  │             │         │
-│  │   Maven,    │  │   Azure,    │  │             │         │
-│  │   Docker,   │  │   Local)    │  │             │         │
-│  │   PyPI,     │  │             │  │             │         │
-│  │   NuGet)    │  │             │  │             │         │
-│  └─────────────┘  └─────────────┘  └─────────────┘         │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐         │
-│  │  PostgreSQL │  │  Elasticsearch│ │  Vulnerability│        │
-│  │  Database   │  │  Search     │  │  Scanner    │         │
-│  └─────────────┘  └─────────────┘  └─────────────┘         │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        cargobay Server                                      │
+│                        (Go + React SPA)                                     │
+│                        Port 4500 (default)                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │                  HTTP Server (chi Router)                            │   │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌───────────┐ │   │
+│  │  │   API Layer │  │  Proxy      │  │  Web UI     │  │ Metrics │ │   │
+│  │  │  (/api/v1)  │  │  Handlers   │  │  (embedded) │  │ (/metrics)│ │   │
+│  │  └─────────────┘  └─────────────┘  └─────────────┘  └───────────┘ │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │              Core Services (RBAC, Auth, Cache, Search)               │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │              Data Layer (PostgreSQL, Storage, Redis)                 │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Configuration

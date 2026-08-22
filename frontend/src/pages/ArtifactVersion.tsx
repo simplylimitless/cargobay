@@ -1,6 +1,35 @@
 import { useState, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
+import { useConfirm } from '../hooks/useConfirm'
+import { getArtifactTypeConfig, isContainerType } from '../lib/artifactTypes'
+
+interface Artifact {
+  ID: string
+  RegistryID: string
+  ArtifactType: string
+  Namespace: string
+  ArtifactName: string
+  Version: string
+  Digest: string
+  DigestAlgorithm: string
+  Size: number
+  Created: string
+  Tags: string[] | null
+  Signatures: { type: string; verified: boolean; timestamp?: string }[] | null
+  Metadata: Record<string, any> | null
+  Downloads: number
+}
+
+// Formats a pull/download count per the agreed display scheme: exact below
+// 1M, "1M+" from 1M up to (not including) 10M, then "10M+"/"15M+"/... in 5M
+// increments above that (rounded down).
+function formatPulls(n: number): string {
+  if (n < 1_000_000) return n.toLocaleString()
+  if (n < 10_000_000) return '1M+'
+  const bucket = Math.floor(n / 5_000_000) * 5
+  return `${bucket}M+`
+}
 
 export function ArtifactVersion() {
   const { registryId, artifactType, namespace, artifactName, version } = useParams<{
@@ -11,54 +40,41 @@ export function ArtifactVersion() {
     version: string
   }>()
   const navigate = useNavigate()
-  const { canManage } = useAuth()
-  const [details, setDetails] = useState<any>(null)
+  const { canManage, token } = useAuth()
+  const { confirm, ConfirmDialog } = useConfirm()
+  const [artifact, setArtifact] = useState<Artifact | null>(null)
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+  const [deleting, setDeleting] = useState(false)
+  const [registryHost, setRegistryHost] = useState<string | null>(null)
 
   useEffect(() => {
-    const mockDetails: Record<string, any> = {
-      docker: {
-        image: `${artifactName}:${version}`,
-        digest: 'sha256:abc123def45678901234567890123456789012345678901234567890123456',
-        size: 142000000,
-        created: '2024-01-15T10:00:00Z',
-        author: 'Docker Bot',
-        layers: 7,
-        environment: ['NODE_VERSION=20', 'DISTRO=bookworm', 'PATH=/usr/local/sbin:/usr/local/bin'],
-        commands: ['CMD ["nginx", "-g", "daemon off;"]'],
-        signatures: [
-          { type: 'cosign', verified: true, timestamp: '2024-01-15T10:05:00Z' },
-        ],
-        uploadedBy: 'alice',
-      },
-      maven: {
-        groupId: namespace,
-        artifactId: artifactName,
-        version: version,
-        published: '2024-01-10',
-        sha1: 'abc123def4567890123456789012345678901234',
-        sha256: 'def4567890123456789012345678901234567890123456789012345678901234',
-        md5: 'ghi78901234567890123456789012345',
-        pomUrl: 'https://repo1.maven.org/maven2/...',
-        dependencies: ['org.springframework:spring-core:6.1.0', 'com.google.guava:guava:32.1.2-jre'],
-        uploadedBy: 'bob',
-      },
-      npm: {
-        name: artifactName,
-        version: version,
-        published: '2024-01-12',
-        license: 'MIT',
-        sha1: 'abc123def4567890123456789012345678901234',
-        sha256: 'def4567890123456789012345678901234567890123456789012345678901234',
-        files: ['lib/', 'dist/', 'package.json', 'README.md', 'LICENSE'],
-        dependencies: { react: '^18.0.0', lodash: '^4.17.0' },
-        uploadedBy: 'alice',
-      },
-    }
+    if (!registryId) return
+    fetch(`/api/v1/registries/${encodeURIComponent(registryId)}`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => setRegistryHost(data?.host || null))
+      .catch(() => setRegistryHost(null))
+  }, [registryId])
 
-    setDetails(mockDetails[artifactType] || {})
-    setLoading(false)
-  }, [artifactType, artifactName, version])
+  useEffect(() => {
+    setLoading(true)
+    setError(null)
+    const params = new URLSearchParams({ registryId: registryId ?? '', artifactType: artifactType ?? '', limit: '200' })
+    if (namespace) params.set('namespace', namespace)
+
+    fetch(`/api/v1/artifacts?${params.toString()}`)
+      .then((res) => {
+        if (!res.ok) throw new Error(`Request failed: ${res.status}`)
+        return res.json()
+      })
+      .then((data) => {
+        const all: Artifact[] = data.artifacts || []
+        const match = all.find((a) => a.ArtifactName === artifactName && a.Version === version)
+        setArtifact(match ?? null)
+      })
+      .catch((err) => setError(err.message || 'Failed to load artifact version'))
+      .finally(() => setLoading(false))
+  }, [registryId, artifactType, namespace, artifactName, version])
 
   const formatSize = (bytes: number) => {
     if (bytes < 1024) return `${bytes} B`
@@ -77,12 +93,24 @@ export function ArtifactVersion() {
     })
   }
 
-  const handleDelete = () => {
-    if (!confirm(`Delete version ${version}? This cannot be undone.`)) return
-    navigate(`/registries/${registryId}/${artifactType}/${namespace}/${artifactName}`)
+  const handleDelete = async () => {
+    if (!artifact) return
+    if (!(await confirm(`Delete version ${version}? This cannot be undone.`))) return
+    setDeleting(true)
+    try {
+      const res = await fetch(`/api/v1/artifacts/${encodeURIComponent(artifact.ID)}`, {
+        method: 'DELETE',
+        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+      })
+      if (!res.ok) throw new Error(`Request failed: ${res.status}`)
+      navigate(`/registries/${registryId}/${artifactType}/${encodeURIComponent(namespace ?? '')}/${encodeURIComponent(artifactName ?? '')}`)
+    } catch (err: any) {
+      setError(err.message || 'Failed to delete version')
+      setDeleting(false)
+    }
   }
 
-  if (loading || !details) {
+  if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
         <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
@@ -90,54 +118,83 @@ export function ArtifactVersion() {
     )
   }
 
+  if (error) {
+    return (
+      <div className="px-4 py-3 bg-red-500/10 border border-red-500/30 rounded-lg text-red-400 text-sm">
+        {error}
+      </div>
+    )
+  }
+
+  if (!artifact) {
+    return (
+      <div className="text-center py-12 text-gray-500">Version not found</div>
+    )
+  }
+
+  // Empty host means the registry is the default/unbound proxy for its type,
+  // reachable at the current origin; a bound host is only reachable there
+  // (see proxy.ResolveRegistry in the backend).
+  const origin = `${window.location.protocol}//${registryHost || window.location.host}`
+  const ns = namespace ?? ''
+  // Docker official images (namespace "library") are referenced with no
+  // namespace prefix at all, e.g. `docker pull nginx:latest` — not `library/nginx`.
+  const isDockerLibrary = artifactType === 'docker' && ns === 'library'
+
+  // Buildx-produced multi-arch images attach extra "attestation" manifests
+  // (SBOM/provenance) alongside the real platform images; these always
+  // report os/arch as "unknown" and aren't a pullable platform, so they're
+  // filtered out here the same way Docker Hub's own UI hides them.
+  const childManifestsRaw = artifact.Metadata?.childManifests
+  const childManifests: Record<string, any>[] = Array.isArray(childManifestsRaw)
+    ? childManifestsRaw.filter((m) => m.os !== 'unknown' && m.arch !== 'unknown')
+    : []
+
+  const typeConfig = getArtifactTypeConfig(artifactType)
+  const pullParams = {
+    origin,
+    host: registryHost || window.location.host,
+    registryHost,
+    namespace: ns,
+    artifactName: artifactName ?? '',
+    version: version ?? '',
+  }
+  const pullCommand = typeConfig.pullCommand(pullParams)
+
   return (
     <div className="space-y-8">
-      <button
-        onClick={() => navigate(`/registries/${registryId}/${artifactType}/${namespace}/${artifactName}`)}
-        className="flex items-center gap-2 text-gray-400 hover:text-gray-100 transition-colors"
-      >
-        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-        </svg>
-        Back to versions
-      </button>
-
+      {ConfirmDialog}
       <div className="card">
         <div className="flex items-start justify-between">
           <div>
             <div className="flex items-center gap-3 mb-2">
               <h1 className="text-3xl font-bold text-white">
-                {namespace ? `${namespace}/${artifactName}` : artifactName}
+                {namespace && !isDockerLibrary ? `${namespace}/${artifactName}` : artifactName}
               </h1>
               <span className="px-3 py-1.5 bg-blue-600 rounded-lg text-sm font-medium text-white">
                 v{version}
               </span>
             </div>
-            {artifactType === 'docker' && (
-              <p className="text-gray-400 font-mono text-lg">{details.image}</p>
-            )}
           </div>
           <div className="text-right">
             <div className="text-sm text-gray-500 mb-1">Registry</div>
             <div className="font-medium text-gray-300">{registryId}</div>
           </div>
         </div>
-        {details.uploadedBy && (
-          <div className="mt-4 pt-4 border-t border-gray-800 flex items-center justify-between">
-            <span className="text-sm text-gray-500">
-              Uploaded by <span className="text-gray-300 font-medium">{details.uploadedBy}</span>
-            </span>
-            {canManage(details.uploadedBy) && (
-              <button onClick={handleDelete} className="btn btn-sm bg-red-600 hover:bg-red-500 text-white">
-                Delete version
-              </button>
-            )}
+        {canManage(artifact.Metadata?.uploadedBy) && (
+          <div className="mt-4 pt-4 border-t border-gray-800 flex items-center justify-end">
+            <button
+              onClick={handleDelete}
+              disabled={deleting}
+              className="btn btn-sm bg-red-600 hover:bg-red-500 text-white disabled:opacity-50"
+            >
+              {deleting ? 'Deleting...' : 'Delete version'}
+            </button>
           </div>
         )}
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* Security Section */}
         <div className="card space-y-4">
           <h2 className="text-lg font-semibold text-gray-100 border-b border-gray-800 pb-2 flex items-center gap-2">
             <svg className="w-5 h-5 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -146,20 +203,20 @@ export function ArtifactVersion() {
             Security & Integrity
           </h2>
 
-          {artifactType === 'docker' && details.signatures && (
+          {artifact.Signatures && artifact.Signatures.length > 0 ? (
             <div className="space-y-3">
               <div className="flex items-center justify-between p-3 bg-green-500/10 border border-green-500/30 rounded-lg">
                 <span className="text-green-500 font-medium flex items-center gap-2">
                   <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
                   </svg>
-                  Signatures Verified
+                  Signatures Present
                 </span>
                 <span className="px-2 py-1 bg-green-500/20 rounded text-xs font-medium text-green-400">
-                  {details.signatures.length} signatures
+                  {artifact.Signatures.length} signatures
                 </span>
               </div>
-              {details.signatures.map((sig: any, idx: number) => (
+              {artifact.Signatures.map((sig, idx) => (
                 <div key={idx} className="bg-gray-800/50 rounded-lg p-3">
                   <div className="flex items-center justify-between mb-2">
                     <span className="font-medium text-gray-300">{sig.type}</span>
@@ -174,35 +231,23 @@ export function ArtifactVersion() {
                       <span className="text-yellow-500 text-xs">Invalid</span>
                     )}
                   </div>
-                  <div className="text-xs text-gray-500 font-mono flex items-center gap-2">
-                    <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
-                    </svg>
-                    Verified: {formatTimestamp(sig.timestamp)}
-                  </div>
                 </div>
               ))}
             </div>
+          ) : (
+            <div className="p-3 bg-gray-800/50 rounded-lg text-gray-500 text-sm">Unsigned</div>
           )}
 
           <div>
-            <label className="text-sm text-gray-500 mb-2 block">SHA-256 Digest</label>
+            <label className="text-sm text-gray-500 mb-2 block">
+              {artifact.DigestAlgorithm || 'Digest'}
+            </label>
             <div className="bg-gray-800/50 rounded-lg p-3 font-mono text-xs text-gray-400 break-all">
-              {details.sha256 || details.digest}
+              {artifact.Digest}
             </div>
           </div>
-
-          {details.sha1 && (
-            <div>
-              <label className="text-sm text-gray-500 mb-2 block">SHA-1</label>
-              <div className="bg-gray-800/50 rounded-lg p-3 font-mono text-xs text-gray-500 break-all">
-                {details.sha1}
-              </div>
-            </div>
-          )}
         </div>
 
-        {/* Metadata Section */}
         <div className="card space-y-4">
           <h2 className="text-lg font-semibold text-gray-100 border-b border-gray-800 pb-2 flex items-center gap-2">
             <svg className="w-5 h-5 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -212,137 +257,90 @@ export function ArtifactVersion() {
           </h2>
 
           <div className="grid grid-cols-2 gap-4">
-            {artifactType === 'docker' && (
-              <>
-                <div>
-                  <div className="text-sm text-gray-500">Size</div>
-                  <div className="font-medium text-white">{formatSize(details.size)}</div>
-                </div>
-                <div>
-                  <div className="text-sm text-gray-500">Created</div>
-                  <div className="font-medium text-white">{formatTimestamp(details.created)}</div>
-                </div>
-                <div>
-                  <div className="text-sm text-gray-500">Layers</div>
-                  <div className="font-medium text-white">{details.layers}</div>
-                </div>
-                <div>
-                  <div className="text-sm text-gray-500">Author</div>
-                  <div className="font-medium text-white">{details.author}</div>
-                </div>
-              </>
-            )}
-
-            {artifactType === 'maven' && (
-              <>
-                <div>
-                  <div className="text-sm text-gray-500">Group ID</div>
-                  <div className="font-mono font-medium text-white">{details.groupId}</div>
-                </div>
-                <div>
-                  <div className="text-sm text-gray-500">Artifact ID</div>
-                  <div className="font-mono font-medium text-white">{details.artifactId}</div>
-                </div>
-                <div>
-                  <div className="text-sm text-gray-500">Published</div>
-                  <div className="font-medium text-white">{details.published}</div>
-                </div>
-              </>
-            )}
-
-            {artifactType === 'npm' && (
-              <>
-                <div>
-                  <div className="text-sm text-gray-500">License</div>
-                  <div className="font-medium text-white">{details.license}</div>
-                </div>
-                <div>
-                  <div className="text-sm text-gray-500">Published</div>
-                  <div className="font-medium text-white">{details.published}</div>
-                </div>
-              </>
-            )}
-          </div>
-        </div>
-      </div>
-
-      {/* Details Section */}
-      {artifactType === 'docker' && details.environment && (
-        <div className="card space-y-4">
-          <h2 className="text-lg font-semibold text-gray-100">Environment Variables</h2>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-            {details.environment.map((env: string, idx: number) => (
-              <div key={idx} className="bg-gray-800/50 rounded-lg p-3 font-mono text-xs text-gray-300 flex items-center gap-2">
-                <svg className="w-4 h-4 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
-                </svg>
-                {env}
-              </div>
-            ))}
-          </div>
-          {details.commands && (
             <div>
-              <h3 className="text-sm font-medium text-gray-500 mb-2">Default Command</h3>
-              <div className="bg-gray-800/50 rounded-lg p-3 font-mono text-xs text-gray-300">
-                {details.commands[0]}
+              <div className="text-sm text-gray-500">Size</div>
+              <div className="font-medium text-white">{formatSize(artifact.Size)}</div>
+            </div>
+            <div>
+              <div className="text-sm text-gray-500">Created</div>
+              <div className="font-medium text-white">{formatTimestamp(artifact.Created)}</div>
+            </div>
+            <div>
+              <div className="text-sm text-gray-500">Pulls</div>
+              <div className="font-medium text-white">{formatPulls(artifact.Downloads || 0)}</div>
+            </div>
+          </div>
+
+          {artifact.Tags && artifact.Tags.length > 0 && (
+            <div>
+              <div className="text-sm text-gray-500 mb-2">Tags</div>
+              <div className="flex flex-wrap gap-1">
+                {artifact.Tags.map((tag, idx) => (
+                  <span key={idx} className="px-2 py-0.5 text-xs rounded-full bg-gray-700 text-gray-300">
+                    {tag}
+                  </span>
+                ))}
               </div>
             </div>
           )}
         </div>
-      )}
+      </div>
 
-      {artifactType === 'maven' && details.dependencies && (
-        <div className="card">
-          <h2 className="text-lg font-semibold text-gray-100 mb-3">Dependencies</h2>
-          <div className="space-y-2">
-            {details.dependencies.map((dep: string, idx: number) => (
-              <div key={idx} className="bg-gray-800/50 rounded-lg p-3 font-mono text-xs text-gray-300 flex items-center justify-between">
-                <span>{dep}</span>
-                <span className="text-gray-500">compile</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {artifactType === 'npm' && details.dependencies && (
-        <div className="card">
-          <h2 className="text-lg font-semibold text-gray-100 mb-3">Dependencies</h2>
-          <div className="space-y-2">
-            {Object.entries(details.dependencies).map(([name, version]: [string, string], idx: number) => (
-              <div key={idx} className="bg-gray-800/50 rounded-lg p-3 font-mono text-xs text-gray-300 flex items-center justify-between">
-                <span>{name}</span>
-                <span className="text-gray-500">{version}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Pull/Install Command */}
       <div className="card">
         <h2 className="text-lg font-semibold text-gray-100 mb-4">Pull/Install Command</h2>
-        <div className="bg-gray-800 rounded-lg p-4 font-mono text-sm text-gray-300 flex items-center justify-between">
-          {artifactType === 'docker' && (
-            <>
-              <span>docker pull {details.image}</span>
-              <button className="text-blue-400 hover:text-blue-300 font-medium">Copy</button>
-            </>
-          )}
-          {artifactType === 'npm' && (
-            <>
-              <span>npm install {artifactName}@{version}</span>
-              <button className="text-blue-400 hover:text-blue-300 font-medium">Copy</button>
-            </>
-          )}
-          {artifactType === 'maven' && (
-            <>
-              <span>&lt;dependency&gt;</span>
-              <button className="text-blue-400 hover:text-blue-300 font-medium">Copy</button>
-            </>
-          )}
+        <div className="bg-gray-800 rounded-lg p-4 font-mono text-sm text-gray-300 flex items-center justify-between gap-3">
+          <span className="break-all">{pullCommand}</span>
+          <button
+            onClick={() => navigator.clipboard.writeText(pullCommand)}
+            className="text-blue-400 hover:text-blue-300 font-medium flex-shrink-0"
+          >
+            Copy
+          </button>
         </div>
+
+        {typeConfig.usage && (
+          <div className="mt-4 pt-4 border-t border-gray-800">
+            <div className="text-sm text-gray-500 mb-2">{typeConfig.usage.title}</div>
+            <div className="bg-gray-800 rounded-lg p-4 font-mono text-sm text-gray-300 flex items-start justify-between gap-3">
+              <pre className="whitespace-pre-wrap break-all">{typeConfig.usage.code(pullParams)}</pre>
+              <button
+                onClick={() => navigator.clipboard.writeText(typeConfig.usage!.code(pullParams))}
+                className="text-blue-400 hover:text-blue-300 font-medium flex-shrink-0"
+              >
+                Copy
+              </button>
+            </div>
+          </div>
+        )}
       </div>
+
+      {isContainerType(artifactType) && childManifests.length > 0 && (
+        <div className="card">
+          <h2 className="text-lg font-semibold text-gray-100 mb-4">Platforms</h2>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <thead className="text-gray-500">
+                <tr>
+                  <th className="py-1.5 pr-4 font-medium">Digest</th>
+                  <th className="py-1.5 pr-4 font-medium">OS/ARCH</th>
+                  <th className="py-1.5 pr-4 font-medium">Compressed Size</th>
+                </tr>
+              </thead>
+              <tbody>
+                {childManifests.map((m, idx) => (
+                  <tr key={idx} className="border-t border-gray-800">
+                    <td className="py-1.5 pr-4 font-mono text-gray-400 truncate max-w-xs">
+                      sha256:{String(m.digest).replace(/^sha256:/, '').slice(-12)}
+                    </td>
+                    <td className="py-1.5 pr-4 text-gray-400">{m.os}/{m.arch}</td>
+                    <td className="py-1.5 pr-4 text-gray-400">{formatSize(Number(m.size))}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

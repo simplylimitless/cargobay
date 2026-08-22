@@ -26,9 +26,12 @@ func HostOnly(host string) string {
 // explicit target — this is how downstream clients address a specific
 // (often private) registry with zero change to repo/package paths: they
 // just point at that registry's own hostname. Otherwise, falls back to
-// today's default behavior: the first enabled public proxy-registry of
-// artifactType. Returns nil if nothing matches (e.g. before any registry
-// has been configured).
+// the highest-priority enabled, non-private, proxy-enabled registry of
+// artifactType. Both paths read live from the DB, so Settings edits take
+// effect immediately — the registries param is unused for resolution but
+// kept for the constructor call sites that still pass it. Returns nil if
+// nothing matches (e.g. before any registry has been configured, or the
+// matched registry has proxying disabled).
 func ResolveRegistry(db *database.Database, registries []database.RegistryConfig, requestHost, artifactType string) *database.RegistryConfig {
 	if host := HostOnly(requestHost); host != "" {
 		if reg, err := db.GetRegistryByHost(host); err == nil && reg != nil && reg.Type == artifactType {
@@ -36,11 +39,8 @@ func ResolveRegistry(db *database.Database, registries []database.RegistryConfig
 		}
 	}
 
-	for i := range registries {
-		reg := registries[i]
-		if reg.Type == artifactType && reg.Proxy && !reg.Private {
-			return &reg
-		}
+	if reg, err := db.GetDefaultRegistry(artifactType); err == nil && reg != nil {
+		return reg
 	}
 	return nil
 }

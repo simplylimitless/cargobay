@@ -35,6 +35,20 @@ type MavenProxy struct {
 
 // NewMavenProxy creates a new Maven proxy instance
 func NewMavenProxy(db *database.Database, storage storage.StorageAdapter, cache *cache.Cache, rbacMgr *rbac.RBAC, registries []database.RegistryConfig) chi.Router {
+	return newMavenProxy(db, storage, cache, rbacMgr, registries, "maven")
+}
+
+// NewMavenAliasProxy mounts the same Maven-layout proxy under a different
+// registry type — Gradle and SBT both consume standard Maven-layout
+// repositories, so they need no protocol differences, only their own
+// registry `Type` label for resolution/RBAC. Cached artifacts are still
+// stored and listed as plain "maven" artifacts, since the on-disk layout
+// and metadata are identical regardless of which client fetched them.
+func NewMavenAliasProxy(db *database.Database, storage storage.StorageAdapter, cache *cache.Cache, rbacMgr *rbac.RBAC, registries []database.RegistryConfig, artifactType string) chi.Router {
+	return newMavenProxy(db, storage, cache, rbacMgr, registries, artifactType)
+}
+
+func newMavenProxy(db *database.Database, storage storage.StorageAdapter, cache *cache.Cache, rbacMgr *rbac.RBAC, registries []database.RegistryConfig, artifactType string) chi.Router {
 	r := chi.NewRouter()
 
 	proxy := &MavenProxy{
@@ -42,10 +56,10 @@ func NewMavenProxy(db *database.Database, storage storage.StorageAdapter, cache 
 		storage:    storage,
 		cache:      cache,
 		registries: registries,
-		registry:   "maven",
+		registry:   artifactType,
 	}
 
-	r.Use(proxypkg.RequireReadAccess(db, rbacMgr, registries, "maven"))
+	r.Use(proxypkg.RequireReadAccess(db, rbacMgr, registries, artifactType))
 
 	// Maven Repository Layout paths
 	// /group/artifact/version/artifact-version.ext
@@ -91,17 +105,25 @@ func (p *MavenProxy) handleJAR(w http.ResponseWriter, r *http.Request) {
 	artifact := chi.URLParam(r, "artifact")
 	version := chi.URLParam(r, "version")
 
+	t := proxypkg.TargetFromContext(r, "maven")
+
 	// Try cache first
 	if data, err := p.storage.GetArtifact("maven", group, artifact, version); err == nil && data != nil {
 		w.Header().Set("Content-Type", "application/java-archive")
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s-%s.jar", artifact, version))
+		if err := p.db.IncrementArtifactDownloads(t.Label, group, artifact, version); err != nil {
+			fmt.Printf("failed to record download for %s:%s:%s: %v\n", group, artifact, version, err)
+		}
 		w.Write(data)
 		return
 	}
 
 	// Fetch from upstream
-	t := proxypkg.TargetFromContext(r, "maven")
-	tarballURL := p.getUpstreamURL(t.Reg, group, artifact, version, "jar")
+	tarballURL, err := p.getUpstreamURL(t.Reg, group, artifact, version, "jar")
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to get JAR upstream URL: %v", err), http.StatusBadGateway)
+		return
+	}
 	req, err := http.NewRequest(http.MethodGet, tarballURL, nil)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to build JAR request: %v", err), http.StatusInternalServerError)
@@ -129,6 +151,9 @@ func (p *MavenProxy) handleJAR(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/java-archive")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s-%s.jar", artifact, version))
+	if err := p.db.IncrementArtifactDownloads(t.Label, group, artifact, version); err != nil {
+		fmt.Printf("failed to record download for %s:%s:%s: %v\n", group, artifact, version, err)
+	}
 	w.Write(data)
 }
 
@@ -148,7 +173,11 @@ func (p *MavenProxy) handlePOM(w http.ResponseWriter, r *http.Request) {
 
 	// Fetch from upstream
 	t := proxypkg.TargetFromContext(r, "maven")
-	tarballURL := p.getUpstreamURL(t.Reg, group, artifact, version, "pom")
+	tarballURL, err := p.getUpstreamURL(t.Reg, group, artifact, version, "pom")
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to get POM upstream URL: %v", err), http.StatusBadGateway)
+		return
+	}
 	req, err := http.NewRequest(http.MethodGet, tarballURL, nil)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to build POM request: %v", err), http.StatusInternalServerError)
@@ -210,7 +239,11 @@ func (p *MavenProxy) handleArtifactFile(w http.ResponseWriter, r *http.Request, 
 
 	// Fetch from upstream
 	t := proxypkg.TargetFromContext(r, "maven")
-	upstreamURL := p.getUpstreamURL(t.Reg, group, artifact, version, ext)
+	upstreamURL, err := p.getUpstreamURL(t.Reg, group, artifact, version, ext)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to get %s upstream URL: %v", ext, err), http.StatusBadGateway)
+		return
+	}
 	req, err := http.NewRequest(http.MethodGet, upstreamURL, nil)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to build %s request: %v", ext, err), http.StatusInternalServerError)
@@ -356,14 +389,15 @@ func (p *MavenProxy) handleMetadata(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(metadata))
 }
 
-// getUpstreamURL returns the upstream URL for an artifact
-func (p *MavenProxy) getUpstreamURL(reg *database.RegistryConfig, group, artifact, version, ext string) string {
-	upstream := "https://repo1.maven.org"
-	if reg != nil && reg.Proxy && reg.URL != "" {
-		upstream = reg.URL
+// getUpstreamURL returns the upstream URL for an artifact. Returns an error
+// if the resolved registry has no upstream proxy configured — it never
+// silently falls back to Maven Central.
+func (p *MavenProxy) getUpstreamURL(reg *database.RegistryConfig, group, artifact, version, ext string) (string, error) {
+	if reg == nil || !reg.Proxy || reg.URL == "" {
+		return "", fmt.Errorf("no upstream proxy configured for this registry")
 	}
 
 	// Maven path: group/artifact/version/artifact-version.ext
 	groupPath := strings.ReplaceAll(group, ".", "/")
-	return fmt.Sprintf("%s/%s/%s/%s/%s-%s.%s", upstream, groupPath, artifact, version, artifact, version, ext)
+	return fmt.Sprintf("%s/%s/%s/%s/%s-%s.%s", reg.URL, groupPath, artifact, version, artifact, version, ext), nil
 }

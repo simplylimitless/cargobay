@@ -90,11 +90,11 @@ type RegistryConfig struct {
 
 // Config is the main application configuration
 type Config struct {
-	Server     ServerConfig      `yaml:"server"`
-	Storage    StorageConfig     `yaml:"storage"`
-	Database   DatabaseConfig    `yaml:"database"`
-	Cache      CacheConfig       `yaml:"cache"`
-	Registries []RegistryConfig  `yaml:"registries"`
+	Server     ServerConfig     `yaml:"server"`
+	Storage    StorageConfig    `yaml:"storage"`
+	Database   DatabaseConfig   `yaml:"database"`
+	Cache      CacheConfig      `yaml:"cache"`
+	Registries []RegistryConfig `yaml:"registries"`
 }
 
 // DefaultConfig returns the default configuration

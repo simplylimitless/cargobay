@@ -18,6 +18,13 @@ function Section({ title, children }: { title: string; children: ReactNode }) {
 }
 
 export function GettingStarted() {
+  // Use the host cargobay is actually being reached at rather than a
+  // hardcoded port — this may differ from the backend's internal listen
+  // port (config.yaml's server.port) once cargobay is behind an ingress or
+  // load balancer terminating on 443/80.
+  const origin = typeof window !== 'undefined' ? window.location.origin : ''
+  const host = typeof window !== 'undefined' ? window.location.host : 'cargobay:4500'
+
   return (
     <div className="space-y-8 max-w-4xl mx-auto">
       <div>
@@ -30,10 +37,10 @@ export function GettingStarted() {
       <Section title="npm">
         <p className="text-sm text-gray-400">Configure npm to install packages through cargobay:</p>
         <CodeBlock>{`# Configure npm to use cargobay
-npm config set registry http://cargobay:4500/npm/
+npm config set registry ${origin}/npm/
 
 # Or in .npmrc
-registry=http://cargobay:4500/npm/`}</CodeBlock>
+registry=${origin}/npm/`}</CodeBlock>
         <p className="text-sm text-gray-500">
           In VS Code, this is picked up automatically once <code className="text-gray-400">.npmrc</code> is set — no extra IDE config needed.
         </p>
@@ -43,7 +50,7 @@ registry=http://cargobay:4500/npm/`}</CodeBlock>
         <p className="text-sm text-gray-400">Add cargobay as a repository in your <code className="text-gray-400">build.gradle</code>:</p>
         <CodeBlock>{`repositories {
     maven {
-        url 'http://cargobay:4500/maven/'
+        url '${origin}/maven/'
     }
 }`}</CodeBlock>
         <p className="text-sm text-gray-500">
@@ -57,7 +64,7 @@ registry=http://cargobay:4500/npm/`}</CodeBlock>
   <mirrors>
     <mirror>
       <id>cargobay</id>
-      <url>http://cargobay:4500/maven/</url>
+      <url>${origin}/maven/</url>
       <mirrorOf>*</mirrorOf>
     </mirror>
   </mirrors>
@@ -70,11 +77,11 @@ registry=http://cargobay:4500/npm/`}</CodeBlock>
       <Section title="Docker">
         <p className="text-sm text-gray-400">Pull images through cargobay, or set it as a registry mirror:</p>
         <CodeBlock>{`# Pull through cargobay
-docker pull cargobay:4500/library/nginx:latest
+docker pull ${host}/library/nginx:latest
 
 # Or configure as a registry mirror in /etc/docker/daemon.json
 {
-  "registry-mirrors": ["http://cargobay:4500/"]
+  "registry-mirrors": ["${origin}/"]
 }`}</CodeBlock>
         <p className="text-sm text-gray-500">Restart Docker Desktop (or the daemon) after editing <code className="text-gray-400">daemon.json</code> for the mirror to take effect.</p>
       </Section>

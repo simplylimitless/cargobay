@@ -20,7 +20,19 @@ export default defineConfig({
         target: backendTarget,
         changeOrigin: true,
       },
-      '/docker': {
+      '/v2': {
+        target: backendTarget,
+        changeOrigin: true,
+      },
+      '/pypi': {
+        target: backendTarget,
+        changeOrigin: true,
+      },
+      '/nuget': {
+        target: backendTarget,
+        changeOrigin: true,
+      },
+      '/helm': {
         target: backendTarget,
         changeOrigin: true,
       },

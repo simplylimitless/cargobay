@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
     metadata         JSONB NOT NULL DEFAULT '{}',
     tags             TEXT[] NOT NULL DEFAULT '{}',
     signatures       JSONB NOT NULL DEFAULT '[]',
+    downloads        BIGINT NOT NULL DEFAULT 0,
     UNIQUE (registry_id, namespace, artifact_name, version)
 );
 
@@ -143,3 +144,78 @@ CREATE TABLE IF NOT EXISTS vulnerability_db_settings (
     last_error            TEXT NOT NULL DEFAULT ''
 );
 INSERT INTO vulnerability_db_settings (id) VALUES (1) ON CONFLICT DO NOTHING;
+
+-- Singleton row holding tunable settings for how the backend rebuilds the
+-- Postgres full-text search index on artifacts (see
+-- migrations/007_add_search_index_settings.sql).
+CREATE TABLE IF NOT EXISTS search_index_settings (
+    id                      INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    auto_reindex_enabled    BOOLEAN NOT NULL DEFAULT TRUE,
+    reindex_interval_hours  INTEGER NOT NULL DEFAULT 24,
+    last_checked_at         TIMESTAMPTZ,
+    last_reindexed_at       TIMESTAMPTZ,
+    last_artifact_count     INTEGER NOT NULL DEFAULT 0,
+    last_error              TEXT NOT NULL DEFAULT ''
+);
+INSERT INTO search_index_settings (id) VALUES (1) ON CONFLICT DO NOTHING;
+
+-- Stores the results of vulnerability scans (currently Docker/OCI images
+-- scanned via Trivy) keyed by artifact (see
+-- migrations/009_add_vulnerability_scans.sql).
+CREATE TABLE IF NOT EXISTS vulnerability_scans (
+    artifact_id      TEXT NOT NULL,
+    artifact_type    TEXT NOT NULL,
+    registry_id      TEXT NOT NULL,
+    namespace        TEXT NOT NULL,
+    artifact_name    TEXT NOT NULL,
+    version          TEXT NOT NULL,
+    scan_time        TIMESTAMPTZ NOT NULL,
+    severity         TEXT NOT NULL,
+    vulnerabilities  JSONB NOT NULL DEFAULT '[]',
+    scanned_by       TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (artifact_id, scan_time)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vulnerability_scans_artifact_id ON vulnerability_scans (artifact_id, scan_time DESC);
+CREATE INDEX IF NOT EXISTS idx_vulnerability_scans_severity ON vulnerability_scans (severity);
+
+-- Singleton row holding tunable settings for how the backend rescans cached
+-- Docker/OCI artifacts for vulnerabilities via Trivy (see
+-- migrations/010_add_vulnerability_scan_settings.sql).
+CREATE TABLE IF NOT EXISTS vulnerability_scan_settings (
+    id                  INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    auto_scan_enabled   BOOLEAN NOT NULL DEFAULT TRUE,
+    scan_interval_hours INTEGER NOT NULL DEFAULT 24,
+    last_checked_at     TIMESTAMPTZ,
+    last_scan_at        TIMESTAMPTZ,
+    last_error          TEXT NOT NULL DEFAULT ''
+);
+INSERT INTO vulnerability_scan_settings (id) VALUES (1) ON CONFLICT DO NOTHING;
+
+-- Singleton row holding tunable settings for the backend's scheduled full
+-- database backup job (see migrations/011_add_backup_settings.sql).
+-- storage_type/storage_config (migrations/013_add_backup_storage_settings.sql)
+-- let backups target a distinct storage backend, configured from Settings;
+-- an empty storage_type means "reuse the main artifact storage adapter".
+CREATE TABLE IF NOT EXISTS backup_settings (
+    id                    INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    auto_backup_enabled   BOOLEAN NOT NULL DEFAULT FALSE,
+    backup_interval_hours INTEGER NOT NULL DEFAULT 24,
+    last_checked_at       TIMESTAMPTZ,
+    last_backup_at        TIMESTAMPTZ,
+    last_backup_path      TEXT NOT NULL DEFAULT '',
+    last_error            TEXT NOT NULL DEFAULT '',
+    storage_type          TEXT NOT NULL DEFAULT '',
+    storage_config        JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+INSERT INTO backup_settings (id) VALUES (1) ON CONFLICT DO NOTHING;
+
+-- Singleton row accumulating instance-wide stats. Currently tracks bytes
+-- served from local storage on a cache hit (i.e. bytes that did not need to
+-- be re-fetched from an upstream registry) — backs the Stats page's
+-- "bandwidth saved" figure (see migrations/011_add_stats.sql).
+CREATE TABLE IF NOT EXISTS stats (
+    id                     INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    bandwidth_saved_bytes  BIGINT NOT NULL DEFAULT 0
+);
+INSERT INTO stats (id) VALUES (1) ON CONFLICT DO NOTHING;

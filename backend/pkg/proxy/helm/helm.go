@@ -243,18 +243,21 @@ func (h *HelmProxy) handleChartDownload(w http.ResponseWriter, r *http.Request) 
 	chartName := chi.URLParam(r, "chartName")
 	version := chi.URLParam(r, "version")
 	fileName := fmt.Sprintf("%s-%s.tgz", chartName, version)
+	t := proxypkg.TargetFromContext(r, "helm")
 
 	// Try to get from storage first
 	data, err := h.storage.GetArtifact("helm", "", chartName, version)
 	if err == nil && data != nil {
 		w.Header().Set("Content-Type", "application/x-gzip")
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", fileName))
+		if err := h.db.IncrementArtifactDownloads(t.Label, "", chartName, version); err != nil {
+			fmt.Printf("failed to record download for %s %s: %v\n", chartName, version, err)
+		}
 		w.Write(data)
 		return
 	}
 
 	// Fetch from upstream
-	t := proxypkg.TargetFromContext(r, "helm")
 	data, err = h.fetchChartFromUpstream(t.Reg, t.Label, chartName, version, fileName)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to download chart: %v", err), http.StatusBadGateway)
@@ -272,6 +275,9 @@ func (h *HelmProxy) handleChartDownload(w http.ResponseWriter, r *http.Request) 
 
 	w.Header().Set("Content-Type", "application/x-gzip")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", fileName))
+	if err := h.db.IncrementArtifactDownloads(t.Label, "", chartName, version); err != nil {
+		fmt.Printf("failed to record download for %s %s: %v\n", chartName, version, err)
+	}
 	w.Write(data)
 }
 
@@ -279,18 +285,21 @@ func (h *HelmProxy) handleChartDownload(w http.ResponseWriter, r *http.Request) 
 func (h *HelmProxy) handleChartDownloadAlt(w http.ResponseWriter, r *http.Request) {
 	chartName := chi.URLParam(r, "chartName")
 	version := chi.URLParam(r, "version")
+	t := proxypkg.TargetFromContext(r, "helm")
 
 	// Try to get from storage first
 	data, err := h.storage.GetArtifact("helm", "", chartName, version)
 	if err == nil && data != nil {
 		w.Header().Set("Content-Type", "application/x-gzip")
+		if err := h.db.IncrementArtifactDownloads(t.Label, "", chartName, version); err != nil {
+			fmt.Printf("failed to record download for %s %s: %v\n", chartName, version, err)
+		}
 		w.Write(data)
 		return
 	}
 
 	// Fetch from upstream
 	fileName := fmt.Sprintf("%s-%s.tgz", chartName, version)
-	t := proxypkg.TargetFromContext(r, "helm")
 	data, err = h.fetchChartFromUpstream(t.Reg, t.Label, chartName, version, fileName)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to download chart: %v", err), http.StatusBadGateway)
@@ -304,6 +313,9 @@ func (h *HelmProxy) handleChartDownloadAlt(w http.ResponseWriter, r *http.Reques
 	}
 
 	w.Header().Set("Content-Type", "application/x-gzip")
+	if err := h.db.IncrementArtifactDownloads(t.Label, "", chartName, version); err != nil {
+		fmt.Printf("failed to record download for %s %s: %v\n", chartName, version, err)
+	}
 	w.Write(data)
 }
 
@@ -360,10 +372,10 @@ func (h *HelmProxy) handleChartsDir(w http.ResponseWriter, r *http.Request) {
 
 // fetchChartFromUpstream fetches a chart from upstream
 func (h *HelmProxy) fetchChartFromUpstream(reg *database.RegistryConfig, registryLabel, chartName, version, fileName string) ([]byte, error) {
-	upstream := "https://charts.bitnami.com/bitnami"
-	if reg != nil && reg.Proxy && reg.URL != "" {
-		upstream = reg.URL
+	if reg == nil || !reg.Proxy || reg.URL == "" {
+		return nil, fmt.Errorf("no upstream proxy configured for this registry")
 	}
+	upstream := reg.URL
 
 	// Try to get from cache
 	cacheKey := fmt.Sprintf("upstream:chart:%s:%s", chartName, version)

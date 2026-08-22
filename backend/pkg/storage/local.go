@@ -149,12 +149,23 @@ func (a *LocalAdapter) DeleteFile(bucket, key string) error {
 	return os.Remove(path)
 }
 
-// ListFiles lists files in local storage
+// ListFiles lists files in local storage. Keys are returned relative to
+// bucket (matching the S3/GCS/Azure adapters), so each one can be passed
+// straight back into Download/DeleteFile without re-deriving a path.
 func (a *LocalAdapter) ListFiles(bucket, prefix string) ([]string, error) {
-	path := filepath.Join(a.basePath, bucket, prefix)
-	matches, err := filepath.Glob(filepath.Join(path, "*"))
+	base := filepath.Join(a.basePath, bucket)
+	matches, err := filepath.Glob(filepath.Join(base, prefix, "*"))
 	if err != nil {
 		return nil, err
 	}
-	return matches, nil
+
+	keys := make([]string, 0, len(matches))
+	for _, m := range matches {
+		rel, err := filepath.Rel(base, m)
+		if err != nil {
+			continue
+		}
+		keys = append(keys, rel)
+	}
+	return keys, nil
 }

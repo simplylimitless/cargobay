@@ -9,15 +9,16 @@ interface RegistryOption {
   type: string
   icon: string
   defaultChecked: boolean
+  proxy: boolean
 }
 
 const REGISTRY_OPTIONS: RegistryOption[] = [
-  { id: 'dockerhub', name: 'Docker Hub', url: 'https://registry-1.docker.io', type: 'docker', icon: '🐳', defaultChecked: true },
-  { id: 'ghcr', name: 'GitHub Container Registry', url: 'https://ghcr.io', type: 'docker', icon: '🐳', defaultChecked: false },
-  { id: 'npm', name: 'NPM Registry', url: 'https://registry.npmjs.org', type: 'npm', icon: '📦', defaultChecked: true },
-  { id: 'maven-central', name: 'Maven Central', url: 'https://repo.maven.apache.org/maven2', type: 'maven', icon: '☕', defaultChecked: true },
-  { id: 'pypi', name: 'PyPI', url: 'https://pypi.org', type: 'pypi', icon: '🐍', defaultChecked: false },
-  { id: 'nuget', name: 'NuGet Gallery', url: 'https://api.nuget.org/v3/index.json', type: 'nuget', icon: '🔨', defaultChecked: false },
+  { id: 'dockerhub', name: 'Docker Hub', url: 'https://registry-1.docker.io', type: 'docker', icon: '🐳', defaultChecked: true, proxy: true },
+  { id: 'ghcr', name: 'GitHub Container Registry', url: 'https://ghcr.io', type: 'docker', icon: '🐳', defaultChecked: false, proxy: true },
+  { id: 'npm', name: 'NPM Registry', url: 'https://registry.npmjs.org', type: 'npm', icon: '📦', defaultChecked: true, proxy: true },
+  { id: 'maven-central', name: 'Maven Central', url: 'https://repo.maven.apache.org/maven2', type: 'maven', icon: '☕', defaultChecked: true, proxy: true },
+  { id: 'pypi', name: 'PyPI', url: 'https://pypi.org', type: 'pypi', icon: '🐍', defaultChecked: false, proxy: true },
+  { id: 'nuget', name: 'NuGet Gallery', url: 'https://api.nuget.org/v3/index.json', type: 'nuget', icon: '🔨', defaultChecked: false, proxy: true },
 ]
 
 export function Setup() {
@@ -62,6 +63,15 @@ export function Setup() {
     setStep(2)
   }
 
+  const toggleRegistryProxy = (id: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
   const finishSetup = async () => {
     setError(null)
     setSubmitting(true)
@@ -72,6 +82,7 @@ export function Setup() {
         url: r.url,
         type: r.type,
         enabled: true,
+        proxy: r.proxy,
         priority: i,
       }))
 
@@ -150,7 +161,7 @@ export function Setup() {
             {REGISTRY_OPTIONS.map((reg) => (
               <label
                 key={reg.id}
-                className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer transition-colors min-w-0 ${
+                className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors min-w-0 ${
                   selected.has(reg.id)
                     ? 'border-blue-500/50 bg-blue-500/10'
                     : 'border-gray-700 bg-gray-800/50 hover:bg-gray-800'
@@ -160,13 +171,26 @@ export function Setup() {
                   type="checkbox"
                   checked={selected.has(reg.id)}
                   onChange={() => toggleRegistry(reg.id)}
-                  className="w-4 h-4 shrink-0"
+                  className="w-4 h-4 shrink-0 mt-0.5"
                 />
-                <span className="text-xl shrink-0">{reg.icon}</span>
-                <span className="min-w-0">
-                  <div className="text-sm font-medium text-gray-100">{reg.name}</div>
-                  <div className="text-xs text-gray-500 font-mono break-all">{reg.url}</div>
-                </span>
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2 mb-1">
+                    <span className="text-xl shrink-0">{reg.icon}</span>
+                    <span className="min-w-0">
+                      <div className="text-sm font-medium text-gray-100">{reg.name}</div>
+                      <div className="text-xs text-gray-500 font-mono break-all">{reg.url}</div>
+                    </span>
+                  </div>
+                  <label className="flex items-center gap-2 ml-6 text-xs text-gray-400">
+                    <input
+                      type="checkbox"
+                      checked={reg.proxy}
+                      onChange={() => toggleRegistryProxy(reg.id)}
+                      className="w-3 h-3 shrink-0"
+                    />
+                    <span>Upstream proxy</span>
+                  </label>
+                </div>
               </label>
             ))}
           </div>

@@ -174,6 +174,7 @@ func (p *PyPIProxy) handlePackageFile(w http.ResponseWriter, r *http.Request) {
 	packageName := chi.URLParam(r, "packageName")
 	version := chi.URLParam(r, "version")
 	fileName := chi.URLParam(r, "fileName")
+	t := proxypkg.TargetFromContext(r, "pypi")
 
 	// Try to get from storage first
 	data, err := p.storage.GetArtifact("pypi", "", packageName, version)
@@ -190,12 +191,15 @@ func (p *PyPIProxy) handlePackageFile(w http.ResponseWriter, r *http.Request) {
 
 		w.Header().Set("Content-Type", contentType)
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", fileName))
+		if err := p.db.IncrementArtifactDownloads(t.Label, "", packageName, version); err != nil {
+			fmt.Printf("failed to record download for %s==%s: %v\n", packageName, version, err)
+		}
 		w.Write(data)
 		return
 	}
 
 	// Fetch from upstream
-	data, err = p.fetchPackageFileFromUpstream(proxypkg.TargetFromContext(r, "pypi").Reg, packageName, version, fileName)
+	data, err = p.fetchPackageFileFromUpstream(t.Reg, packageName, version, fileName)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to download package: %v", err), http.StatusBadGateway)
 		return
@@ -222,6 +226,9 @@ func (p *PyPIProxy) handlePackageFile(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", fileName))
+	if err := p.db.IncrementArtifactDownloads(t.Label, "", packageName, version); err != nil {
+		fmt.Printf("failed to record download for %s==%s: %v\n", packageName, version, err)
+	}
 	w.Write(data)
 }
 
@@ -240,10 +247,10 @@ func (p *PyPIProxy) handleLegacyPackageVersion(w http.ResponseWriter, r *http.Re
 
 // fetchPackageFromUpstream fetches package metadata from PyPI
 func (p *PyPIProxy) fetchPackageFromUpstream(reg *database.RegistryConfig, registryLabel, packageName, version string) (*database.ArtifactMetadata, error) {
-	upstream := "https://pypi.org"
-	if reg != nil && reg.Proxy && reg.URL != "" {
-		upstream = reg.URL
+	if reg == nil || !reg.Proxy || reg.URL == "" {
+		return nil, fmt.Errorf("no upstream proxy configured for this registry")
 	}
+	upstream := reg.URL
 
 	// Get package info from PyPI API
 	infoURL := fmt.Sprintf("%s/pypi/%s/json", upstream, packageName)
@@ -320,10 +327,10 @@ func (p *PyPIProxy) fetchPackageFromUpstream(reg *database.RegistryConfig, regis
 
 // fetchPackageFileFromUpstream fetches a package file from PyPI
 func (p *PyPIProxy) fetchPackageFileFromUpstream(reg *database.RegistryConfig, packageName, version, fileName string) ([]byte, error) {
-	upstream := "https://files.pythonhosted.org"
-	if reg != nil && reg.Proxy && strings.HasPrefix(reg.URL, "http") {
-		upstream = reg.URL
+	if reg == nil || !reg.Proxy || !strings.HasPrefix(reg.URL, "http") {
+		return nil, fmt.Errorf("no upstream proxy configured for this registry")
 	}
+	upstream := reg.URL
 
 	// PyPI file URL format
 	fileURL := fmt.Sprintf("%s/packages/%s/%s/%s", upstream, packageName[0:1], packageName, fileName)

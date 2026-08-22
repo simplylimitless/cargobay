@@ -8,26 +8,31 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/simplylimitless/cargobay/backend/pkg/auth"
+	"github.com/simplylimitless/cargobay/backend/pkg/backup"
 	"github.com/simplylimitless/cargobay/backend/pkg/cache"
 	"github.com/simplylimitless/cargobay/backend/pkg/database"
 	"github.com/simplylimitless/cargobay/backend/pkg/middleware"
 	"github.com/simplylimitless/cargobay/backend/pkg/rbac"
+	"github.com/simplylimitless/cargobay/backend/pkg/searchindex"
 	"github.com/simplylimitless/cargobay/backend/pkg/storage"
 	"github.com/simplylimitless/cargobay/backend/pkg/vulnerability"
-	"github.com/go-chi/chi/v5"
 )
 
 // Server represents the HTTP API server
 type Server struct {
-	router         chi.Router
-	db             *database.Database
-	rbac           *rbac.RBAC
-	scanner        *vulnerability.VulnerabilityScanner
-	vulnDBUpdater  *vulnerability.DBUpdater
-	storageAdapter storage.StorageAdapter
-	cache          *cache.Cache
-	server         *http.Server
+	router               chi.Router
+	db                   *database.Database
+	rbac                 *rbac.RBAC
+	scanner              *vulnerability.VulnerabilityScanner
+	vulnDBUpdater        *vulnerability.DBUpdater
+	vulnRescanner        *vulnerability.Rescanner
+	searchIndexReindexer *searchindex.Reindexer
+	backupSvc            *backup.Backup
+	storageAdapter       storage.StorageAdapter
+	cache                *cache.Cache
+	server               *http.Server
 }
 
 // APIResponse represents a standard API response
@@ -40,24 +45,28 @@ type APIResponse struct {
 
 // PaginationResponse represents a paginated response
 type PaginationResponse struct {
-	Artifacts []database.ArtifactMetadata `json:"artifacts"`
-	Total     int                         `json:"total"`
-	HasMore   bool                        `json:"hasMore"`
+	Artifacts  []database.ArtifactMetadata `json:"artifacts"`
+	Total      int                         `json:"total"`
+	HasMore    bool                        `json:"hasMore"`
 	NextCursor string                      `json:"nextCursor,omitempty"`
 	PrevCursor string                      `json:"prevCursor,omitempty"`
 }
 
 // NewServer creates a new API server
 func NewServer(db *database.Database, rbacMgr *rbac.RBAC, scanner *vulnerability.VulnerabilityScanner,
-	storageAdapter storage.StorageAdapter, cacheClient *cache.Cache, vulnDBUpdater *vulnerability.DBUpdater) *Server {
+	storageAdapter storage.StorageAdapter, cacheClient *cache.Cache, vulnDBUpdater *vulnerability.DBUpdater,
+	searchIndexReindexer *searchindex.Reindexer, vulnRescanner *vulnerability.Rescanner, backupSvc *backup.Backup) *Server {
 
 	s := &Server{
-		db:             db,
-		rbac:           rbacMgr,
-		scanner:        scanner,
-		vulnDBUpdater:  vulnDBUpdater,
-		storageAdapter: storageAdapter,
-		cache:          cacheClient,
+		db:                   db,
+		rbac:                 rbacMgr,
+		scanner:              scanner,
+		vulnDBUpdater:        vulnDBUpdater,
+		vulnRescanner:        vulnRescanner,
+		searchIndexReindexer: searchIndexReindexer,
+		backupSvc:            backupSvc,
+		storageAdapter:       storageAdapter,
+		cache:                cacheClient,
 	}
 
 	s.router = chi.NewRouter()
@@ -94,6 +103,7 @@ func (s *Server) setupRoutes() {
 
 	// Search endpoint
 	api.Get("/search", s.handleSearch)
+	api.Get("/search/autocomplete", s.handleAutocomplete)
 
 	// Registries endpoints (read)
 	api.Get("/registries", s.handleListRegistries)
@@ -118,6 +128,23 @@ func (s *Server) setupRoutes() {
 	// Vulnerability DB settings (read) — permission enforced in-handler via system:read
 	api.Get("/settings/vulnerability-db", s.handleGetVulnDBSettings)
 
+	// Search index settings (read) — permission enforced in-handler via system:read
+	api.Get("/settings/search-index", s.handleGetSearchIndexSettings)
+
+	// Backup settings/list (read) — permission enforced in-handler via system:read
+	api.Get("/settings/backup", s.handleGetBackupSettings)
+	api.Get("/settings/backup/list", s.handleListBackups)
+
+	// Vulnerability scan settings (read) — permission enforced in-handler via system:read
+	api.Get("/settings/vulnerability-scan", s.handleGetVulnScanSettings)
+
+	// Vulnerability scan results (read-only, public — same visibility as artifacts themselves)
+	api.Get("/artifacts/vulnerability-summary", s.handleGetVulnerabilitySummary)
+	api.Get("/vulnerability-scans", s.handleListVulnerabilityScans)
+
+	// Instance-wide stats (read-only, public — bandwidth saved + top pulled artifacts)
+	api.Get("/stats", s.handleGetStats)
+
 	// Everything below mutates state and requires an authenticated caller.
 	api.Group(func(api chi.Router) {
 		api.Use(middleware.RequireAuth)
@@ -137,6 +164,19 @@ func (s *Server) setupRoutes() {
 
 		api.Put("/settings/vulnerability-db", s.handleUpdateVulnDBSettings)
 		api.Post("/settings/vulnerability-db/update", s.handleTriggerVulnDBUpdate)
+
+		api.Put("/settings/search-index", s.handleUpdateSearchIndexSettings)
+		api.Post("/settings/search-index/reindex", s.handleTriggerSearchIndexReindex)
+
+		api.Put("/settings/backup", s.handleUpdateBackupSettings)
+		api.Post("/settings/backup/backup-now", s.handleTriggerBackup)
+		// Restore replaces the entire database in one shot, so it requires the
+		// same admin gate (user:admin) as user management rather than the
+		// system:write check other settings endpoints use in-handler.
+		api.Post("/settings/backup/restore", s.rbac.RequirePermission("user:admin")(http.HandlerFunc(s.handleRestoreBackup)).ServeHTTP)
+
+		api.Put("/settings/vulnerability-scan", s.handleUpdateVulnScanSettings)
+		api.Post("/settings/vulnerability-scan/scan-now", s.handleTriggerVulnScan)
 
 		// Self-service profile endpoints - any authenticated user may update their own account.
 		api.Put("/users/me", s.handleUpdateCurrentUser)
@@ -199,6 +239,32 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "cargobay_cache_misses_total 0\n")
 }
 
+// callerUserID returns the authenticated user's ID, or "" for an anonymous caller.
+func (s *Server) callerUserID(r *http.Request) string {
+	if user := middleware.GetUser(r); user != nil {
+		return user.UserID
+	}
+	return ""
+}
+
+// readableRegistryIDs returns the IDs of every enabled registry the caller
+// (possibly anonymous) may read, per RBAC.CanReadRegistry — public
+// registries are always included, private ones only with a grant.
+func (s *Server) readableRegistryIDs(r *http.Request) ([]string, error) {
+	registries, err := s.db.ListRegistries()
+	if err != nil {
+		return nil, err
+	}
+	userID := s.callerUserID(r)
+	ids := make([]string, 0, len(registries))
+	for _, reg := range registries {
+		if s.rbac.CanReadRegistry(userID, &reg) {
+			ids = append(ids, reg.ID)
+		}
+	}
+	return ids, nil
+}
+
 // handleListArtifacts handles listing artifacts with cursor-based pagination
 func (s *Server) handleListArtifacts(w http.ResponseWriter, r *http.Request) {
 	// Check if cursor-based pagination is requested
@@ -219,15 +285,39 @@ func (s *Server) handleListArtifacts(w http.ResponseWriter, r *http.Request) {
 		Cursor:       cursor,
 	}
 
-	artifacts, err := s.db.ListArtifacts(r.URL.Query().Get("registryId"), opts)
-	if err != nil {
-		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to list artifacts: %v", err))
-		return
+	registryID := r.URL.Query().Get("registryId")
+
+	var artifacts []database.ArtifactMetadata
+	var total int
+	var err error
+
+	if registryID != "" {
+		registry, gerr := s.db.GetRegistry(registryID)
+		if gerr != nil {
+			s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to list artifacts: %v", gerr))
+			return
+		}
+		if registry == nil || !s.rbac.CanReadRegistry(s.callerUserID(r), registry) {
+			s.writeJSON(w, http.StatusOK, PaginationResponse{Artifacts: []database.ArtifactMetadata{}, Total: 0, HasMore: false})
+			return
+		}
+		artifacts, err = s.db.ListArtifacts(registryID, opts)
+		if err == nil {
+			total, err = s.db.CountArtifacts(registryID, opts)
+		}
+	} else {
+		var registryIDs []string
+		registryIDs, err = s.readableRegistryIDs(r)
+		if err == nil {
+			artifacts, err = s.db.ListArtifactsMulti(registryIDs, opts)
+			if err == nil {
+				total, err = s.db.CountArtifactsMulti(registryIDs, opts)
+			}
+		}
 	}
 
-	total, err := s.db.CountArtifacts(r.URL.Query().Get("registryId"), opts)
 	if err != nil {
-		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to count artifacts: %v", err))
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to list artifacts: %v", err))
 		return
 	}
 
@@ -242,6 +332,12 @@ func (s *Server) handleListArtifacts(w http.ResponseWriter, r *http.Request) {
 
 // handleListArtifactsCursor handles cursor-based pagination for artifacts
 func (s *Server) handleListArtifactsCursor(w http.ResponseWriter, r *http.Request) {
+	registryIDs, err := s.readableRegistryIDs(r)
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to list artifacts: %v", err))
+		return
+	}
+
 	opts := database.CursorPaginationOptions{
 		Namespace:    r.URL.Query().Get("namespace"),
 		ArtifactType: r.URL.Query().Get("artifactType"),
@@ -249,6 +345,7 @@ func (s *Server) handleListArtifactsCursor(w http.ResponseWriter, r *http.Reques
 		Cursor:       r.URL.Query().Get("cursor"),
 		OrderBy:      queryParamOrDefault(r, "orderBy", "created"),
 		Order:        queryParamOrDefault(r, "order", "desc"),
+		RegistryIDs:  registryIDs,
 	}
 
 	artifacts, nextCursor, hasMore, err := s.db.ListArtifactsCursor(opts)
@@ -258,10 +355,10 @@ func (s *Server) handleListArtifactsCursor(w http.ResponseWriter, r *http.Reques
 	}
 
 	response := database.CursorPaginationResponse[database.ArtifactMetadata]{
-		Items:     artifacts,
+		Items:      artifacts,
 		NextCursor: nextCursor,
-		HasNext:   hasMore,
-		Limit:     opts.Limit,
+		HasNext:    hasMore,
+		Limit:      opts.Limit,
 	}
 
 	s.writeJSON(w, http.StatusOK, response)
@@ -319,7 +416,17 @@ func (s *Server) handleCreateArtifact(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGetArtifact(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	artifact, err := s.db.GetArtifact(id)
+	if err != nil || artifact == nil {
+		s.writeJSONError(w, http.StatusNotFound, "Artifact not found")
+		return
+	}
+
+	registry, err := s.db.GetRegistry(artifact.RegistryID)
 	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to load registry: %v", err))
+		return
+	}
+	if !s.rbac.CanReadRegistry(s.callerUserID(r), registry) {
 		s.writeJSONError(w, http.StatusNotFound, "Artifact not found")
 		return
 	}
@@ -331,16 +438,24 @@ func (s *Server) handleGetArtifact(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDeleteArtifact(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
-	// Enforce artifact:delete permission
 	user := middleware.GetUser(r)
-	if user == nil || !s.rbac.HasPermission(user.UserID, "artifact:delete") {
+	if user == nil {
 		s.writeJSONError(w, http.StatusForbidden, "Permission denied: artifact:delete required")
 		return
 	}
 
 	artifact, err := s.db.GetArtifact(id)
-	if err != nil {
+	if err != nil || artifact == nil {
 		s.writeJSONError(w, http.StatusNotFound, "Artifact not found")
+		return
+	}
+
+	// Allow deletion if the caller has artifact:delete, or is the original
+	// uploader of this artifact (recorded in Metadata by handleCreateArtifact).
+	uploadedBy, _ := artifact.Metadata["uploadedBy"].(string)
+	isOwner := uploadedBy != "" && uploadedBy == user.Username
+	if !isOwner && !s.rbac.HasPermission(user.UserID, "artifact:delete") {
+		s.writeJSONError(w, http.StatusForbidden, "Permission denied: artifact:delete required")
 		return
 	}
 
@@ -372,7 +487,7 @@ func (s *Server) handleScanArtifact(w http.ResponseWriter, r *http.Request) {
 
 	// Get artifact
 	artifact, err := s.db.GetArtifact(id)
-	if err != nil {
+	if err != nil || artifact == nil {
 		s.writeJSONError(w, http.StatusNotFound, "Artifact not found")
 		return
 	}
@@ -456,6 +571,294 @@ func (s *Server) handleUpdateVulnDBSettings(w http.ResponseWriter, r *http.Reque
 	s.writeJSON(w, http.StatusOK, settings)
 }
 
+// handleGetSearchIndexSettings returns the current search-index reindex settings.
+func (s *Server) handleGetSearchIndexSettings(w http.ResponseWriter, r *http.Request) {
+	user := middleware.GetUser(r)
+	if user == nil || !s.rbac.HasPermission(user.UserID, "system:read") {
+		s.writeJSONError(w, http.StatusForbidden, "Permission denied: system:read required")
+		return
+	}
+
+	settings, err := s.db.GetSearchIndexSettings()
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get search index settings: %v", err))
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, settings)
+}
+
+// handleUpdateSearchIndexSettings updates the auto-reindex toggle and refresh interval.
+func (s *Server) handleUpdateSearchIndexSettings(w http.ResponseWriter, r *http.Request) {
+	user := middleware.GetUser(r)
+	if user == nil || !s.rbac.HasPermission(user.UserID, "system:write") {
+		s.writeJSONError(w, http.StatusForbidden, "Permission denied: system:write required")
+		return
+	}
+
+	var input struct {
+		AutoReindexEnabled   bool `json:"autoReindexEnabled"`
+		ReindexIntervalHours int  `json:"reindexIntervalHours"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		s.writeJSONError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	if input.ReindexIntervalHours < 1 {
+		s.writeJSONError(w, http.StatusBadRequest, "reindexIntervalHours must be at least 1")
+		return
+	}
+
+	if err := s.db.UpdateSearchIndexSettings(input.AutoReindexEnabled, input.ReindexIntervalHours); err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to update search index settings: %v", err))
+		return
+	}
+
+	settings, err := s.db.GetSearchIndexSettings()
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get search index settings: %v", err))
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, settings)
+}
+
+// handleTriggerSearchIndexReindex synchronously rebuilds the search index
+// and returns the resulting settings row.
+func (s *Server) handleTriggerSearchIndexReindex(w http.ResponseWriter, r *http.Request) {
+	user := middleware.GetUser(r)
+	if user == nil || !s.rbac.HasPermission(user.UserID, "system:write") {
+		s.writeJSONError(w, http.StatusForbidden, "Permission denied: system:write required")
+		return
+	}
+
+	if s.searchIndexReindexer == nil {
+		s.writeJSONError(w, http.StatusServiceUnavailable, "Search index reindexer is not configured")
+		return
+	}
+
+	// Errors are surfaced via the settings row's lastError field (set by
+	// RunReindex), not as an HTTP error — the request itself succeeded in
+	// attempting the reindex.
+	_ = s.searchIndexReindexer.RunReindex(r.Context())
+
+	settings, err := s.db.GetSearchIndexSettings()
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get search index settings: %v", err))
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, settings)
+}
+
+// sensitiveBackupStorageKeys lists storage_config keys whose values are
+// credentials and must never round-trip to the browser in cleartext --
+// covers the secret fields across all four storage.New backends (see
+// backend/pkg/storage/{local,s3,gcs,azure}.go's New*Adapter constructors).
+var sensitiveBackupStorageKeys = map[string]bool{
+	"secret_key":        true,
+	"session_token":     true,
+	"account_key":       true,
+	"sas_token":         true,
+	"connection_string": true,
+	"json_key":          true,
+}
+
+// maskedSecretValue is the sentinel returned in place of a configured
+// secret. handleUpdateBackupSettings recognizes it on the way back in and
+// preserves the previously stored value, so an untouched secret field
+// doesn't get overwritten with the mask string itself.
+const maskedSecretValue = "••••••••"
+
+// maskSensitiveConfig returns a copy of cfg with sensitive values replaced
+// by maskedSecretValue (left empty if unset), everything else unchanged.
+func maskSensitiveConfig(cfg map[string]string) map[string]string {
+	masked := make(map[string]string, len(cfg))
+	for k, v := range cfg {
+		if sensitiveBackupStorageKeys[k] && v != "" {
+			masked[k] = maskedSecretValue
+		} else {
+			masked[k] = v
+		}
+	}
+	return masked
+}
+
+// maskedBackupSettings returns a copy of settings with storage_config
+// secrets masked, safe to send to the client.
+func maskedBackupSettings(settings *database.BackupSettings) database.BackupSettings {
+	out := *settings
+	out.StorageConfig = maskSensitiveConfig(settings.StorageConfig)
+	return out
+}
+
+var validBackupStorageTypes = map[string]bool{"": true, "local": true, "s3": true, "gcs": true, "azure": true}
+
+// handleGetBackupSettings returns the current scheduled-backup settings.
+func (s *Server) handleGetBackupSettings(w http.ResponseWriter, r *http.Request) {
+	user := middleware.GetUser(r)
+	if user == nil || !s.rbac.HasPermission(user.UserID, "system:read") {
+		s.writeJSONError(w, http.StatusForbidden, "Permission denied: system:read required")
+		return
+	}
+
+	settings, err := s.db.GetBackupSettings()
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get backup settings: %v", err))
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, maskedBackupSettings(settings))
+}
+
+// handleUpdateBackupSettings updates the auto-backup toggle/interval and the
+// backup storage destination (type + config). Masked secret fields
+// (maskedSecretValue) in the incoming storageConfig are replaced with the
+// currently stored value before saving, so the client never has to resend
+// a real credential just to change an unrelated field.
+func (s *Server) handleUpdateBackupSettings(w http.ResponseWriter, r *http.Request) {
+	user := middleware.GetUser(r)
+	if user == nil || !s.rbac.HasPermission(user.UserID, "system:write") {
+		s.writeJSONError(w, http.StatusForbidden, "Permission denied: system:write required")
+		return
+	}
+
+	var input struct {
+		AutoBackupEnabled   bool              `json:"autoBackupEnabled"`
+		BackupIntervalHours int               `json:"backupIntervalHours"`
+		StorageType         string            `json:"storageType"`
+		StorageConfig       map[string]string `json:"storageConfig"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		s.writeJSONError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	if input.BackupIntervalHours < 1 {
+		s.writeJSONError(w, http.StatusBadRequest, "backupIntervalHours must be at least 1")
+		return
+	}
+	if !validBackupStorageTypes[input.StorageType] {
+		s.writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("Invalid storage type: %s", input.StorageType))
+		return
+	}
+
+	current, err := s.db.GetBackupSettings()
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get backup settings: %v", err))
+		return
+	}
+
+	mergedConfig := make(map[string]string, len(input.StorageConfig))
+	for k, v := range input.StorageConfig {
+		if sensitiveBackupStorageKeys[k] && v == maskedSecretValue {
+			mergedConfig[k] = current.StorageConfig[k]
+		} else {
+			mergedConfig[k] = v
+		}
+	}
+
+	if input.StorageType != "" {
+		if _, err := storage.New(input.StorageType, mergedConfig); err != nil {
+			s.writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("Invalid backup storage config: %v", err))
+			return
+		}
+	}
+
+	if err := s.db.UpdateBackupSettings(input.AutoBackupEnabled, input.BackupIntervalHours); err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to update backup settings: %v", err))
+		return
+	}
+	if err := s.db.UpdateBackupStorageSettings(input.StorageType, mergedConfig); err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to update backup storage settings: %v", err))
+		return
+	}
+
+	settings, err := s.db.GetBackupSettings()
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get backup settings: %v", err))
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, maskedBackupSettings(settings))
+}
+
+// handleTriggerBackup synchronously runs a full database backup and
+// returns the resulting settings row.
+func (s *Server) handleTriggerBackup(w http.ResponseWriter, r *http.Request) {
+	user := middleware.GetUser(r)
+	if user == nil || !s.rbac.HasPermission(user.UserID, "system:write") {
+		s.writeJSONError(w, http.StatusForbidden, "Permission denied: system:write required")
+		return
+	}
+
+	if s.backupSvc == nil {
+		s.writeJSONError(w, http.StatusServiceUnavailable, "Backup service is not configured")
+		return
+	}
+
+	// Errors are surfaced via the settings row's lastError field (set by
+	// Run), not as an HTTP error — the request itself succeeded in
+	// attempting the backup.
+	_ = s.backupSvc.Run(r.Context())
+
+	settings, err := s.db.GetBackupSettings()
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get backup settings: %v", err))
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, settings)
+}
+
+// handleListBackups lists every stored backup archive, newest first.
+func (s *Server) handleListBackups(w http.ResponseWriter, r *http.Request) {
+	user := middleware.GetUser(r)
+	if user == nil || !s.rbac.HasPermission(user.UserID, "system:read") {
+		s.writeJSONError(w, http.StatusForbidden, "Permission denied: system:read required")
+		return
+	}
+
+	if s.backupSvc == nil {
+		s.writeJSONError(w, http.StatusServiceUnavailable, "Backup service is not configured")
+		return
+	}
+
+	backups, err := s.backupSvc.List(r.Context())
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to list backups: %v", err))
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{"backups": backups})
+}
+
+// handleRestoreBackup replaces the entire database with the contents of a
+// previously stored backup. Higher-risk than every other settings endpoint
+// (it's a destructive, whole-database operation), so it's gated by
+// user:admin at the route level (see setupRoutes) rather than the
+// system:write check used elsewhere in this file.
+func (s *Server) handleRestoreBackup(w http.ResponseWriter, r *http.Request) {
+	if s.backupSvc == nil {
+		s.writeJSONError(w, http.StatusServiceUnavailable, "Backup service is not configured")
+		return
+	}
+
+	var input struct {
+		Path string `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil || input.Path == "" {
+		s.writeJSONError(w, http.StatusBadRequest, "Invalid request body: path is required")
+		return
+	}
+
+	if err := s.backupSvc.Restore(r.Context(), input.Path); err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to restore backup: %v", err))
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, map[string]string{"status": "restored", "path": input.Path})
+}
+
 // handleTriggerVulnDBUpdate synchronously runs a vulnerability-DB refresh
 // and returns the resulting settings row.
 func (s *Server) handleTriggerVulnDBUpdate(w http.ResponseWriter, r *http.Request) {
@@ -484,6 +887,184 @@ func (s *Server) handleTriggerVulnDBUpdate(w http.ResponseWriter, r *http.Reques
 	s.writeJSON(w, http.StatusOK, settings)
 }
 
+// handleGetVulnScanSettings returns the current vulnerability-scan settings.
+func (s *Server) handleGetVulnScanSettings(w http.ResponseWriter, r *http.Request) {
+	user := middleware.GetUser(r)
+	if user == nil || !s.rbac.HasPermission(user.UserID, "system:read") {
+		s.writeJSONError(w, http.StatusForbidden, "Permission denied: system:read required")
+		return
+	}
+
+	settings, err := s.db.GetVulnScanSettings()
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get vulnerability scan settings: %v", err))
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, settings)
+}
+
+// handleUpdateVulnScanSettings updates the auto-scan toggle and rescan interval.
+func (s *Server) handleUpdateVulnScanSettings(w http.ResponseWriter, r *http.Request) {
+	user := middleware.GetUser(r)
+	if user == nil || !s.rbac.HasPermission(user.UserID, "system:write") {
+		s.writeJSONError(w, http.StatusForbidden, "Permission denied: system:write required")
+		return
+	}
+
+	var input struct {
+		AutoScanEnabled   bool `json:"autoScanEnabled"`
+		ScanIntervalHours int  `json:"scanIntervalHours"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		s.writeJSONError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	if input.ScanIntervalHours < 1 {
+		s.writeJSONError(w, http.StatusBadRequest, "scanIntervalHours must be at least 1")
+		return
+	}
+
+	if err := s.db.UpdateVulnScanSettings(input.AutoScanEnabled, input.ScanIntervalHours); err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to update vulnerability scan settings: %v", err))
+		return
+	}
+
+	settings, err := s.db.GetVulnScanSettings()
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get vulnerability scan settings: %v", err))
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, settings)
+}
+
+// handleTriggerVulnScan synchronously sweeps every cached docker/oci
+// artifact for vulnerabilities and returns the resulting settings row.
+func (s *Server) handleTriggerVulnScan(w http.ResponseWriter, r *http.Request) {
+	user := middleware.GetUser(r)
+	if user == nil || !s.rbac.HasPermission(user.UserID, "system:write") {
+		s.writeJSONError(w, http.StatusForbidden, "Permission denied: system:write required")
+		return
+	}
+
+	if s.vulnRescanner == nil {
+		s.writeJSONError(w, http.StatusServiceUnavailable, "Vulnerability rescanner is not configured")
+		return
+	}
+
+	// Errors are surfaced via the settings row's lastError field (set by
+	// RunRescan), not as an HTTP error — the request itself succeeded in
+	// attempting the scan.
+	_ = s.vulnRescanner.RunRescan(r.Context())
+
+	settings, err := s.db.GetVulnScanSettings()
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get vulnerability scan settings: %v", err))
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, settings)
+}
+
+// handleGetVulnerabilitySummary returns the latest scan result per artifact
+// ID for a batched set of IDs (?ids=a,b,c), backing Docker Hub-style tag
+// badges without an N+1 request per visible version.
+func (s *Server) handleGetVulnerabilitySummary(w http.ResponseWriter, r *http.Request) {
+	idsParam := r.URL.Query().Get("ids")
+	if idsParam == "" {
+		s.writeJSON(w, http.StatusOK, map[string]*vulnerability.ScanResult{})
+		return
+	}
+	ids := strings.Split(idsParam, ",")
+
+	results, err := s.scanner.GetLatestScanResults(ids)
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get vulnerability summary: %v", err))
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, results)
+}
+
+// handleListVulnerabilityScans lists vulnerability scan results, optionally
+// filtered by artifactId and/or severity, for the Vulnerabilities page.
+func (s *Server) handleListVulnerabilityScans(w http.ResponseWriter, r *http.Request) {
+	artifactID := r.URL.Query().Get("artifactId")
+	severity := r.URL.Query().Get("severity")
+
+	results, err := s.scanner.ListVulnerabilityScans(artifactID, severity)
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to list vulnerability scans: %v", err))
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{"results": results})
+}
+
+// StatsResponse is the payload for GET /stats: instance-wide bandwidth and
+// pull-count figures backing the Stats page.
+type StatsResponse struct {
+	BandwidthSavedBytes int64                       `json:"bandwidthSavedBytes"`
+	TotalPulls          int64                       `json:"totalPulls"`
+	TopArtifacts        []database.ArtifactMetadata `json:"topArtifacts"`
+}
+
+// handleGetStats returns bandwidth saved by caching plus a leaderboard of the
+// most-pulled artifacts. Read-only and public, matching the visibility of the
+// vulnerability-summary endpoint — but the leaderboard itself is still
+// filtered down to registries the caller may read, so a private registry's
+// artifacts never leak through it.
+func (s *Server) handleGetStats(w http.ResponseWriter, r *http.Request) {
+	limit := parseIntParam(r.URL.Query().Get("limit"), 10)
+
+	bandwidthSaved, err := s.db.GetBandwidthSaved()
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get bandwidth saved: %v", err))
+		return
+	}
+
+	totalPulls, err := s.db.TotalDownloads()
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get total pulls: %v", err))
+		return
+	}
+
+	readableIDs, err := s.readableRegistryIDs(r)
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to check registry access: %v", err))
+		return
+	}
+	readable := make(map[string]bool, len(readableIDs))
+	for _, id := range readableIDs {
+		readable[id] = true
+	}
+
+	// Pull a wider candidate set than requested since some of the top-N by
+	// raw download count may belong to registries the caller can't read.
+	candidates, err := s.db.TopArtifactsByDownloads(limit * 5)
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get top artifacts: %v", err))
+		return
+	}
+	topArtifacts := make([]database.ArtifactMetadata, 0, limit)
+	for _, a := range candidates {
+		if !readable[a.RegistryID] {
+			continue
+		}
+		topArtifacts = append(topArtifacts, a)
+		if len(topArtifacts) >= limit {
+			break
+		}
+	}
+
+	s.writeJSON(w, http.StatusOK, StatsResponse{
+		BandwidthSavedBytes: bandwidthSaved,
+		TotalPulls:          totalPulls,
+		TopArtifacts:        topArtifacts,
+	})
+}
+
 // handleDownloadArtifact handles downloading an artifact
 func (s *Server) handleDownloadArtifact(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
@@ -496,7 +1077,17 @@ func (s *Server) handleDownloadArtifact(w http.ResponseWriter, r *http.Request) 
 	}
 
 	artifact, err := s.db.GetArtifact(id)
+	if err != nil || artifact == nil {
+		s.writeJSONError(w, http.StatusNotFound, "Artifact not found")
+		return
+	}
+
+	registry, err := s.db.GetRegistry(artifact.RegistryID)
 	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to load registry: %v", err))
+		return
+	}
+	if !s.rbac.CanReadRegistry(user.UserID, registry) {
 		s.writeJSONError(w, http.StatusNotFound, "Artifact not found")
 		return
 	}
@@ -584,7 +1175,41 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.writeJSON(w, http.StatusOK, results)
+	readableIDs, err := s.readableRegistryIDs(r)
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to check registry access: %v", err))
+		return
+	}
+	readable := make(map[string]bool, len(readableIDs))
+	for _, id := range readableIDs {
+		readable[id] = true
+	}
+	filtered := make([]database.ArtifactMetadata, 0, len(results))
+	for _, a := range results {
+		if readable[a.RegistryID] {
+			filtered = append(filtered, a)
+		}
+	}
+
+	s.writeJSON(w, http.StatusOK, filtered)
+}
+
+// handleAutocomplete handles search-as-you-type suggestions for artifact names
+func (s *Server) handleAutocomplete(w http.ResponseWriter, r *http.Request) {
+	prefix := r.URL.Query().Get("q")
+	if prefix == "" {
+		s.writeJSON(w, http.StatusOK, map[string]interface{}{"suggestions": []string{}})
+		return
+	}
+
+	limit := parseIntParam(r.URL.Query().Get("limit"), 8)
+	suggestions, err := s.db.AutocompleteArtifacts(prefix, limit)
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to autocomplete: %v", err))
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{"suggestions": suggestions})
 }
 
 // handleListRegistries handles listing registries. Private registries the
@@ -593,15 +1218,23 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 // so filtering here is what actually keeps a private registry's existence
 // from leaking to users with no access to it.
 func (s *Server) handleListRegistries(w http.ResponseWriter, r *http.Request) {
-	registries, err := s.db.ListRegistries()
-	if err != nil {
-		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to list registries: %v", err))
-		return
-	}
-
 	userID := ""
 	if user := middleware.GetUser(r); user != nil {
 		userID = user.UserID
+	}
+
+	// Admin management UIs (Settings) pass ?all=true to also see disabled
+	// registries, so they don't vanish from the list when toggled off.
+	var registries []database.RegistryConfig
+	var err error
+	if r.URL.Query().Get("all") == "true" && userID != "" && s.rbac.HasPermission(userID, "registry:write") {
+		registries, err = s.db.ListAllRegistries()
+	} else {
+		registries, err = s.db.ListRegistries()
+	}
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to list registries: %v", err))
+		return
 	}
 
 	visible := make([]database.RegistryConfig, 0, len(registries))
@@ -777,10 +1410,10 @@ func (s *Server) handleListUsers(w http.ResponseWriter, r *http.Request) {
 // handleListUsersCursor handles cursor-based pagination for users
 func (s *Server) handleListUsersCursor(w http.ResponseWriter, r *http.Request) {
 	opts := database.CursorPaginationOptions{
-		Limit:     parseIntParam(r.URL.Query().Get("limit"), 50),
-		Cursor:    r.URL.Query().Get("cursor"),
-		OrderBy:   queryParamOrDefault(r, "orderBy", "created_at"),
-		Order:     queryParamOrDefault(r, "order", "desc"),
+		Limit:   parseIntParam(r.URL.Query().Get("limit"), 50),
+		Cursor:  r.URL.Query().Get("cursor"),
+		OrderBy: queryParamOrDefault(r, "orderBy", "created_at"),
+		Order:   queryParamOrDefault(r, "order", "desc"),
 	}
 
 	users, nextCursor, hasMore, err := s.db.ListUsersCursor(opts)
@@ -800,10 +1433,10 @@ func (s *Server) handleListUsersCursor(w http.ResponseWriter, r *http.Request) {
 // handleCreateUser handles creating a new user
 func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		Username   string   `json:"username"`
-		Email      string   `json:"email"`
-		Password   string   `json:"password"`
-		Roles      []string `json:"roles"`
+		Username string   `json:"username"`
+		Email    string   `json:"email"`
+		Password string   `json:"password"`
+		Roles    []string `json:"roles"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
@@ -855,7 +1488,7 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSON(w, http.StatusCreated, map[string]interface{}{
-		"user": user,
+		"user":    user,
 		"message": "User created successfully",
 	})
 }
@@ -1029,86 +1662,86 @@ func (s *Server) handleAdminResetPassword(w http.ResponseWriter, r *http.Request
 // single role, so this replaces any roles the user currently has rather
 // than adding to them.
 func (s *Server) handleAssignUserRole(w http.ResponseWriter, r *http.Request) {
-	 userID := chi.URLParam(r, "id")
+	userID := chi.URLParam(r, "id")
 
-	 var input struct {
-		 RoleID string `json:"roleId"`
-	 }
-	 if err := json.NewDecoder(r.Body).Decode(&input); err != nil || input.RoleID == "" {
-		 s.writeJSONError(w, http.StatusBadRequest, "roleId is required")
-		 return
-	 }
-	 roleID := input.RoleID
+	var input struct {
+		RoleID string `json:"roleId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil || input.RoleID == "" {
+		s.writeJSONError(w, http.StatusBadRequest, "roleId is required")
+		return
+	}
+	roleID := input.RoleID
 
-	 // Check if user exists
-	 user, err := s.db.GetUser(userID)
-	 if err != nil {
-		 s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get user: %v", err))
-		 return
-	 }
-	 if user == nil {
-		 s.writeJSONError(w, http.StatusNotFound, "User not found")
-		 return
-	 }
+	// Check if user exists
+	user, err := s.db.GetUser(userID)
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get user: %v", err))
+		return
+	}
+	if user == nil {
+		s.writeJSONError(w, http.StatusNotFound, "User not found")
+		return
+	}
 
-	 // Check if role exists (in DB or static roles)
-	 role := s.rbac.GetRole(roleID)
-	 if role == nil {
-		 s.writeJSONError(w, http.StatusBadRequest, "Role not found")
-		 return
-	 }
+	// Check if role exists (in DB or static roles)
+	role := s.rbac.GetRole(roleID)
+	if role == nil {
+		s.writeJSONError(w, http.StatusBadRequest, "Role not found")
+		return
+	}
 
-	 // Replace existing roles with the single new role
-	 existingRoles, err := s.db.GetUserRoles(userID)
-	 if err != nil {
-		 s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get user roles: %v", err))
-		 return
-	 }
-	 for _, existingRoleID := range existingRoles {
-		 if existingRoleID == roleID {
-			 continue
-		 }
-		 if err := s.db.RevokeRoleFromUser(userID, existingRoleID); err != nil {
-			 s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to revoke existing role: %v", err))
-			 return
-		 }
-	 }
+	// Replace existing roles with the single new role
+	existingRoles, err := s.db.GetUserRoles(userID)
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get user roles: %v", err))
+		return
+	}
+	for _, existingRoleID := range existingRoles {
+		if existingRoleID == roleID {
+			continue
+		}
+		if err := s.db.RevokeRoleFromUser(userID, existingRoleID); err != nil {
+			s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to revoke existing role: %v", err))
+			return
+		}
+	}
 
-	 if err := s.db.AssignRoleToUser(userID, roleID); err != nil {
-		 s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to assign role: %v", err))
-		 return
-	 }
+	if err := s.db.AssignRoleToUser(userID, roleID); err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to assign role: %v", err))
+		return
+	}
 
-	 s.writeJSON(w, http.StatusOK, map[string]interface{}{
-		 "message": "Role assigned successfully",
-		 "role":    role,
-	 })
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"message": "Role assigned successfully",
+		"role":    role,
+	})
 }
 
 // handleRevokeUserRole handles revoking a role from a user
 func (s *Server) handleRevokeUserRole(w http.ResponseWriter, r *http.Request) {
-	 userID := chi.URLParam(r, "id")
-	 roleID := chi.URLParam(r, "roleId")
+	userID := chi.URLParam(r, "id")
+	roleID := chi.URLParam(r, "roleId")
 
-	 // Check if user exists
-	 user, err := s.db.GetUser(userID)
-	 if err != nil {
-		 s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get user: %v", err))
-		 return
-	 }
-	 if user == nil {
-		 s.writeJSONError(w, http.StatusNotFound, "User not found")
-		 return
-	 }
+	// Check if user exists
+	user, err := s.db.GetUser(userID)
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get user: %v", err))
+		return
+	}
+	if user == nil {
+		s.writeJSONError(w, http.StatusNotFound, "User not found")
+		return
+	}
 
-	 // Revoke role
-	 err = s.db.RevokeRoleFromUser(userID, roleID)
-	 if err != nil {
-		 s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to revoke role: %v", err))
-		 return
-	 }
+	// Revoke role
+	err = s.db.RevokeRoleFromUser(userID, roleID)
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to revoke role: %v", err))
+		return
+	}
 
-	 s.writeJSON(w, http.StatusOK, map[string]string{"message": "Role revoked successfully"})
+	s.writeJSON(w, http.StatusOK, map[string]string{"message": "Role revoked successfully"})
 }
 
 // handleGetUser handles getting a single user
@@ -1424,6 +2057,7 @@ func (s *Server) handleSetupInit(w http.ResponseWriter, r *http.Request) {
 			URL      string `json:"url"`
 			Type     string `json:"type"`
 			Enabled  bool   `json:"enabled"`
+			Proxy    bool   `json:"proxy"`
 			Priority int    `json:"priority"`
 		} `json:"registries"`
 	}
@@ -1465,6 +2099,7 @@ func (s *Server) handleSetupInit(w http.ResponseWriter, r *http.Request) {
 			URL:      reg.URL,
 			Type:     reg.Type,
 			Enabled:  reg.Enabled,
+			Proxy:    reg.Proxy,
 			Priority: reg.Priority,
 		}
 		if err := s.db.SaveRegistry(&registry); err != nil {

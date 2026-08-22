@@ -70,6 +70,13 @@ func (c *Cache) Close() error {
 	return c.client.Close()
 }
 
+// Ping checks Redis connectivity
+func (c *Cache) Ping() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return c.client.Ping(ctx).Err()
+}
+
 // getKey generates a cache key
 func (c *Cache) getKey(prefix string, parts ...string) string {
 	return fmt.Sprintf("%s:%s", prefix, joinParts(parts...))

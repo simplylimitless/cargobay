@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Routes, Route, useNavigate, useLocation } from 'react-router-dom'
 import { Navbar } from './components/Navbar'
+import { Breadcrumbs } from './components/Breadcrumbs'
 import { RegistryList } from './pages/RegistryList'
 import { RegistryDetail } from './pages/RegistryDetail'
 import { ArtifactList } from './pages/ArtifactList'
@@ -16,6 +17,7 @@ import { ArtifactBrowse } from './pages/ArtifactBrowse'
 import { VulnerabilityResults } from './pages/VulnerabilityResults'
 import { Profile } from './pages/Profile'
 import { Setup } from './pages/Setup'
+import { Stats } from './pages/Stats'
 
 function App() {
   const navigate = useNavigate()
@@ -50,6 +52,7 @@ function App() {
     <div className="min-h-screen bg-gray-950">
       <Navbar />
       <main className="container mx-auto px-4 py-8">
+        <Breadcrumbs />
         <Routes>
           <Route path="/setup" element={<Setup />} />
           <Route path="/" element={<RegistryList />} />
@@ -71,6 +74,7 @@ function App() {
           <Route path="/browse/:registryId/:artifactType/:namespace" element={<ArtifactBrowse />} />
           <Route path="/vulnerabilities" element={<VulnerabilityResults />} />
           <Route path="/vulnerabilities/:artifactId" element={<VulnerabilityResults />} />
+          <Route path="/stats" element={<Stats />} />
           <Route path="/profile" element={<Profile />} />
         </Routes>
       </main>

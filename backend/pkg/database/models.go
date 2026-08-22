@@ -20,6 +20,7 @@ type ArtifactMetadata struct {
 	Metadata        map[string]any `db:"metadata"`
 	Tags            []string       `db:"tags"`
 	Signatures      []Signature    `db:"signatures"`
+	Downloads       int64          `db:"downloads"`
 }
 
 // Signature represents a digital signature on an artifact
@@ -44,15 +45,15 @@ type UserRepository struct {
 
 // AccessKey represents an API access key
 type AccessKey struct {
-	ID         string    `db:"id"`
-	UserID     string    `db:"user_id"`
-	Name       string    `db:"name"`
-	KeyHash    string    `db:"key_hash"`
-	Permissions []string `db:"permissions"`
-	CreatedAt  time.Time `db:"created_at"`
-	LastUsed   *time.Time `db:"last_used"`
-	ExpiresAt  *time.Time `db:"expires_at"`
-	IsActive   bool      `db:"is_active"`
+	ID          string     `db:"id"`
+	UserID      string     `db:"user_id"`
+	Name        string     `db:"name"`
+	KeyHash     string     `db:"key_hash"`
+	Permissions []string   `db:"permissions"`
+	CreatedAt   time.Time  `db:"created_at"`
+	LastUsed    *time.Time `db:"last_used"`
+	ExpiresAt   *time.Time `db:"expires_at"`
+	IsActive    bool       `db:"is_active"`
 }
 
 // RegistryConfig represents an upstream registry
@@ -101,13 +102,13 @@ type RegistryAccess struct {
 
 // AuditLog represents an audit log entry
 type AuditLog struct {
-	ID          string    `db:"id"`
-	UserID      string    `db:"user_id"`
-	Action      string    `db:"action"`
-	ResourceType string   `db:"resource_type"`
-	ResourceID  string    `db:"resource_id"`
-	Details     string    `db:"details"`
-	CreatedAt   time.Time `db:"created_at"`
+	ID           string    `db:"id"`
+	UserID       string    `db:"user_id"`
+	Action       string    `db:"action"`
+	ResourceType string    `db:"resource_type"`
+	ResourceID   string    `db:"resource_id"`
+	Details      string    `db:"details"`
+	CreatedAt    time.Time `db:"created_at"`
 }
 
 // Permission defines a granular permission
@@ -131,7 +132,7 @@ type Role struct {
 
 // RolePermission links roles to permissions
 type RolePermission struct {
-	RoleID      string `db:"role_id"`
+	RoleID       string `db:"role_id"`
 	PermissionID string `db:"permission_id"`
 }
 
@@ -145,22 +146,65 @@ type VulnDBSettings struct {
 	LastError           string     `db:"last_error" json:"lastError"`
 }
 
+// SearchIndexSettings tunes how the backend rebuilds the Postgres full-text
+// search index (the search_vector column on artifacts). Singleton row (id
+// always 1).
+type SearchIndexSettings struct {
+	AutoReindexEnabled   bool       `db:"auto_reindex_enabled" json:"autoReindexEnabled"`
+	ReindexIntervalHours int        `db:"reindex_interval_hours" json:"reindexIntervalHours"`
+	LastCheckedAt        *time.Time `db:"last_checked_at" json:"lastCheckedAt"`
+	LastReindexedAt      *time.Time `db:"last_reindexed_at" json:"lastReindexedAt"`
+	LastArtifactCount    int        `db:"last_artifact_count" json:"lastArtifactCount"`
+	LastError            string     `db:"last_error" json:"lastError"`
+}
+
+// VulnScanSettings tunes how the backend rescans cached Docker/OCI artifacts
+// for vulnerabilities via Trivy. Distinct from VulnDBSettings (which governs
+// refreshing Trivy's own CVE database). Singleton row (id always 1).
+type VulnScanSettings struct {
+	AutoScanEnabled   bool       `db:"auto_scan_enabled" json:"autoScanEnabled"`
+	ScanIntervalHours int        `db:"scan_interval_hours" json:"scanIntervalHours"`
+	LastCheckedAt     *time.Time `db:"last_checked_at" json:"lastCheckedAt"`
+	LastScanAt        *time.Time `db:"last_scan_at" json:"lastScanAt"`
+	LastError         string     `db:"last_error" json:"lastError"`
+}
+
+// BackupSettings tunes how the backend performs scheduled full database
+// backups (see backend/pkg/backup). Singleton row (id always 1).
+// StorageType/StorageConfig mirror config.StorageConfig's shape (type +
+// generic key/value map); an empty StorageType means backups reuse the main
+// artifact storage adapter instead of a dedicated one.
+type BackupSettings struct {
+	AutoBackupEnabled   bool              `db:"auto_backup_enabled" json:"autoBackupEnabled"`
+	BackupIntervalHours int               `db:"backup_interval_hours" json:"backupIntervalHours"`
+	LastCheckedAt       *time.Time        `db:"last_checked_at" json:"lastCheckedAt"`
+	LastBackupAt        *time.Time        `db:"last_backup_at" json:"lastBackupAt"`
+	LastBackupPath      string            `db:"last_backup_path" json:"lastBackupPath"`
+	LastError           string            `db:"last_error" json:"lastError"`
+	StorageType         string            `db:"storage_type" json:"storageType"`
+	StorageConfig       map[string]string `db:"storage_config" json:"storageConfig"`
+}
+
 // CursorPaginationOptions represents cursor-based pagination parameters
 type CursorPaginationOptions struct {
-	Namespace    string // Filter by namespace
-	ArtifactType string // Filter by artifact type
-	Limit        int    // Number of results per page (default: 50, max: 200)
-	Cursor       string // Cursor from previous page (base64-encoded timestamp)
-	OrderBy      string // Field to order by (default: created)
-	Order        string // Order direction: "asc" or "desc" (default: desc)
+	Namespace    string   // Filter by namespace
+	ArtifactType string   // Filter by artifact type
+	Limit        int      // Number of results per page (default: 50, max: 200)
+	Cursor       string   // Cursor from previous page (base64-encoded timestamp)
+	OrderBy      string   // Field to order by (default: created)
+	Order        string   // Order direction: "asc" or "desc" (default: desc)
+	RegistryIDs  []string // Restrict results to these registry IDs. Nil means
+	// "no restriction" (used by callers like ListUsersCursor that don't scope
+	// by registry at all); a non-nil empty slice means "no readable
+	// registries" and yields zero rows, not an unfiltered listing.
 }
 
 // CursorPaginationResponse represents a paginated response with cursors
 type CursorPaginationResponse[T any] struct {
-	Items      []T      `json:"items"`
-	NextCursor string   `json:"nextCursor,omitempty"`
-	PrevCursor string   `json:"prevCursor,omitempty"`
-	HasNext    bool     `json:"hasNext"`
-	HasPrev    bool     `json:"hasPrev"`
-	Limit      int      `json:"limit"`
+	Items      []T    `json:"items"`
+	NextCursor string `json:"nextCursor,omitempty"`
+	PrevCursor string `json:"prevCursor,omitempty"`
+	HasNext    bool   `json:"hasNext"`
+	HasPrev    bool   `json:"hasPrev"`
+	Limit      int    `json:"limit"`
 }

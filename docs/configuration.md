@@ -2,26 +2,40 @@
 
 This guide explains how to configure cargobay for your environment.
 
+## Quick Reference
+
+| Setting | Environment Variable | YAML Key | Description |
+|---------|---------------------|----------|-------------|
+| Server Port | `PORT` | `server.port` | Server port (fixed to 4500) |
+| Server Host | `HOST` | `server.host` | Server host | 0.0.0.0 |
+| Database | `DATABASE_URL` | `database.dsn` | PostgreSQL connection string |
+| Redis | `REDIS_URL` | `cache.url` | Redis connection string |
+| Storage Type | `STORAGE_TYPE` | `storage.type` | Storage backend |
+| Trivy Cache | `TRIVY_CACHE_DIR` | - | Trivy DB cache directory |
+
 ## Environment Variables
+
+## Environment Variables
+
+Only the variables below are actually read by `config.LoadConfig()`
+(`backend/pkg/config/config.go`); anything else must go through
+`config.yaml` instead.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `CB_PORT` | Server port | `8080` |
-| `CB_HOST` | Server host | `localhost` |
-| `CB_UI_PORT` | UI port | `3000` |
-| `CB_DATABASE_URL` | PostgreSQL connection string | `postgresql://localhost:5432/cargobay` |
-| `CB_REDIS_URL` | Redis connection string | `redis://localhost:6379` |
-| `CB_STORAGE_TYPE` | Storage backend (local, s3, gcs, azure) | `local` |
-| `CB_STORAGE_PATH` | Local storage path | `/var/lib/cargobay/storage` |
-| `CB_CORS_ORIGINS` | Comma-separated list of allowed CORS origins | `*` |
-| `CB_LOG_LEVEL` | Log level (debug, info, warn, error) | `info` |
-| `CB_SESSION_SECRET` | Secret for session encryption | Auto-generated |
-| `CB_ENCRYPTION_KEY` | Key for sensitive data encryption | Auto-generated |
-| `CB_SCAN_ENABLED` | Enable vulnerability scanning | `true` |
-| `CB_SCAN_INTERVAL` | Default scan interval in seconds | `86400` (24h) |
+| `CONFIG_FILE` | Path to the YAML config file to load | `./config.yaml` |
+| `PORT` | Server port — **note:** currently only checked for presence; setting it always resets the port to the built-in default of `4500` rather than using the value you pass | `4500` |
+| `HOST` | Server host | `0.0.0.0` |
+| `DATABASE_URL` | PostgreSQL connection string | `postgres://localhost:5432/cargobay` |
+| `REDIS_URL` | Redis connection string | `redis://localhost:6379` |
+| `STORAGE_TYPE` | Storage backend (local, s3, gcs, azure) | `local` |
+| `S3_ACCESS_KEY` | S3 access key (only used when `STORAGE_TYPE=s3`) | none |
+| `S3_SECRET_KEY` | S3 secret key (only used when `STORAGE_TYPE=s3`) | none |
 | `TRIVY_CACHE_DIR` | Trivy vulnerability-DB cache directory used by the backend's own DB-refresh scheduler; must match the volume mounted into the `trivy` server container | `/app/trivy-cache` |
-| `CB_CACHE_TTL` | Cache TTL in seconds | `3600` (1h) |
-| `CB_MAX_UPLOAD_SIZE` | Maximum upload size in bytes | `1073741824` (1GB) |
+
+The frontend is built to static assets and embedded into the backend binary
+at build time (`backend/pkg/webui`), so it's served from the same host and
+`PORT` as the API — there is no separate frontend port or process.
 
 ## Configuration Files
 
@@ -64,6 +78,105 @@ scanning:
   enabled: true
   interval: 86400
 ```
+
+## Docker Registry Mirror
+
+### Configuring the upstream
+
+All upstream registries are configured under `registries:` in `config.yaml`,
+not via environment variables. cargobay supports 21 package formats:
+
+| Type | Description | Upstream URL |
+|------|-------------|--------------|
+| `docker` | Docker/OCI images | https://registry-1.docker.io |
+| `npm` | Node.js packages | https://registry.npmjs.org |
+| `maven` | Java/Maven artifacts | https://repo1.maven.org |
+| `gradle` | Gradle dependencies (Maven-compatible) | https://repo1.maven.org |
+| `sbt` | SBT dependencies (Maven-compatible) | https://repo1.maven.org |
+| `pypi` | Python packages | https://pypi.org |
+| `nuget` | .NET packages | https://api.nuget.org |
+| `helm` | Kubernetes Helm charts | https://registry-1.docker.io |
+| `cargo` | Rust crates | https://crates.io |
+| `go` | Go modules | https://proxy.golang.org |
+| `alpine` | Alpine Linux packages | https://alpinelinux.org |
+| `debian` | Debian/Ubuntu packages | https://deb.debian.org |
+| `rpm` | RPM packages | https://rpm.org |
+| `yum` | YUM packages | https://yum.org |
+| `conan` | Conan C++ packages | https://conan.io |
+| `cocoapods` | iOS/macOS pods | https://cocoapods.org |
+| `swift` | Swift packages | https://swiftpackageindex.com |
+| `dart` | Dart packages | https://pub.dev |
+| `terraform` | Terraform modules | https://registry.terraform.io |
+| `composer` | PHP packages | https://packagist.org |
+| `conda` | Conda packages | https://repo.anaconda.com |
+
+### Example Configuration
+
+```yaml
+registries:
+  - id: dockerhub
+    name: Docker Hub
+    type: docker
+    url: https://registry-1.docker.io
+    proxy: true
+    enabled: true
+    priority: 1
+
+  - id: npmjs
+    name: npm Registry
+    type: npm
+    url: https://registry.npmjs.org
+    proxy: true
+    enabled: true
+    priority: 2
+
+  - id: maven-central
+    name: Maven Central
+    type: maven
+    url: https://repo1.maven.org
+    proxy: true
+    enabled: true
+    priority: 2
+```
+
+**Use `url` for the upstream address, not `upstream`.** `RegistryConfig` in
+`backend/pkg/config/config.go` has an `upstream` YAML field, but
+`main.go`'s conversion from `cfg.Registries` to the runtime
+`database.RegistryConfig` only copies `url` — `upstream` is silently
+dropped. Setting `upstream:` in `config.yaml` looks valid and loads without
+error, but the proxy pulls nothing through, because `url` (the field it
+actually reads) is empty. This is a known bug in the current field mapping;
+until it's fixed, `url` is the only field that works.
+
+### Pointing a Docker client at the mirror
+
+The Docker proxy is mounted under `/v2`, matching where Docker/OCI clients
+always request `/v2/...` at the registry host — they don't accept a path
+prefix, so this must stay `/v2` and not `/docker`. Configure your Docker
+daemon's `registry-mirrors` with cargobay's bare host and port, with **no
+path suffix**:
+
+```json
+{
+  "registry-mirrors": ["https://cargobay.example.com:4500"]
+}
+```
+
+If cargobay is served over plain HTTP, add the same host to
+`insecure-registries` as well. Restart the Docker daemon after editing
+`daemon.json`.
+
+### Private/multiple docker registries
+
+To expose more than one docker upstream (or a private one reachable only
+under its own hostname), bind a registry to a specific host via its `Host`
+field on `database.RegistryConfig` — this isn't exposed in the
+`registries:` YAML list (which has no `Host` field), so it must be set
+through the registries API or the Settings UI after the registry exists.
+Requests whose `Host` header matches a bound registry are routed to it
+directly; anything else falls back to the first enabled public proxy
+registry of that type. See [Registries](api.md#registries) in the API
+reference.
 
 ## Storage Backend Configuration
 
@@ -302,3 +415,12 @@ export CB_DATABASE_URL=postgresql://test:test@localhost:5432/cargobay_test
 export CB_STORAGE_TYPE=local
 export CB_STORAGE_PATH=/tmp/cargobay_test
 ```
+
+## Architecture Overview
+
+For a detailed understanding of how cargobay's components interact, see the [Architecture Documentation](architecture.md). This covers:
+
+- **Component breakdown**: API layer, proxy handlers, data layer
+- **Data flows**: Artifact upload, Docker pull, search operations
+- **Deployment patterns**: Development (Docker Compose) and production (Kubernetes)
+- **Security model**: Authentication, authorization, data protection

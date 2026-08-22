@@ -50,7 +50,8 @@ services:
 
   backend:
     build:
-      context: ./backend
+      context: .
+      dockerfile: Dockerfile
     ports:
       - "4500:4500"
     environment:
@@ -62,6 +63,10 @@ services:
       # backend's own DB-refresh CLI calls and `trivy server`'s scans see
       # the same downloaded vulnerability DB.
       TRIVY_CACHE_DIR: /app/trivy-cache
+      # Trivy scans Docker/OCI artifacts by pulling them back from cargobay's
+      # own registry API, over the compose network.
+      TRIVY_SERVER_ADDR: http://trivy:4954
+      REGISTRY_ADDR: backend:4500
     volumes:
       # Local bind mount for artifact storage — used when storage.type is "local"
       # in backend/config.yaml. Point this at an NFS mount if desired, or switch
@@ -73,11 +78,3 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-
-  frontend:
-    build:
-      context: ./frontend
-    ports:
-      - "5174:5174"
-    depends_on:
-      - backend
