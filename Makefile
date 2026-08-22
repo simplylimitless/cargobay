@@ -167,20 +167,17 @@ docker-cleanup: ## Remove all containers, volumes, and networks
 # Database
 # =============================================================================
 
-.PHONY: db-migrate db-migrate-down db-reset db-seed
+.PHONY: db-migrate db-migrate-status db-seed
 
+# The server also applies pending migrations automatically on startup (see
+# backend/pkg/migrate and backend/cmd/server/main.go), backing up first if
+# the database already has data. These targets are for manual/CI use only.
 db-migrate: ## Apply database migrations
 	@echo "${BLUE}Applying database migrations...${RESET}"
-	@cd backend && go run -tags migrate migrate up
+	@cd backend && go run ./cmd/cli migrate up
 
-db-migrate-down: ## Roll back database migrations
-	@echo "${BLUE}Rolling back database migrations...${RESET}"
-	@cd backend && go run -tags migrate migrate down
-
-db-reset: ## Reset database to initial state
-	@echo "${YELLOW}Resetting database...${RESET}"
-	$(MAKE) db-migrate-down
-	$(MAKE) db-migrate
+db-migrate-status: ## List pending database migrations
+	@cd backend && go run ./cmd/cli migrate status
 
 db-seed: ## Seed database with initial data
 	@echo "${BLUE}Seeding database...${RESET}"

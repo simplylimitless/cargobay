@@ -139,6 +139,13 @@ func (db *Database) QueryRow(ctx context.Context, sql string, args ...any) pgx.R
 	return db.pool.QueryRow(ctx, sql, args...)
 }
 
+// Begin starts a transaction on the pool. Exposed for callers (e.g.
+// pkg/migrate) that need multiple statements to commit or roll back
+// together, rather than the fire-and-forget Exec/Query/QueryRow above.
+func (db *Database) Begin(ctx context.Context) (pgx.Tx, error) {
+	return db.pool.Begin(ctx)
+}
+
 // GetArtifactByParams retrieves an artifact by its identifying parameters
 func (db *Database) GetArtifactByParams(registryID, namespace, artifactName, version string) (*ArtifactMetadata, error) {
 	row := db.pool.QueryRow(

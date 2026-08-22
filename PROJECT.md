@@ -192,7 +192,7 @@ PostgreSQL-backed database for metadata with scalable search support.
 | Cursor-based pagination | Efficient deep pagination without OFFSET |
 | Connection pooling | Handles concurrent queries at scale |
 
-**Migration:** See `backend/migrations/` for schema updates.
+**Migration:** Applied automatically on server startup (see `backend/pkg/migrate`); source files live in `backend/pkg/migrate/sql/migrations/`. Run manually with `make db-migrate` / `make db-migrate-status`.
 
 ---
 
@@ -392,10 +392,10 @@ helm install cargobay ./charts/cargobay
 | Search results | Every request | Cached (5 min TTL) |
 
 ### Database Migration
-Run the migration to enable full-text search indexing:
-```bash
-psql -d cargobay -f backend/migrations/001_add_tsvector_index.sql
-```
+The full-text search indexing migration (and every other migration under
+`backend/pkg/migrate/sql/migrations/`) is applied automatically the first
+time the server starts against a given database. To apply it manually
+ahead of a deploy: `make db-migrate`.
 
 ### Horizontal Scaling
 1. Deploy multiple cargobay instances behind load balancer

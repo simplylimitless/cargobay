@@ -18,6 +18,7 @@ import (
 	"github.com/simplylimitless/cargobay/backend/pkg/config"
 	"github.com/simplylimitless/cargobay/backend/pkg/database"
 	"github.com/simplylimitless/cargobay/backend/pkg/middleware"
+	"github.com/simplylimitless/cargobay/backend/pkg/migrate"
 	"github.com/simplylimitless/cargobay/backend/pkg/proxy"
 	"github.com/simplylimitless/cargobay/backend/pkg/proxy/alpine"
 	"github.com/simplylimitless/cargobay/backend/pkg/proxy/cargo"
@@ -84,6 +85,43 @@ func main() {
 		}
 	})
 
+	// Initialize backup service ahead of migrating (see below) so a backup
+	// can be taken immediately before schema changes touch a live
+	// deployment. defaultStorage is used unless an admin has configured a
+	// dedicated backup destination via Settings
+	// (backup_settings.storage_type/storage_config in the DB, re-read on
+	// every backup/restore/list call — see backup.Backup.resolveStorage).
+	backupSvc := backup.New(db, trackedStorage)
+
+	// Apply the baseline schema and any pending migrations. On a database
+	// that already has data (i.e. not the very first boot against an empty
+	// Postgres instance), take a full backup first and refuse to start if
+	// that backup fails — better to block a deploy than to alter a live
+	// schema without a safety net.
+	migrator := migrate.New(db)
+	migrateCtx := context.Background()
+	hasExistingSchema, err := migrator.HasExistingSchema(migrateCtx)
+	if err != nil {
+		log.Fatalf("Failed to inspect database schema: %v", err)
+	}
+	pendingMigrations, err := migrator.Pending(migrateCtx)
+	if err != nil {
+		log.Fatalf("Failed to determine pending migrations: %v", err)
+	}
+	if hasExistingSchema && len(pendingMigrations) > 0 {
+		log.Printf("%d pending migration(s) found; taking a backup before applying them: %v", len(pendingMigrations), pendingMigrations)
+		if err := backupSvc.Run(migrateCtx); err != nil {
+			log.Fatalf("Refusing to run migrations: pre-migration backup failed: %v", err)
+		}
+	}
+	appliedMigrations, err := migrator.Apply(migrateCtx)
+	if err != nil {
+		log.Fatalf("Failed to apply database migrations: %v", err)
+	}
+	if len(appliedMigrations) > 0 {
+		log.Printf("Applied migrations: %v", appliedMigrations)
+	}
+
 	// Convert registry config
 	registries := make([]database.RegistryConfig, len(cfg.Registries))
 	for i, reg := range cfg.Registries {
@@ -140,11 +178,8 @@ func main() {
 	vulnRescanner := vulnerability.NewRescanner(db, scanner)
 	go vulnRescanner.StartScheduler(schedulerCtx)
 
-	// Initialize backup service (full logical DB dump/restore). defaultStorage
-	// is used unless an admin has configured a dedicated backup destination
-	// via Settings (backup_settings.storage_type/storage_config in the DB,
-	// re-read on every backup/restore/list call — see backup.Backup.resolveStorage).
-	backupSvc := backup.New(db, trackedStorage)
+	// Start the recurring backup scheduler (backupSvc itself was constructed
+	// earlier, ahead of the migration step above).
 	go backupSvc.StartScheduler(schedulerCtx)
 
 	// Initialize API server
