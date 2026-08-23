@@ -3,6 +3,7 @@ package docker
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -237,6 +238,80 @@ func TestHandlePutManifestAndGetManifest(t *testing.T) {
 	assert.Equal(t, http.StatusOK, getRec.Code)
 	assert.Equal(t, manifestBody, getRec.Body.Bytes())
 	assert.NotEmpty(t, getRec.Header().Get("Docker-Content-Digest"))
+}
+
+// TestHandleManifestRevalidatesMutableTag verifies that a cached tag whose
+// upstream digest has changed (e.g. "latest" repointed at a new image) is
+// re-fetched on the next pull instead of served stale, while a tag whose
+// upstream digest is unchanged is served straight from cache without
+// re-downloading the manifest body.
+func TestHandleManifestRevalidatesMutableTag(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p := newTestProxy(t, db, c)
+
+	manifestV1 := []byte(`{"schemaVersion":2,"config":{"digest":"sha256:v1"}}`)
+	manifestV2 := []byte(`{"schemaVersion":2,"config":{"digest":"sha256:v2"}}`)
+	current := manifestV1
+	var upstreamHits int
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits++
+		sum := sha256.Sum256(current)
+		digest := fmt.Sprintf("sha256:%x", sum)
+		w.Header().Set("Docker-Content-Digest", digest)
+		w.Header().Set("Content-Type", "application/vnd.docker.distribution.manifest.v2+json")
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.Write(current)
+	}))
+	t.Cleanup(upstream.Close)
+
+	regID := uniqueID("revalidate-reg")
+	reg := &database.RegistryConfig{
+		ID:       regID,
+		Name:     regID,
+		URL:      upstream.URL,
+		Type:     "docker",
+		Proxy:    true,
+		Enabled:  true,
+		Priority: 10,
+	}
+	require.NoError(t, db.SaveRegistry(reg))
+	t.Cleanup(func() { db.DeleteRegistry(regID) })
+	t.Cleanup(func() { db.DeleteArtifact(regID, "library", "app", "latest") })
+	tgt := target{reg: reg, label: regID}
+
+	// First pull: nothing cached yet, pulls manifestV1 through from upstream.
+	req := httptest.NewRequest(http.MethodGet, "/v2/library/app/manifests/latest", nil)
+	rec := httptest.NewRecorder()
+	p.handleManifest(rec, req, tgt, "library/app", "latest")
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, manifestV1, rec.Body.Bytes())
+	assert.Equal(t, 1, upstreamHits, "expected a single GET on first pull, nothing cached yet")
+
+	// Second pull: upstream unchanged, should be served from cache after a
+	// single revalidation HEAD (no manifest re-download).
+	hitsBefore := upstreamHits
+	req = httptest.NewRequest(http.MethodGet, "/v2/library/app/manifests/latest", nil)
+	rec = httptest.NewRecorder()
+	p.handleManifest(rec, req, tgt, "library/app", "latest")
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, manifestV1, rec.Body.Bytes())
+	assert.Equal(t, hitsBefore+1, upstreamHits, "expected exactly one revalidation HEAD when the tag hasn't moved")
+
+	// Upstream repoints "latest" at a new image.
+	current = manifestV2
+
+	// Third pull: revalidation HEAD should detect the digest mismatch and
+	// trigger a fresh GET, serving the new content instead of the stale cache.
+	req = httptest.NewRequest(http.MethodGet, "/v2/library/app/manifests/latest", nil)
+	rec = httptest.NewRecorder()
+	p.handleManifest(rec, req, tgt, "library/app", "latest")
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, manifestV2, rec.Body.Bytes())
 }
 
 func TestHandleHeadManifestNotFound(t *testing.T) {

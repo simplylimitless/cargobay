@@ -115,6 +115,30 @@ func isDigestReference(reference string) bool {
 	return strings.HasPrefix(reference, "sha256:")
 }
 
+// manifestAcceptHeader is sent on every upstream manifest request (full
+// fetch, and the HEAD used to revalidate a cached tag) so upstream returns
+// the same manifest kind either way.
+const manifestAcceptHeader = "application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json"
+
+// staleCachedTag reports whether a cached tag's digest no longer matches what
+// the upstream registry currently serves for that tag. Digest references are
+// immutable by definition and never revalidated. If proxying is disabled (no
+// upstream to check against) or the upstream check itself fails (e.g.
+// transient network error), the cached copy is treated as fresh — pulls stay
+// available even when upstream is briefly unreachable, at the cost of
+// possibly serving a tag that changed moments ago.
+func (p *DockerProxy) staleCachedTag(t target, repository, reference, cachedDigest string) bool {
+	if isDigestReference(reference) || t.reg == nil || !t.reg.Proxy {
+		return false
+	}
+	upstreamDigest, err := p.fetchUpstreamDigest(t.reg, repository, reference)
+	if err != nil {
+		log.Printf("tag revalidation: failed to check %s/%s for staleness, serving cached copy: %v", repository, reference, err)
+		return false
+	}
+	return upstreamDigest != cachedDigest
+}
+
 // manifestList mirrors the subset of the Docker manifest-list / OCI image
 // index schema needed to surface each platform's digest, since cargobay's
 // artifacts table stores a single digest per row and this is otherwise the
@@ -493,7 +517,7 @@ func (p *DockerProxy) handleManifest(w http.ResponseWriter, r *http.Request, t t
 		}
 	}
 
-	if artifact != nil {
+	if artifact != nil && !p.staleCachedTag(t, repository, reference, artifact.Digest) {
 		// If proxy is disabled for this registry, don't serve cached content
 		// that came from upstream - return 404 so the client knows proxying
 		// is not available.
@@ -564,6 +588,9 @@ func (p *DockerProxy) handleHeadManifest(w http.ResponseWriter, r *http.Request,
 	if err == nil {
 		for _, a := range artifacts {
 			if a.ArtifactName == name && (a.Version == reference || a.Digest == reference) {
+				if p.staleCachedTag(t, repository, reference, a.Digest) {
+					break
+				}
 				// If proxy is disabled for this registry, don't serve cached content
 				if t.reg != nil && !t.reg.Proxy {
 					http.Error(w, "upstream proxy disabled", http.StatusNotFound)
@@ -932,12 +959,13 @@ func parseWWWAuthenticate(header string) *dockerAuthChallenge {
 	return challenge
 }
 
-// upstreamRequest performs a GET against the upstream registry, transparently
-// handling the Bearer-token challenge/response flow required by Docker Hub
-// and other v2 registries before retrying the request with a token.
-func (p *DockerProxy) upstreamRequest(reg *database.RegistryConfig, reqURL string, headers map[string]string) (*http.Response, error) {
+// upstreamRequest performs a request against the upstream registry,
+// transparently handling the Bearer-token challenge/response flow required
+// by Docker Hub and other v2 registries before retrying the request with a
+// token.
+func (p *DockerProxy) upstreamRequest(reg *database.RegistryConfig, method, reqURL string, headers map[string]string) (*http.Response, error) {
 	doGet := func(bearer string) (*http.Response, error) {
-		req, err := http.NewRequest(http.MethodGet, reqURL, nil)
+		req, err := http.NewRequest(method, reqURL, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -1009,8 +1037,8 @@ func (p *DockerProxy) fetchManifestFromUpstream(reg *database.RegistryConfig, re
 		return nil, "", err
 	}
 	reqURL := fmt.Sprintf("%s/v2/%s/manifests/%s", base, normalizeRepository(repository), reference)
-	resp, err := p.upstreamRequest(reg, reqURL, map[string]string{
-		"Accept": "application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json",
+	resp, err := p.upstreamRequest(reg, http.MethodGet, reqURL, map[string]string{
+		"Accept": manifestAcceptHeader,
 	})
 	if err != nil {
 		return nil, "", err
@@ -1026,6 +1054,33 @@ func (p *DockerProxy) fetchManifestFromUpstream(reg *database.RegistryConfig, re
 	return body, resp.Header.Get("Content-Type"), nil
 }
 
+// fetchUpstreamDigest performs a cheap HEAD request against the upstream
+// registry to learn the current digest a mutable tag resolves to, without
+// downloading the manifest body. Used to revalidate a cached tag on every
+// pull, since a tag like "latest" can be repointed upstream at any time.
+func (p *DockerProxy) fetchUpstreamDigest(reg *database.RegistryConfig, repository, reference string) (string, error) {
+	base, err := upstreamBase(reg)
+	if err != nil {
+		return "", err
+	}
+	reqURL := fmt.Sprintf("%s/v2/%s/manifests/%s", base, normalizeRepository(repository), reference)
+	resp, err := p.upstreamRequest(reg, http.MethodHead, reqURL, map[string]string{
+		"Accept": manifestAcceptHeader,
+	})
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("upstream returned %d", resp.StatusCode)
+	}
+	digest := resp.Header.Get("Docker-Content-Digest")
+	if digest == "" {
+		return "", fmt.Errorf("upstream HEAD response had no Docker-Content-Digest header")
+	}
+	return digest, nil
+}
+
 // fetchBlobFromUpstream pulls a blob (image layer or config) through from
 // the upstream registry for a repository that isn't cached locally yet.
 func (p *DockerProxy) fetchBlobFromUpstream(reg *database.RegistryConfig, repository, digest string) ([]byte, error) {
@@ -1034,7 +1089,7 @@ func (p *DockerProxy) fetchBlobFromUpstream(reg *database.RegistryConfig, reposi
 		return nil, err
 	}
 	reqURL := fmt.Sprintf("%s/v2/%s/blobs/%s", base, normalizeRepository(repository), digest)
-	resp, err := p.upstreamRequest(reg, reqURL, nil)
+	resp, err := p.upstreamRequest(reg, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, err
 	}
