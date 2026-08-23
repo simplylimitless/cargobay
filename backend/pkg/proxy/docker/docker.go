@@ -37,7 +37,6 @@ type DockerProxy struct {
 	cache      *cache.Cache
 	rbac       *rbac.RBAC
 	registries []database.RegistryConfig
-	registry   string
 	scanner    *vulnerability.VulnerabilityScanner
 }
 
@@ -51,7 +50,6 @@ func NewDockerProxy(db *database.Database, storage storage.StorageAdapter, cache
 		cache:      cache,
 		rbac:       rbacMgr,
 		registries: registries,
-		registry:   "docker",
 		scanner:    scanner,
 	}
 
@@ -430,7 +428,7 @@ func (p *DockerProxy) cacheManifestFromUpstream(t target, repository, reference 
 	if err := p.db.SaveArtifact(cached); err != nil {
 		return nil, "", "", err
 	}
-	p.triggerAsyncScan(namespace, name, reference)
+	p.triggerAsyncScan(t.label, repository, namespace, name, reference)
 
 	return body, digest, contentType, nil
 }
@@ -634,7 +632,7 @@ func (p *DockerProxy) handlePutManifest(w http.ResponseWriter, r *http.Request, 
 		http.Error(w, fmt.Sprintf("Failed to save artifact: %v", err), http.StatusInternalServerError)
 		return
 	}
-	p.triggerAsyncScan(namespace, name, reference)
+	p.triggerAsyncScan(t.label, repository, namespace, name, reference)
 
 	w.Header().Set("Docker-Content-Digest", digest)
 	w.WriteHeader(http.StatusCreated)
@@ -644,12 +642,16 @@ func (p *DockerProxy) handlePutManifest(w http.ResponseWriter, r *http.Request, 
 // artifact in the background, so it never adds latency to the push/pull
 // request that triggered it. The scanner pulls the image itself over
 // cargobay's own registry API, so no artifact data needs to be passed here.
-func (p *DockerProxy) triggerAsyncScan(namespace, name, reference string) {
+// registryLabel and repository must match what the caller just saved the
+// artifact under, or the scan result gets persisted against an artifact ID
+// that never matches a real row and the vulnerability badge never shows up.
+func (p *DockerProxy) triggerAsyncScan(registryLabel, repository, namespace, name, reference string) {
 	if p.scanner == nil || isDigestReference(reference) {
 		return
 	}
 	artifact := &database.ArtifactMetadata{
-		ID:           fmt.Sprintf("docker:%s:%s:%s", p.registry, strings.ReplaceAll(namespace+"/"+name, "/", "_"), reference),
+		ID:           fmt.Sprintf("docker:%s:%s:%s", registryLabel, strings.ReplaceAll(repository, "/", "_"), reference),
+		RegistryID:   registryLabel,
 		ArtifactType: "docker",
 		Namespace:    namespace,
 		ArtifactName: name,

@@ -52,7 +52,6 @@ func newTestProxy(t *testing.T, db *database.Database, c *cache.Cache) *DockerPr
 		cache:      c,
 		rbac:       rbac.New(db),
 		registries: nil,
-		registry:   "docker",
 		scanner:    nil,
 	}
 }
