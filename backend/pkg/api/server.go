@@ -182,6 +182,12 @@ func (s *Server) setupRoutes() {
 		api.Put("/users/me", s.handleUpdateCurrentUser)
 		api.Post("/users/me/password", s.handleChangePassword)
 
+		// Self-service personal access tokens - any authenticated user may
+		// create/list/revoke their own tokens, no special permission required.
+		api.Get("/users/me/access-keys", s.handleListMyAccessKeys)
+		api.Post("/users/me/access-keys", s.handleCreateMyAccessKey)
+		api.Delete("/users/me/access-keys/{keyId}", s.handleRevokeMyAccessKey)
+
 		// User management requires admin ("user:admin"), enforced per-handler
 		// via rbac.CanManageUser / RBAC.RequirePermission.
 		api.Post("/users", s.rbac.RequirePermission("user:admin")(http.HandlerFunc(s.handleCreateUser)).ServeHTTP)
@@ -247,6 +253,11 @@ func (s *Server) callerUserID(r *http.Request) string {
 	return ""
 }
 
+// callerUser returns the authenticated user, or nil for an anonymous caller.
+func (s *Server) callerUser(r *http.Request) *middleware.User {
+	return middleware.GetUser(r)
+}
+
 // readableRegistryIDs returns the IDs of every enabled registry the caller
 // (possibly anonymous) may read, per RBAC.CanReadRegistry — public
 // registries are always included, private ones only with a grant.
@@ -255,10 +266,10 @@ func (s *Server) readableRegistryIDs(r *http.Request) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	userID := s.callerUserID(r)
+	user := s.callerUser(r)
 	ids := make([]string, 0, len(registries))
 	for _, reg := range registries {
-		if s.rbac.CanReadRegistry(userID, &reg) {
+		if s.rbac.CanReadRegistry(user, &reg) {
 			ids = append(ids, reg.ID)
 		}
 	}
@@ -297,7 +308,7 @@ func (s *Server) handleListArtifacts(w http.ResponseWriter, r *http.Request) {
 			s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to list artifacts: %v", gerr))
 			return
 		}
-		if registry == nil || !s.rbac.CanReadRegistry(s.callerUserID(r), registry) {
+		if registry == nil || !s.rbac.CanReadRegistry(s.callerUser(r), registry) {
 			s.writeJSON(w, http.StatusOK, PaginationResponse{Artifacts: []database.ArtifactMetadata{}, Total: 0, HasMore: false})
 			return
 		}
@@ -368,7 +379,7 @@ func (s *Server) handleListArtifactsCursor(w http.ResponseWriter, r *http.Reques
 func (s *Server) handleCreateArtifact(w http.ResponseWriter, r *http.Request) {
 	// Enforce artifact:write permission
 	user := middleware.GetUser(r)
-	if user == nil || !s.rbac.HasPermission(user.UserID, "artifact:write") {
+	if user == nil || !s.rbac.HasEffectivePermission(user, "artifact:write") {
 		s.writeJSONError(w, http.StatusForbidden, "Permission denied: artifact:write required")
 		return
 	}
@@ -426,7 +437,7 @@ func (s *Server) handleGetArtifact(w http.ResponseWriter, r *http.Request) {
 		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to load registry: %v", err))
 		return
 	}
-	if !s.rbac.CanReadRegistry(s.callerUserID(r), registry) {
+	if !s.rbac.CanReadRegistry(s.callerUser(r), registry) {
 		s.writeJSONError(w, http.StatusNotFound, "Artifact not found")
 		return
 	}
@@ -454,7 +465,7 @@ func (s *Server) handleDeleteArtifact(w http.ResponseWriter, r *http.Request) {
 	// uploader of this artifact (recorded in Metadata by handleCreateArtifact).
 	uploadedBy, _ := artifact.Metadata["uploadedBy"].(string)
 	isOwner := uploadedBy != "" && uploadedBy == user.Username
-	if !isOwner && !s.rbac.HasPermission(user.UserID, "artifact:delete") {
+	if !isOwner && !s.rbac.HasEffectivePermission(user, "artifact:delete") {
 		s.writeJSONError(w, http.StatusForbidden, "Permission denied: artifact:delete required")
 		return
 	}
@@ -480,7 +491,7 @@ func (s *Server) handleScanArtifact(w http.ResponseWriter, r *http.Request) {
 
 	// Enforce artifact:read permission
 	user := middleware.GetUser(r)
-	if user == nil || !s.rbac.HasPermission(user.UserID, "artifact:read") {
+	if user == nil || !s.rbac.HasEffectivePermission(user, "artifact:read") {
 		s.writeJSONError(w, http.StatusForbidden, "Permission denied: artifact:read required")
 		return
 	}
@@ -522,7 +533,7 @@ func (s *Server) handleScanArtifact(w http.ResponseWriter, r *http.Request) {
 // handleGetVulnDBSettings returns the current vulnerability-DB update settings.
 func (s *Server) handleGetVulnDBSettings(w http.ResponseWriter, r *http.Request) {
 	user := middleware.GetUser(r)
-	if user == nil || !s.rbac.HasPermission(user.UserID, "system:read") {
+	if user == nil || !s.rbac.HasEffectivePermission(user, "system:read") {
 		s.writeJSONError(w, http.StatusForbidden, "Permission denied: system:read required")
 		return
 	}
@@ -539,7 +550,7 @@ func (s *Server) handleGetVulnDBSettings(w http.ResponseWriter, r *http.Request)
 // handleUpdateVulnDBSettings updates the auto-update toggle and refresh interval.
 func (s *Server) handleUpdateVulnDBSettings(w http.ResponseWriter, r *http.Request) {
 	user := middleware.GetUser(r)
-	if user == nil || !s.rbac.HasPermission(user.UserID, "system:write") {
+	if user == nil || !s.rbac.HasEffectivePermission(user, "system:write") {
 		s.writeJSONError(w, http.StatusForbidden, "Permission denied: system:write required")
 		return
 	}
@@ -574,7 +585,7 @@ func (s *Server) handleUpdateVulnDBSettings(w http.ResponseWriter, r *http.Reque
 // handleGetSearchIndexSettings returns the current search-index reindex settings.
 func (s *Server) handleGetSearchIndexSettings(w http.ResponseWriter, r *http.Request) {
 	user := middleware.GetUser(r)
-	if user == nil || !s.rbac.HasPermission(user.UserID, "system:read") {
+	if user == nil || !s.rbac.HasEffectivePermission(user, "system:read") {
 		s.writeJSONError(w, http.StatusForbidden, "Permission denied: system:read required")
 		return
 	}
@@ -591,7 +602,7 @@ func (s *Server) handleGetSearchIndexSettings(w http.ResponseWriter, r *http.Req
 // handleUpdateSearchIndexSettings updates the auto-reindex toggle and refresh interval.
 func (s *Server) handleUpdateSearchIndexSettings(w http.ResponseWriter, r *http.Request) {
 	user := middleware.GetUser(r)
-	if user == nil || !s.rbac.HasPermission(user.UserID, "system:write") {
+	if user == nil || !s.rbac.HasEffectivePermission(user, "system:write") {
 		s.writeJSONError(w, http.StatusForbidden, "Permission denied: system:write required")
 		return
 	}
@@ -627,7 +638,7 @@ func (s *Server) handleUpdateSearchIndexSettings(w http.ResponseWriter, r *http.
 // and returns the resulting settings row.
 func (s *Server) handleTriggerSearchIndexReindex(w http.ResponseWriter, r *http.Request) {
 	user := middleware.GetUser(r)
-	if user == nil || !s.rbac.HasPermission(user.UserID, "system:write") {
+	if user == nil || !s.rbac.HasEffectivePermission(user, "system:write") {
 		s.writeJSONError(w, http.StatusForbidden, "Permission denied: system:write required")
 		return
 	}
@@ -697,7 +708,7 @@ var validBackupStorageTypes = map[string]bool{"": true, "local": true, "s3": tru
 // handleGetBackupSettings returns the current scheduled-backup settings.
 func (s *Server) handleGetBackupSettings(w http.ResponseWriter, r *http.Request) {
 	user := middleware.GetUser(r)
-	if user == nil || !s.rbac.HasPermission(user.UserID, "system:read") {
+	if user == nil || !s.rbac.HasEffectivePermission(user, "system:read") {
 		s.writeJSONError(w, http.StatusForbidden, "Permission denied: system:read required")
 		return
 	}
@@ -718,7 +729,7 @@ func (s *Server) handleGetBackupSettings(w http.ResponseWriter, r *http.Request)
 // a real credential just to change an unrelated field.
 func (s *Server) handleUpdateBackupSettings(w http.ResponseWriter, r *http.Request) {
 	user := middleware.GetUser(r)
-	if user == nil || !s.rbac.HasPermission(user.UserID, "system:write") {
+	if user == nil || !s.rbac.HasEffectivePermission(user, "system:write") {
 		s.writeJSONError(w, http.StatusForbidden, "Permission denied: system:write required")
 		return
 	}
@@ -786,7 +797,7 @@ func (s *Server) handleUpdateBackupSettings(w http.ResponseWriter, r *http.Reque
 // returns the resulting settings row.
 func (s *Server) handleTriggerBackup(w http.ResponseWriter, r *http.Request) {
 	user := middleware.GetUser(r)
-	if user == nil || !s.rbac.HasPermission(user.UserID, "system:write") {
+	if user == nil || !s.rbac.HasEffectivePermission(user, "system:write") {
 		s.writeJSONError(w, http.StatusForbidden, "Permission denied: system:write required")
 		return
 	}
@@ -813,7 +824,7 @@ func (s *Server) handleTriggerBackup(w http.ResponseWriter, r *http.Request) {
 // handleListBackups lists every stored backup archive, newest first.
 func (s *Server) handleListBackups(w http.ResponseWriter, r *http.Request) {
 	user := middleware.GetUser(r)
-	if user == nil || !s.rbac.HasPermission(user.UserID, "system:read") {
+	if user == nil || !s.rbac.HasEffectivePermission(user, "system:read") {
 		s.writeJSONError(w, http.StatusForbidden, "Permission denied: system:read required")
 		return
 	}
@@ -863,7 +874,7 @@ func (s *Server) handleRestoreBackup(w http.ResponseWriter, r *http.Request) {
 // and returns the resulting settings row.
 func (s *Server) handleTriggerVulnDBUpdate(w http.ResponseWriter, r *http.Request) {
 	user := middleware.GetUser(r)
-	if user == nil || !s.rbac.HasPermission(user.UserID, "system:write") {
+	if user == nil || !s.rbac.HasEffectivePermission(user, "system:write") {
 		s.writeJSONError(w, http.StatusForbidden, "Permission denied: system:write required")
 		return
 	}
@@ -890,7 +901,7 @@ func (s *Server) handleTriggerVulnDBUpdate(w http.ResponseWriter, r *http.Reques
 // handleGetVulnScanSettings returns the current vulnerability-scan settings.
 func (s *Server) handleGetVulnScanSettings(w http.ResponseWriter, r *http.Request) {
 	user := middleware.GetUser(r)
-	if user == nil || !s.rbac.HasPermission(user.UserID, "system:read") {
+	if user == nil || !s.rbac.HasEffectivePermission(user, "system:read") {
 		s.writeJSONError(w, http.StatusForbidden, "Permission denied: system:read required")
 		return
 	}
@@ -907,7 +918,7 @@ func (s *Server) handleGetVulnScanSettings(w http.ResponseWriter, r *http.Reques
 // handleUpdateVulnScanSettings updates the auto-scan toggle and rescan interval.
 func (s *Server) handleUpdateVulnScanSettings(w http.ResponseWriter, r *http.Request) {
 	user := middleware.GetUser(r)
-	if user == nil || !s.rbac.HasPermission(user.UserID, "system:write") {
+	if user == nil || !s.rbac.HasEffectivePermission(user, "system:write") {
 		s.writeJSONError(w, http.StatusForbidden, "Permission denied: system:write required")
 		return
 	}
@@ -943,7 +954,7 @@ func (s *Server) handleUpdateVulnScanSettings(w http.ResponseWriter, r *http.Req
 // artifact for vulnerabilities and returns the resulting settings row.
 func (s *Server) handleTriggerVulnScan(w http.ResponseWriter, r *http.Request) {
 	user := middleware.GetUser(r)
-	if user == nil || !s.rbac.HasPermission(user.UserID, "system:write") {
+	if user == nil || !s.rbac.HasEffectivePermission(user, "system:write") {
 		s.writeJSONError(w, http.StatusForbidden, "Permission denied: system:write required")
 		return
 	}
@@ -1071,7 +1082,7 @@ func (s *Server) handleDownloadArtifact(w http.ResponseWriter, r *http.Request) 
 
 	// Enforce artifact:read permission
 	user := middleware.GetUser(r)
-	if user == nil || !s.rbac.HasPermission(user.UserID, "artifact:read") {
+	if user == nil || !s.rbac.HasEffectivePermission(user, "artifact:read") {
 		s.writeJSONError(w, http.StatusForbidden, "Permission denied: artifact:read required")
 		return
 	}
@@ -1087,7 +1098,7 @@ func (s *Server) handleDownloadArtifact(w http.ResponseWriter, r *http.Request) 
 		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to load registry: %v", err))
 		return
 	}
-	if !s.rbac.CanReadRegistry(user.UserID, registry) {
+	if !s.rbac.CanReadRegistry(user, registry) {
 		s.writeJSONError(w, http.StatusNotFound, "Artifact not found")
 		return
 	}
@@ -1114,7 +1125,7 @@ func (s *Server) handleSignArtifact(w http.ResponseWriter, r *http.Request) {
 
 	// Enforce artifact:sign permission
 	user := middleware.GetUser(r)
-	if user == nil || !s.rbac.HasPermission(user.UserID, "artifact:sign") {
+	if user == nil || !s.rbac.HasEffectivePermission(user, "artifact:sign") {
 		s.writeJSONError(w, http.StatusForbidden, "Permission denied: artifact:sign required")
 		return
 	}
@@ -1218,8 +1229,9 @@ func (s *Server) handleAutocomplete(w http.ResponseWriter, r *http.Request) {
 // so filtering here is what actually keeps a private registry's existence
 // from leaking to users with no access to it.
 func (s *Server) handleListRegistries(w http.ResponseWriter, r *http.Request) {
+	user := middleware.GetUser(r)
 	userID := ""
-	if user := middleware.GetUser(r); user != nil {
+	if user != nil {
 		userID = user.UserID
 	}
 
@@ -1239,7 +1251,7 @@ func (s *Server) handleListRegistries(w http.ResponseWriter, r *http.Request) {
 
 	visible := make([]database.RegistryConfig, 0, len(registries))
 	for _, reg := range registries {
-		if s.rbac.CanReadRegistry(userID, &reg) {
+		if s.rbac.CanReadRegistry(user, &reg) {
 			visible = append(visible, reg)
 		}
 	}
@@ -1254,7 +1266,7 @@ func (s *Server) handleListRegistries(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleCreateRegistry(w http.ResponseWriter, r *http.Request) {
 	// Enforce registry:write permission
 	user := middleware.GetUser(r)
-	if user == nil || !s.rbac.HasPermission(user.UserID, "registry:write") {
+	if user == nil || !s.rbac.HasEffectivePermission(user, "registry:write") {
 		s.writeJSONError(w, http.StatusForbidden, "Permission denied: registry:write required")
 		return
 	}
@@ -1283,11 +1295,8 @@ func (s *Server) handleGetRegistry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID := ""
-	if user := middleware.GetUser(r); user != nil {
-		userID = user.UserID
-	}
-	if !s.rbac.CanReadRegistry(userID, registry) {
+	user := middleware.GetUser(r)
+	if !s.rbac.CanReadRegistry(user, registry) {
 		s.writeJSONError(w, http.StatusNotFound, "Registry not found")
 		return
 	}
@@ -1299,7 +1308,7 @@ func (s *Server) handleGetRegistry(w http.ResponseWriter, r *http.Request) {
 // on a private registry. Only callers with registry:write may manage grants.
 func (s *Server) handleGrantRegistryAccess(w http.ResponseWriter, r *http.Request) {
 	user := middleware.GetUser(r)
-	if user == nil || !s.rbac.HasPermission(user.UserID, "registry:write") {
+	if user == nil || !s.rbac.HasEffectivePermission(user, "registry:write") {
 		s.writeJSONError(w, http.StatusForbidden, "Permission denied: registry:write required")
 		return
 	}
@@ -1332,7 +1341,7 @@ func (s *Server) handleGrantRegistryAccess(w http.ResponseWriter, r *http.Reques
 // handleRevokeRegistryAccess removes a user's grant on a private registry.
 func (s *Server) handleRevokeRegistryAccess(w http.ResponseWriter, r *http.Request) {
 	user := middleware.GetUser(r)
-	if user == nil || !s.rbac.HasPermission(user.UserID, "registry:write") {
+	if user == nil || !s.rbac.HasEffectivePermission(user, "registry:write") {
 		s.writeJSONError(w, http.StatusForbidden, "Permission denied: registry:write required")
 		return
 	}
@@ -1350,7 +1359,7 @@ func (s *Server) handleRevokeRegistryAccess(w http.ResponseWriter, r *http.Reque
 // handleListRegistryAccess lists all user grants on a private registry.
 func (s *Server) handleListRegistryAccess(w http.ResponseWriter, r *http.Request) {
 	user := middleware.GetUser(r)
-	if user == nil || !s.rbac.HasPermission(user.UserID, "registry:write") {
+	if user == nil || !s.rbac.HasEffectivePermission(user, "registry:write") {
 		s.writeJSONError(w, http.StatusForbidden, "Permission denied: registry:write required")
 		return
 	}
@@ -1373,7 +1382,7 @@ func (s *Server) handleDeleteRegistry(w http.ResponseWriter, r *http.Request) {
 
 	// Enforce registry:delete permission
 	user := middleware.GetUser(r)
-	if user == nil || !s.rbac.HasPermission(user.UserID, "registry:delete") {
+	if user == nil || !s.rbac.HasEffectivePermission(user, "registry:delete") {
 		s.writeJSONError(w, http.StatusForbidden, "Permission denied: registry:delete required")
 		return
 	}
@@ -1846,6 +1855,181 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]string{"message": "Password updated successfully"})
 }
 
+// accessKeyMetadata is the public shape of an AccessKey — everything except
+// KeyHash, which must never leave the server once the key has been created.
+type accessKeyMetadata struct {
+	ID          string     `json:"id"`
+	Name        string     `json:"name"`
+	Description string     `json:"description"`
+	Scope       string     `json:"scope"`
+	CreatedAt   time.Time  `json:"createdAt"`
+	LastUsed    *time.Time `json:"lastUsed"`
+	ExpiresAt   *time.Time `json:"expiresAt"`
+	IsActive    bool       `json:"isActive"`
+}
+
+// personalAccessTokenScope maps the UI-facing scope string to the permissions
+// slice stored in access_keys.permissions. middleware.accessKeyScope derives
+// "full" vs "read" back out of this same slice (it treats presence of
+// "write" as full scope), so the two must stay in sync.
+func personalAccessTokenScope(scope string) ([]string, bool) {
+	switch scope {
+	case "read":
+		return []string{"read"}, true
+	case "read-write":
+		return []string{"read", "write"}, true
+	default:
+		return nil, false
+	}
+}
+
+// accessKeyUIScope is the inverse of personalAccessTokenScope, for display.
+func accessKeyUIScope(permissions []string) string {
+	for _, p := range permissions {
+		if p == "write" {
+			return "read-write"
+		}
+	}
+	return "read"
+}
+
+func toAccessKeyMetadata(key *database.AccessKey) accessKeyMetadata {
+	return accessKeyMetadata{
+		ID:          key.ID,
+		Name:        key.Name,
+		Description: key.Description,
+		Scope:       accessKeyUIScope(key.Permissions),
+		CreatedAt:   key.CreatedAt,
+		LastUsed:    key.LastUsed,
+		ExpiresAt:   key.ExpiresAt,
+		IsActive:    key.IsActive,
+	}
+}
+
+// handleListMyAccessKeys lists the caller's own personal access tokens.
+// Never includes KeyHash.
+func (s *Server) handleListMyAccessKeys(w http.ResponseWriter, r *http.Request) {
+	user := middleware.GetUser(r)
+	if user == nil {
+		s.writeJSONError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	keys, err := s.db.ListUserPersonalAccessTokens(user.UserID)
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to list access keys: %v", err))
+		return
+	}
+
+	metadata := make([]accessKeyMetadata, 0, len(keys))
+	for _, key := range keys {
+		metadata = append(metadata, toAccessKeyMetadata(&key))
+	}
+
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"accessKeys": metadata,
+	})
+}
+
+// handleCreateMyAccessKey creates a new personal access token for the
+// caller. The raw token is returned exactly once, here — it is never
+// recoverable afterward since only its hash is persisted.
+func (s *Server) handleCreateMyAccessKey(w http.ResponseWriter, r *http.Request) {
+	user := middleware.GetUser(r)
+	if user == nil {
+		s.writeJSONError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	var input struct {
+		Name        string  `json:"name"`
+		Description string  `json:"description"`
+		Scope       string  `json:"scope"`
+		ExpiresAt   *string `json:"expiresAt"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		s.writeJSONError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	if input.Name == "" {
+		s.writeJSONError(w, http.StatusBadRequest, "name is required")
+		return
+	}
+	permissions, ok := personalAccessTokenScope(input.Scope)
+	if !ok {
+		s.writeJSONError(w, http.StatusBadRequest, `scope must be "read" or "read-write"`)
+		return
+	}
+
+	var expiresAt *time.Time
+	if input.ExpiresAt != nil && *input.ExpiresAt != "" {
+		parsed, err := time.Parse(time.RFC3339, *input.ExpiresAt)
+		if err != nil {
+			s.writeJSONError(w, http.StatusBadRequest, "expiresAt must be an RFC3339 timestamp")
+			return
+		}
+		expiresAt = &parsed
+	}
+
+	token, err := auth.GenerateToken()
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, "Failed to generate token")
+		return
+	}
+
+	key, err := s.db.CreatePersonalAccessToken(user.UserID, input.Name, auth.HashToken(token), permissions, expiresAt, input.Description)
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to create access token: %v", err))
+		return
+	}
+
+	resp := struct {
+		accessKeyMetadata
+		Token string `json:"token"`
+	}{
+		accessKeyMetadata: toAccessKeyMetadata(key),
+		Token:             token,
+	}
+	s.writeJSON(w, http.StatusCreated, resp)
+}
+
+// handleRevokeMyAccessKey revokes one of the caller's own personal access
+// tokens. db.InvalidateAccessKey itself has no ownership check, so the
+// caller's key list is consulted first to confirm the key belongs to them.
+func (s *Server) handleRevokeMyAccessKey(w http.ResponseWriter, r *http.Request) {
+	user := middleware.GetUser(r)
+	if user == nil {
+		s.writeJSONError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	keyID := chi.URLParam(r, "keyId")
+
+	keys, err := s.db.ListUserPersonalAccessTokens(user.UserID)
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to list access keys: %v", err))
+		return
+	}
+	owned := false
+	for _, key := range keys {
+		if key.ID == keyID {
+			owned = true
+			break
+		}
+	}
+	if !owned {
+		s.writeJSONError(w, http.StatusNotFound, "Access token not found")
+		return
+	}
+
+	if err := s.db.InvalidateAccessKey(keyID); err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to revoke access token: %v", err))
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, map[string]string{"message": "Access token revoked"})
+}
+
 // handleGetUserRoles handles getting user roles
 func (s *Server) handleGetUserRoles(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
@@ -1934,7 +2118,7 @@ func (s *Server) handleReplicationStatus(w http.ResponseWriter, r *http.Request)
 func (s *Server) handleReplicationSync(w http.ResponseWriter, r *http.Request) {
 	// Enforce replication:sync permission
 	user := middleware.GetUser(r)
-	if user == nil || !s.rbac.HasPermission(user.UserID, "replication:sync") {
+	if user == nil || !s.rbac.HasEffectivePermission(user, "replication:sync") {
 		s.writeJSONError(w, http.StatusForbidden, "Permission denied: replication:sync required")
 		return
 	}

@@ -829,17 +829,46 @@ func (db *Database) CreateAccessKey(userID, name string, permissions []string, e
 
 	row := db.pool.QueryRow(
 		context.Background(),
-		`INSERT INTO access_keys (id, user_id, name, key_hash, permissions, created_at, expires_at, is_active)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE)
-		 RETURNING id, user_id, name, key_hash, permissions, created_at, last_used, expires_at, is_active`,
+		`INSERT INTO access_keys (id, user_id, name, key_hash, permissions, created_at, expires_at, is_active, key_type)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, 'session')
+		 RETURNING id, user_id, name, key_hash, permissions, created_at, last_used, expires_at, is_active, key_type`,
 		keyID, userID, name, keyHash, permissions, createdAt, expiresAt,
 	)
 
 	var key AccessKey
 	err := row.Scan(&key.ID, &key.UserID, &key.Name, &key.KeyHash,
-		&key.Permissions, &key.CreatedAt, &key.LastUsed, &key.ExpiresAt, &key.IsActive)
+		&key.Permissions, &key.CreatedAt, &key.LastUsed, &key.ExpiresAt, &key.IsActive, &key.KeyType)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create access key: %w", err)
+	}
+	return &key, nil
+}
+
+// CreatePersonalAccessToken creates a new user-managed access key whose
+// secret is presented to the caller exactly once. Unlike CreateAccessKey
+// (used for short-lived login sessions, which stores the raw token so it
+// can be handed back to callers that already treat it as opaque), the
+// caller here must pass tokenHash — the token's hash, computed with
+// auth.HashToken before calling this method — so the raw secret is never
+// persisted. scope is stored in the existing permissions column, e.g.
+// []string{"read"} or []string{"read", "write"}.
+func (db *Database) CreatePersonalAccessToken(userID, name, tokenHash string, scope []string, expiresAt *time.Time, description string) (*AccessKey, error) {
+	keyID := generateUUID()
+	createdAt := time.Now()
+
+	row := db.pool.QueryRow(
+		context.Background(),
+		`INSERT INTO access_keys (id, user_id, name, key_hash, permissions, created_at, expires_at, is_active, key_type, description)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, 'personal', $8)
+		 RETURNING id, user_id, name, key_hash, permissions, created_at, last_used, expires_at, is_active, key_type, description`,
+		keyID, userID, name, tokenHash, scope, createdAt, expiresAt, description,
+	)
+
+	var key AccessKey
+	err := row.Scan(&key.ID, &key.UserID, &key.Name, &key.KeyHash,
+		&key.Permissions, &key.CreatedAt, &key.LastUsed, &key.ExpiresAt, &key.IsActive, &key.KeyType, &key.Description)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create personal access token: %w", err)
 	}
 	return &key, nil
 }
@@ -851,13 +880,13 @@ func (db *Database) ValidateAccessKey(keyHash string) (*AccessKey, error) {
 		context.Background(),
 		`UPDATE access_keys SET last_used = $1
 		 WHERE key_hash = $2 AND is_active = TRUE AND (expires_at IS NULL OR expires_at > $1)
-		 RETURNING id, user_id, name, key_hash, permissions, created_at, last_used, expires_at, is_active`,
+		 RETURNING id, user_id, name, key_hash, permissions, created_at, last_used, expires_at, is_active, key_type`,
 		now, keyHash,
 	)
 
 	var key AccessKey
 	err := row.Scan(&key.ID, &key.UserID, &key.Name, &key.KeyHash,
-		&key.Permissions, &key.CreatedAt, &key.LastUsed, &key.ExpiresAt, &key.IsActive)
+		&key.Permissions, &key.CreatedAt, &key.LastUsed, &key.ExpiresAt, &key.IsActive, &key.KeyType)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -880,12 +909,25 @@ func (db *Database) InvalidateAccessKey(id string) error {
 	return nil
 }
 
-// ListUserAccessKeys lists all access keys for a user
+// ListUserAccessKeys lists all access keys for a user, of every key_type
+// (session and personal alike). Intended for admin bulk-invalidation flows
+// (e.g. deactivating a user must kill their login sessions too) — user-facing
+// token management should use ListUserPersonalAccessTokens instead.
 func (db *Database) ListUserAccessKeys(userID string) ([]AccessKey, error) {
+	return db.listUserAccessKeys(userID, "")
+}
+
+// ListUserPersonalAccessTokens lists only the user-managed PATs for a user,
+// excluding the login-session keys auth.Login creates on every sign-in.
+func (db *Database) ListUserPersonalAccessTokens(userID string) ([]AccessKey, error) {
+	return db.listUserAccessKeys(userID, "AND key_type = 'personal'")
+}
+
+func (db *Database) listUserAccessKeys(userID, extraWhere string) ([]AccessKey, error) {
 	rows, err := db.pool.Query(
 		context.Background(),
-		`SELECT id, user_id, name, key_hash, permissions, created_at, last_used, expires_at, is_active
-		 FROM access_keys WHERE user_id = $1 ORDER BY created_at DESC`,
+		`SELECT id, user_id, name, key_hash, permissions, created_at, last_used, expires_at, is_active, key_type, description
+		 FROM access_keys WHERE user_id = $1 `+extraWhere+` ORDER BY created_at DESC`,
 		userID,
 	)
 	if err != nil {
@@ -897,7 +939,7 @@ func (db *Database) ListUserAccessKeys(userID string) ([]AccessKey, error) {
 	for rows.Next() {
 		var k AccessKey
 		err := rows.Scan(&k.ID, &k.UserID, &k.Name, &k.KeyHash,
-			&k.Permissions, &k.CreatedAt, &k.LastUsed, &k.ExpiresAt, &k.IsActive)
+			&k.Permissions, &k.CreatedAt, &k.LastUsed, &k.ExpiresAt, &k.IsActive, &k.KeyType, &k.Description)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan access key: %w", err)
 		}

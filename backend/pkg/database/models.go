@@ -55,6 +55,14 @@ type AccessKey struct {
 	LastUsed    *time.Time `db:"last_used"`
 	ExpiresAt   *time.Time `db:"expires_at"`
 	IsActive    bool       `db:"is_active"`
+	// KeyType is "session" for short-lived login sessions (created by
+	// auth.Login) or "personal" for user-managed PATs (created via the
+	// API Tokens UI). Keeps the two apart without relying on Name.
+	KeyType string `db:"key_type"`
+	// Description is an optional free-text note set by the user when
+	// creating a personal access token, to help tell PATs with similar
+	// names apart. Always empty for session keys.
+	Description string `db:"description"`
 }
 
 // RegistryConfig represents an upstream registry

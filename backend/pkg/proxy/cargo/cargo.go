@@ -99,7 +99,7 @@ func (p *CargoProxy) handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(lines) == 0 {
-		data, err := p.fetchIndexFromUpstream(t.Reg, name)
+		data, err := p.fetchIndexFromUpstream(t.Reg, t.Label, name)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Failed to fetch crate index: %v", err), http.StatusNotFound)
 			return
@@ -141,7 +141,7 @@ func (p *CargoProxy) handleDownload(w http.ResponseWriter, r *http.Request) {
 	version := chi.URLParam(r, "version")
 	t := proxypkg.TargetFromContext(r, "cargo")
 
-	if data, err := p.storage.GetArtifact("cargo", "", name, version); err == nil && data != nil {
+	if data, err := p.storage.GetArtifact(t.Label, "", name, version); err == nil && data != nil {
 		w.Header().Set("Content-Type", "application/gzip")
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s-%s.crate", name, version))
 		if err := p.db.IncrementArtifactDownloads(t.Label, "", name, version); err != nil {
@@ -157,7 +157,7 @@ func (p *CargoProxy) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := p.storage.SaveArtifact("cargo", "", name, version, data); err != nil {
+	if _, err := p.storage.SaveArtifact(t.Label, "", name, version, data); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to save crate: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -173,7 +173,7 @@ func (p *CargoProxy) handleDownload(w http.ResponseWriter, r *http.Request) {
 // fetchIndexFromUpstream fetches a crate's sparse index file from upstream
 // and saves one artifact record per version line so subsequent index and
 // download requests are served from the database/storage cache.
-func (p *CargoProxy) fetchIndexFromUpstream(reg *database.RegistryConfig, name string) ([]byte, error) {
+func (p *CargoProxy) fetchIndexFromUpstream(reg *database.RegistryConfig, registryLabel, name string) ([]byte, error) {
 	if reg == nil || !reg.Proxy || reg.URL == "" {
 		return nil, fmt.Errorf("no upstream proxy configured for this registry")
 	}
@@ -211,6 +211,7 @@ func (p *CargoProxy) fetchIndexFromUpstream(reg *database.RegistryConfig, name s
 		}
 		artifact := &database.ArtifactMetadata{
 			ID:              fmt.Sprintf("cargo:%s:%s", name, entry.Vers),
+			RegistryID:      registryLabel,
 			ArtifactType:    "cargo",
 			ArtifactName:    name,
 			Version:         entry.Vers,

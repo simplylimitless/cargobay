@@ -384,7 +384,7 @@ func (p *DockerProxy) cacheManifestFromUpstream(t target, repository, reference 
 	digestBytes := sha256.Sum256(body)
 	digest = fmt.Sprintf("sha256:%x", digestBytes)
 
-	if _, err := p.storage.SaveArtifact("docker", repository, reference, "latest", body); err != nil {
+	if _, err := p.storage.SaveArtifact(t.label, namespace, name, reference, body); err != nil {
 		return nil, "", "", err
 	}
 
@@ -604,13 +604,14 @@ func (p *DockerProxy) handlePutManifest(w http.ResponseWriter, r *http.Request, 
 	digestBytes := sha256.Sum256(body)
 	digest := fmt.Sprintf("sha256:%x", digestBytes)
 
+	// Split repository to get namespace and name
+	namespace, name := splitDockerRepository(repository)
+
 	// Save manifest to storage
-	if _, err := p.storage.SaveArtifact("docker", repository, reference, "latest", body); err != nil {
+	if _, err := p.storage.SaveArtifact(t.label, namespace, name, reference, body); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to save manifest: %v", err), http.StatusInternalServerError)
 		return
 	}
-
-	namespace, name := splitDockerRepository(repository)
 
 	// Save to database
 	artifact := &database.ArtifactMetadata{
@@ -788,8 +789,15 @@ func (p *DockerProxy) handleFinishUpload(w http.ResponseWriter, r *http.Request,
 
 // handleDeleteManifest deletes a manifest
 func (p *DockerProxy) handleDeleteManifest(w http.ResponseWriter, r *http.Request, t target, repository, reference string) {
-	if err := p.storage.DeleteArtifact("docker", repository, reference, "latest"); err != nil {
+	namespace, name := splitDockerRepository(repository)
+
+	if err := p.storage.DeleteArtifact(t.label, namespace, name, reference); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to delete manifest: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	if _, err := p.db.DeleteArtifact(t.label, namespace, name, reference); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to delete artifact from database: %v", err), http.StatusInternalServerError)
 		return
 	}
 

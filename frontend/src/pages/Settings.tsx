@@ -137,7 +137,8 @@ export function Settings() {
   const [loading, setLoading] = useState(true)
   const [searchParams, setSearchParams] = useSearchParams()
   const tabParam = searchParams.get('tab') as SettingsTab | null
-  const activeTab: SettingsTab = tabParam && SETTINGS_TABS.includes(tabParam) ? tabParam : 'general'
+  const activeTab: SettingsTab =
+    tabParam && SETTINGS_TABS.includes(tabParam) ? tabParam : 'general'
   const setActiveTab = (tab: SettingsTab) => setSearchParams(tab === 'general' ? {} : { tab }, { replace: false })
 
   const [registries, setRegistries] = useState<Registry[]>([])
@@ -2065,6 +2066,7 @@ export function Settings() {
           </div>
         </div>
       )}
+
     </div>
   )
 }

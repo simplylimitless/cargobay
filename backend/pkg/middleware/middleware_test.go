@@ -87,6 +87,22 @@ func seedTestAccessKey(t *testing.T, db *database.Database, userID string, permi
 	return key.KeyHash
 }
 
+// seedTestPAT creates a real personal-access-token row (cleaned up via
+// t.Cleanup) for tests that exercise NewAuthMiddleware's PAT fallback paths.
+// Returns the raw token — callers present this as a Basic-auth password or
+// Bearer token, never the stored hash.
+func seedTestPAT(t *testing.T, db *database.Database, userID string, scope []string) string {
+	t.Helper()
+	token, err := auth.GenerateToken()
+	require.NoError(t, err)
+	key, err := db.CreatePersonalAccessToken(userID, "test-pat", auth.HashToken(token), scope, nil, "")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		db.Exec(context.Background(), "DELETE FROM access_keys WHERE id = $1", key.ID)
+	})
+	return token
+}
+
 // TestNewRateLimiter creates a new rate limiter and tests its initialization
 func TestNewRateLimiter(t *testing.T) {
 	limit := 100
@@ -689,6 +705,152 @@ func TestUserRetrievalAfterAuthWithPassword(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.Header.Set("Authorization", "Basic "+encodedAuth)
+	rec := httptest.NewRecorder()
+
+	next.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
+// TestAuthMiddlewareBasicAuthWithReadOnlyPAT tests the docker-login
+// convention (real username + PAT as the password) with a read-only token:
+// authentication succeeds and the resulting user is scoped to "read".
+func TestAuthMiddlewareBasicAuthWithReadOnlyPAT(t *testing.T) {
+	db := connectTestDB(t)
+	lookup := NewMockRoleAndPermissionLookup()
+
+	user := seedTestUser(t, db, "real-account-password")
+	lookup.Roles[user.UserID] = []string{"admin"}
+	lookup.Permissions[user.UserID] = []string{"artifact:read", "artifact:write", "registry:write"}
+	token := seedTestPAT(t, db, user.UserID, []string{"read"})
+
+	middleware := NewAuthMiddleware(db, lookup)
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authedUser := GetUser(r)
+		if authedUser == nil {
+			http.Error(w, "No user found", http.StatusUnauthorized)
+			return
+		}
+		assert.Equal(t, user.UserID, authedUser.UserID)
+		assert.Equal(t, "read", authedUser.Scope)
+		// The underlying account's full role permissions are still loaded —
+		// scoping down to "read" happens later, at RBAC-check time.
+		assert.Contains(t, authedUser.Permissions, "registry:write")
+		w.WriteHeader(http.StatusOK)
+	})
+
+	next := middleware(handler)
+
+	authString := user.Username + ":" + token
+	encodedAuth := base64.StdEncoding.EncodeToString([]byte(authString))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Basic "+encodedAuth)
+	rec := httptest.NewRecorder()
+
+	next.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
+// TestAuthMiddlewareBasicAuthWithReadWritePAT tests the same convention
+// with a read-write token: the resulting user is scoped to "full".
+func TestAuthMiddlewareBasicAuthWithReadWritePAT(t *testing.T) {
+	db := connectTestDB(t)
+	lookup := NewMockRoleAndPermissionLookup()
+
+	user := seedTestUser(t, db, "real-account-password")
+	lookup.Roles[user.UserID] = []string{"publisher"}
+	lookup.Permissions[user.UserID] = []string{"artifact:read", "artifact:write"}
+	token := seedTestPAT(t, db, user.UserID, []string{"read", "write"})
+
+	middleware := NewAuthMiddleware(db, lookup)
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authedUser := GetUser(r)
+		if authedUser == nil {
+			http.Error(w, "No user found", http.StatusUnauthorized)
+			return
+		}
+		assert.Equal(t, "full", authedUser.Scope)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	next := middleware(handler)
+
+	authString := user.Username + ":" + token
+	encodedAuth := base64.StdEncoding.EncodeToString([]byte(authString))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Basic "+encodedAuth)
+	rec := httptest.NewRecorder()
+
+	next.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
+// TestAuthMiddlewareBasicAuthWithOtherUsersPAT tests that a PAT only
+// authenticates when paired with the username of the account that owns it —
+// pairing a valid token with a different (also valid) username must fail.
+func TestAuthMiddlewareBasicAuthWithOtherUsersPAT(t *testing.T) {
+	db := connectTestDB(t)
+	lookup := NewMockRoleAndPermissionLookup()
+
+	owner := seedTestUser(t, db, "owner-password")
+	other := seedTestUser(t, db, "other-password")
+	token := seedTestPAT(t, db, owner.UserID, []string{"read"})
+
+	middleware := NewAuthMiddleware(db, lookup)
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Nil(t, GetUser(r))
+		w.WriteHeader(http.StatusOK)
+	})
+
+	next := middleware(handler)
+
+	authString := other.Username + ":" + token
+	encodedAuth := base64.StdEncoding.EncodeToString([]byte(authString))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Basic "+encodedAuth)
+	rec := httptest.NewRecorder()
+
+	next.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
+// TestAuthMiddlewareBearerWithReadOnlyPAT tests that a PAT presented
+// directly as a bearer token (rather than the Basic-auth password) also
+// authenticates and carries its scope through.
+func TestAuthMiddlewareBearerWithReadOnlyPAT(t *testing.T) {
+	db := connectTestDB(t)
+	lookup := NewMockRoleAndPermissionLookup()
+
+	user := seedTestUser(t, db, "some-password")
+	lookup.Permissions[user.UserID] = []string{"artifact:read"}
+	token := seedTestPAT(t, db, user.UserID, []string{"read"})
+
+	middleware := NewAuthMiddleware(db, lookup)
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authedUser := GetUser(r)
+		if authedUser == nil {
+			http.Error(w, "No user found", http.StatusUnauthorized)
+			return
+		}
+		assert.Equal(t, user.UserID, authedUser.UserID)
+		assert.Equal(t, "read", authedUser.Scope)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	next := middleware(handler)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 
 	next.ServeHTTP(rec, req)
