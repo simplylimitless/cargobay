@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
+import { getArtifactTypeConfig } from '../lib/artifactTypes'
 
 interface Artifact {
   ID: string
@@ -78,16 +79,6 @@ export function ArtifactList() {
     navigate(`/registries/${registryId}/${artifactType}/${encodeURIComponent(artifact.namespace)}/${encodeURIComponent(artifact.artifactName)}`)
   }
 
-  const iconForType = (type: string) => {
-    switch (type) {
-      case 'docker': return '🐳'
-      case 'maven': return '☕'
-      case 'npm': return '📦'
-      case 'helm': return '⚓'
-      default: return '📦'
-    }
-  }
-
   const formatSize = (bytes: number): string => {
     if (bytes >= 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`
     if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(2)} MB`
@@ -97,7 +88,7 @@ export function ArtifactList() {
   return (
     <div className="space-y-8">
       <div className="card flex items-center gap-4">
-        <div className="text-4xl">{iconForType(artifactType ?? '')}</div>
+        <div className="text-4xl">{getArtifactTypeConfig(artifactType).icon}</div>
         <div>
           <h1 className="text-2xl font-bold text-gray-100 capitalize">{artifactType} Artifacts</h1>
           <p className="text-gray-400">

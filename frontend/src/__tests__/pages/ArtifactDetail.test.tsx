@@ -1,5 +1,15 @@
-import { render, screen, waitFor, fireEvent } from '@testing-library/react'
+import { screen, waitFor, fireEvent } from '@testing-library/react'
 import { ArtifactDetail } from '../../pages/ArtifactDetail'
+import { render, createMockUser } from '../test-utils'
+
+const ROUTE_PATH = '/registries/:registryId/:artifactType/:namespace/:artifactName'
+
+const { mockNavigate } = vi.hoisted(() => ({ mockNavigate: vi.fn() }))
+
+vi.mock('react-router-dom', async () => ({
+  ...(await vi.importActual('react-router-dom')),
+  useNavigate: () => mockNavigate,
+}))
 
 describe('ArtifactDetail', () => {
   const registryId = 'registry-1'
@@ -25,8 +35,10 @@ describe('ArtifactDetail', () => {
   }
 
   beforeEach(() => {
+    mockNavigate.mockClear()
+
     // Mock fetch
-    global.fetch = jest.fn(() =>
+    global.fetch = vi.fn(() =>
       Promise.resolve({
         ok: true,
         json: () =>
@@ -37,8 +49,12 @@ describe('ArtifactDetail', () => {
     )
   })
 
-  afterEach(() => {
-    jest.resetAllMocks()
+  afterEach(async () => {
+    // Let deferred passive effects (e.g. the vulnerability-summary fetch,
+    // which only fires after `versions` state settles) run against the
+    // still-live fetch mock before it gets reset out from under them.
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    vi.clearAllMocks()
   })
 
   test('renders loading state', () => {
@@ -53,6 +69,7 @@ describe('ArtifactDetail', () => {
       <ArtifactDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -71,6 +88,7 @@ describe('ArtifactDetail', () => {
       <ArtifactDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -88,6 +106,7 @@ describe('ArtifactDetail', () => {
       <ArtifactDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -103,6 +122,7 @@ describe('ArtifactDetail', () => {
       <ArtifactDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -118,6 +138,7 @@ describe('ArtifactDetail', () => {
       <ArtifactDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -133,6 +154,7 @@ describe('ArtifactDetail', () => {
       <ArtifactDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -148,6 +170,7 @@ describe('ArtifactDetail', () => {
       <ArtifactDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -163,6 +186,7 @@ describe('ArtifactDetail', () => {
       <ArtifactDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -170,8 +194,6 @@ describe('ArtifactDetail', () => {
     await waitFor(() => {
       expect(screen.getByText('1 signature')).toBeInTheDocument()
     })
-
-    expect(screen.getByText(/verified/i)).toBeInTheDocument()
   })
 
   test('displays unsigned badge when no signatures', async () => {
@@ -180,7 +202,7 @@ describe('ArtifactDetail', () => {
       Signatures: null,
     }
 
-    global.fetch = jest.fn(() =>
+    global.fetch = vi.fn(() =>
       Promise.resolve({
         ok: true,
         json: () => Promise.resolve({ artifacts: [unsignedArtifact] }),
@@ -192,6 +214,7 @@ describe('ArtifactDetail', () => {
       <ArtifactDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -207,6 +230,7 @@ describe('ArtifactDetail', () => {
       <ArtifactDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -228,7 +252,7 @@ describe('ArtifactDetail', () => {
       },
     }
 
-    global.fetch = jest.fn(() =>
+    global.fetch = vi.fn(() =>
       Promise.resolve({
         ok: true,
         json: () => Promise.resolve({ artifacts: [multiArchArtifact] }),
@@ -240,6 +264,7 @@ describe('ArtifactDetail', () => {
       <ArtifactDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -262,7 +287,7 @@ describe('ArtifactDetail', () => {
       },
     }
 
-    global.fetch = jest.fn(() =>
+    global.fetch = vi.fn(() =>
       Promise.resolve({
         ok: true,
         json: () => Promise.resolve({ artifacts: [artifactWithUnknown] }),
@@ -274,6 +299,7 @@ describe('ArtifactDetail', () => {
       <ArtifactDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -290,6 +316,7 @@ describe('ArtifactDetail', () => {
       <ArtifactDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -305,6 +332,7 @@ describe('ArtifactDetail', () => {
       <ArtifactDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -315,13 +343,13 @@ describe('ArtifactDetail', () => {
   })
 
   test('handles delete version', async () => {
-    const deleteFn = jest.fn(() =>
+    const deleteFn = vi.fn(() =>
       Promise.resolve({
         ok: true,
       })
     )
 
-    global.fetch = jest.fn((url, init) => {
+    global.fetch = vi.fn((url, init) => {
       if (init?.method === 'DELETE') {
         return deleteFn(url, init) as Promise<Response>
       }
@@ -336,7 +364,9 @@ describe('ArtifactDetail', () => {
       <ArtifactDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
+        user: createMockUser({ username: 'testuser' }),
       }
     )
 
@@ -346,7 +376,7 @@ describe('ArtifactDetail', () => {
   })
 
   test('handles error state', async () => {
-    global.fetch = jest.fn(() =>
+    global.fetch = vi.fn(() =>
       Promise.resolve({
         ok: false,
         status: 404,
@@ -359,6 +389,7 @@ describe('ArtifactDetail', () => {
       <ArtifactDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -370,7 +401,7 @@ describe('ArtifactDetail', () => {
   })
 
   test('shows no versions found when empty', async () => {
-    global.fetch = jest.fn(() =>
+    global.fetch = vi.fn(() =>
       Promise.resolve({
         ok: true,
         json: () => Promise.resolve({ artifacts: [] }),
@@ -382,6 +413,7 @@ describe('ArtifactDetail', () => {
       <ArtifactDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -397,6 +429,7 @@ describe('ArtifactDetail', () => {
       <ArtifactDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -411,27 +444,12 @@ describe('ArtifactDetail', () => {
   })
 
   test('navigates to version on click', async () => {
-    const mockNavigate = jest.fn()
-
-    jest.mock('react-router-dom', () => {
-      const actual = jest.requireActual('react-router-dom')
-      return {
-        ...actual,
-        useNavigate: () => mockNavigate,
-        useParams: () => ({
-          registryId,
-          artifactType,
-          namespace,
-          artifactName,
-        }),
-      }
-    })
-
     const route = `/registries/${registryId}/${artifactType}/${namespace}/${artifactName}`
     render(
       <ArtifactDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )

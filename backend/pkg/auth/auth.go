@@ -2,6 +2,10 @@
 package auth
 
 import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"time"
 
@@ -113,4 +117,30 @@ func Login(db *database.Database, username, password string) (*LoginOutput, erro
 // Logout invalidates an access key
 func Logout(db *database.Database, keyID string) error {
 	return db.InvalidateAccessKey(keyID)
+}
+
+// tokenPrefix marks a value as a cargobay personal access token, so tokens
+// are visually distinguishable from session tokens and greppable if one
+// leaks into logs or config files.
+const tokenPrefix = "cbpat_"
+
+// GenerateToken creates a new cryptographically random personal access
+// token. Unlike the legacy access-key generator (UUID + timestamp based),
+// this draws directly from crypto/rand.
+func GenerateToken() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("failed to generate token: %w", err)
+	}
+	return tokenPrefix + base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
+// HashToken returns the hex-encoded SHA-256 digest of a token, for storage
+// and lookup. Tokens already carry 256 bits of entropy from crypto/rand, so
+// this exists to protect against exposure via DB read access, not to resist
+// brute force on a low-entropy secret (which is why no per-token salt is
+// needed).
+func HashToken(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
 }

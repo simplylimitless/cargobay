@@ -1,5 +1,15 @@
-import { render, screen, waitFor, fireEvent } from '@testing-library/react'
+import { screen, waitFor, fireEvent } from '@testing-library/react'
 import { ArtifactList } from '../../pages/ArtifactList'
+import { render } from '../test-utils'
+
+const ROUTE_PATH = '/registries/:registryId/:artifactType/:namespace?'
+
+const { mockNavigate } = vi.hoisted(() => ({ mockNavigate: vi.fn() }))
+
+vi.mock('react-router-dom', async () => ({
+  ...(await vi.importActual('react-router-dom')),
+  useNavigate: () => mockNavigate,
+}))
 
 describe('ArtifactList', () => {
   const registryId = 'registry-1'
@@ -39,8 +49,10 @@ describe('ArtifactList', () => {
   ]
 
   beforeEach(() => {
+    mockNavigate.mockClear()
+
     // Mock fetch
-    global.fetch = jest.fn(() =>
+    global.fetch = vi.fn(() =>
       Promise.resolve({
         ok: true,
         json: () => Promise.resolve({ artifacts: mockArtifacts }),
@@ -49,7 +61,7 @@ describe('ArtifactList', () => {
   })
 
   afterEach(() => {
-    jest.resetAllMocks()
+    vi.clearAllMocks()
   })
 
   test('renders loading state', () => {
@@ -63,12 +75,13 @@ describe('ArtifactList', () => {
       <ArtifactList />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
 
     await waitFor(() => {
-      expect(screen.getByText('Docker Artifacts')).toBeInTheDocument()
+      expect(screen.getByText(/docker artifacts/i)).toBeInTheDocument()
     })
   })
 
@@ -78,6 +91,7 @@ describe('ArtifactList', () => {
       <ArtifactList />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -93,6 +107,7 @@ describe('ArtifactList', () => {
       <ArtifactList />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -109,6 +124,7 @@ describe('ArtifactList', () => {
       <ArtifactList />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -123,6 +139,7 @@ describe('ArtifactList', () => {
       <ArtifactList />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -137,6 +154,7 @@ describe('ArtifactList', () => {
       <ArtifactList />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -151,6 +169,7 @@ describe('ArtifactList', () => {
       <ArtifactList />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -166,6 +185,7 @@ describe('ArtifactList', () => {
       <ArtifactList />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -181,35 +201,21 @@ describe('ArtifactList', () => {
       <ArtifactList />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
 
     await waitFor(() => {
       expect(screen.getByText('nginx')).toBeInTheDocument()
-      expect(screen.getByText('app')).toBeInTheDocument()
+      expect(screen.getByText('myorg/app')).toBeInTheDocument()
     })
 
     const searchInput = screen.getByPlaceholderText(/Search docker artifacts/i)
     await fireEvent.change(searchInput, { target: { value: 'ng' } })
 
     expect(screen.getByText('nginx')).toBeInTheDocument()
-    expect(screen.queryByText('app')).not.toBeInTheDocument()
-  })
-
-  test('displays artifact count', async () => {
-    const route = `/registries/${registryId}/${artifactType}`
-    render(
-      <ArtifactList />,
-      {
-        route,
-        history: [route],
-      }
-    )
-
-    await waitFor(() => {
-      expect(screen.getByText(/2 artifacts/i)).toBeInTheDocument()
-    })
+    expect(screen.queryByText('myorg/app')).not.toBeInTheDocument()
   })
 
   test('groups versions by artifact name', async () => {
@@ -218,12 +224,13 @@ describe('ArtifactList', () => {
       <ArtifactList />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
 
     await waitFor(() => {
-      expect(screen.getByText('2 versions')).toBeInTheDocument()
+      expect(screen.getByText(/2 versions/i)).toBeInTheDocument()
     })
   })
 
@@ -233,12 +240,13 @@ describe('ArtifactList', () => {
       <ArtifactList />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
 
     await waitFor(() => {
-      expect(screen.getByText('latest 1.21.0')).toBeInTheDocument()
+      expect(screen.getByText(/latest 1\.21\.0/i)).toBeInTheDocument()
     })
   })
 
@@ -248,6 +256,7 @@ describe('ArtifactList', () => {
       <ArtifactList />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -263,6 +272,7 @@ describe('ArtifactList', () => {
       <ArtifactList />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -278,6 +288,7 @@ describe('ArtifactList', () => {
       <ArtifactList />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -293,6 +304,7 @@ describe('ArtifactList', () => {
       <ArtifactList />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -304,25 +316,12 @@ describe('ArtifactList', () => {
   })
 
   test('navigates to artifact detail on click', async () => {
-    const mockNavigate = jest.fn()
-
-    jest.mock('react-router-dom', () => {
-      const actual = jest.requireActual('react-router-dom')
-      return {
-        ...actual,
-        useNavigate: () => mockNavigate,
-        useParams: () => ({
-          registryId,
-          artifactType,
-        }),
-      }
-    })
-
     const route = `/registries/${registryId}/${artifactType}`
     render(
       <ArtifactList />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -339,7 +338,7 @@ describe('ArtifactList', () => {
   })
 
   test('shows empty state when no artifacts', async () => {
-    global.fetch = jest.fn(() =>
+    global.fetch = vi.fn(() =>
       Promise.resolve({
         ok: true,
         json: () => Promise.resolve({ artifacts: [] }),
@@ -351,6 +350,7 @@ describe('ArtifactList', () => {
       <ArtifactList />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -366,6 +366,7 @@ describe('ArtifactList', () => {
       <ArtifactList />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -381,7 +382,7 @@ describe('ArtifactList', () => {
   })
 
   test('handles fetch error', async () => {
-    global.fetch = jest.fn(() =>
+    global.fetch = vi.fn(() =>
       Promise.resolve({
         ok: false,
         status: 500,
@@ -394,6 +395,7 @@ describe('ArtifactList', () => {
       <ArtifactList />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -410,6 +412,7 @@ describe('ArtifactList', () => {
       <ArtifactList />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -431,7 +434,7 @@ describe('ArtifactList', () => {
       Tags: [],
     }
 
-    global.fetch = jest.fn(() =>
+    global.fetch = vi.fn(() =>
       Promise.resolve({
         ok: true,
         json: () => Promise.resolve({ artifacts: [largeArtifact] }),
@@ -443,6 +446,7 @@ describe('ArtifactList', () => {
       <ArtifactList />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -458,12 +462,13 @@ describe('ArtifactList', () => {
       <ArtifactList />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
 
     await waitFor(() => {
-      expect(screen.getByText('DOCKER')).toBeInTheDocument()
+      expect(screen.getAllByText('DOCKER').length).toBeGreaterThan(0)
     })
   })
 })

@@ -96,7 +96,7 @@ func (p *ComposerProxy) handleDist(w http.ResponseWriter, r *http.Request) {
 	version := chi.URLParam(r, "version")
 	t := proxypkg.TargetFromContext(r, "composer")
 
-	if data, err := p.storage.GetArtifact("composer", vendor, name, version); err == nil && data != nil {
+	if data, err := p.storage.GetArtifact(t.Label, vendor, name, version); err == nil && data != nil {
 		w.Header().Set("Content-Type", "application/zip")
 		if err := p.db.IncrementArtifactDownloads(t.Label, vendor, name, version); err != nil {
 			fmt.Printf("failed to record download for %s/%s@%s: %v\n", vendor, name, version, err)
@@ -130,7 +130,7 @@ func (p *ComposerProxy) handleDist(w http.ResponseWriter, r *http.Request) {
 	if err := p.db.SaveArtifact(artifact); err != nil {
 		fmt.Printf("Warning: failed to save package metadata: %v\n", err)
 	}
-	if _, err := p.storage.SaveArtifact("composer", vendor, name, version, data); err != nil {
+	if _, err := p.storage.SaveArtifact(t.Label, vendor, name, version, data); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to save package: %v", err), http.StatusInternalServerError)
 		return
 	}

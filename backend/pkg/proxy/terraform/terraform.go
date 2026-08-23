@@ -127,7 +127,7 @@ func (p *TerraformProxy) handleProviderFile(w http.ResponseWriter, r *http.Reque
 	fileName := chi.URLParam(r, "fileName")
 	t := proxypkg.TargetFromContext(r, "terraform")
 
-	if data, err := p.storage.GetArtifact("terraform-provider", namespace, ptype, version); err == nil && data != nil {
+	if data, err := p.storage.GetArtifact(t.Label, namespace, ptype, version); err == nil && data != nil {
 		w.Header().Set("Content-Type", "application/zip")
 		if err := p.db.IncrementArtifactDownloads(t.Label, namespace, ptype, version); err != nil {
 			fmt.Printf("failed to record download for %s/%s@%s: %v\n", namespace, ptype, version, err)
@@ -157,7 +157,7 @@ func (p *TerraformProxy) handleProviderFile(w http.ResponseWriter, r *http.Reque
 	if err := p.db.SaveArtifact(artifact); err != nil {
 		fmt.Printf("Warning: failed to save provider metadata: %v\n", err)
 	}
-	if _, err := p.storage.SaveArtifact("terraform-provider", namespace, ptype, version, data); err != nil {
+	if _, err := p.storage.SaveArtifact(t.Label, namespace, ptype, version, data); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to save provider: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -222,7 +222,7 @@ func (p *TerraformProxy) handleModuleArchive(w http.ResponseWriter, r *http.Requ
 	moduleNamespace := fmt.Sprintf("%s/%s", namespace, system)
 	t := proxypkg.TargetFromContext(r, "terraform")
 
-	if data, err := p.storage.GetArtifact("terraform-module", moduleNamespace, name, version); err == nil && data != nil {
+	if data, err := p.storage.GetArtifact(t.Label, moduleNamespace, name, version); err == nil && data != nil {
 		w.Header().Set("Content-Type", "application/gzip")
 		if err := p.db.IncrementArtifactDownloads(t.Label, moduleNamespace, name, version); err != nil {
 			fmt.Printf("failed to record download for %s/%s@%s: %v\n", moduleNamespace, name, version, err)
@@ -252,7 +252,7 @@ func (p *TerraformProxy) handleModuleArchive(w http.ResponseWriter, r *http.Requ
 	if err := p.db.SaveArtifact(artifact); err != nil {
 		fmt.Printf("Warning: failed to save module metadata: %v\n", err)
 	}
-	if _, err := p.storage.SaveArtifact("terraform-module", moduleNamespace, name, version, data); err != nil {
+	if _, err := p.storage.SaveArtifact(t.Label, moduleNamespace, name, version, data); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to save module: %v", err), http.StatusInternalServerError)
 		return
 	}

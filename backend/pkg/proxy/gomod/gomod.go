@@ -104,7 +104,7 @@ func (p *GoModProxy) handleVersioned(w http.ResponseWriter, r *http.Request, pat
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(versionInfo{Version: artifact.Version, Time: artifact.Created})
 	case ".mod":
-		if data, err := p.storage.GetArtifact("go-mod", "", module, version); err == nil && data != nil {
+		if data, err := p.storage.GetArtifact(t.Label, "", module, version); err == nil && data != nil {
 			w.Header().Set("Content-Type", "text/plain")
 			w.Write(data)
 			return
@@ -114,11 +114,11 @@ func (p *GoModProxy) handleVersioned(w http.ResponseWriter, r *http.Request, pat
 			http.Error(w, fmt.Sprintf("Failed to fetch go.mod: %v", err), http.StatusBadGateway)
 			return
 		}
-		p.storage.SaveArtifact("go-mod", "", module, version, data)
+		p.storage.SaveArtifact(t.Label, "", module, version, data)
 		w.Header().Set("Content-Type", "text/plain")
 		w.Write(data)
 	case ".zip":
-		if data, err := p.storage.GetArtifact("go", "", module, version); err == nil && data != nil {
+		if data, err := p.storage.GetArtifact(t.Label, "", module, version); err == nil && data != nil {
 			w.Header().Set("Content-Type", "application/zip")
 			if err := p.db.IncrementArtifactDownloads(t.Label, "", module, version); err != nil {
 				fmt.Printf("failed to record download for %s@%s: %v\n", module, version, err)
@@ -131,7 +131,7 @@ func (p *GoModProxy) handleVersioned(w http.ResponseWriter, r *http.Request, pat
 			http.Error(w, fmt.Sprintf("Failed to fetch module zip: %v", err), http.StatusBadGateway)
 			return
 		}
-		if _, err := p.storage.SaveArtifact("go", "", module, version, data); err != nil {
+		if _, err := p.storage.SaveArtifact(t.Label, "", module, version, data); err != nil {
 			http.Error(w, fmt.Sprintf("Failed to save module: %v", err), http.StatusInternalServerError)
 			return
 		}

@@ -1,67 +1,26 @@
-import { render, screen, waitFor, fireEvent } from '@testing-library/react'
+import { screen, fireEvent } from '@testing-library/react'
 import { Navbar } from '../../components/Navbar'
-import { createMockNavigate, createMockUser } from '../test-utils'
+import { render, createMockUser } from '../test-utils'
+
+const { mockNavigate } = vi.hoisted(() => ({ mockNavigate: vi.fn() }))
+
+vi.mock('react-router-dom', async () => ({
+  ...(await vi.importActual('react-router-dom')),
+  useNavigate: () => mockNavigate,
+}))
 
 // Mock SearchInput component
-jest.mock('../../components/SearchInput', () => ({
+vi.mock('../../components/SearchInput', () => ({
   SearchInput: () => <div data-testid="mock-search-input">Search</div>,
 }))
 
-// Mock react-router-dom
-jest.mock('react-router-dom', () => {
-  const actual = jest.requireActual('react-router-dom')
-  return {
-    ...actual,
-    useNavigate: jest.fn(),
-    Link: ({ to, children, className }: { to: string; children: ReactNode; className?: string }) => {
-      const handleClick = (e: React.MouseEvent) => {
-        e.preventDefault()
-        if (props.onClick) props.onClick(e)
-      }
-      const props = { to, onClick: handleClick }
-      return <a href={to} className={className} onClick={handleClick}>{children}</a>
-    },
-  }
-})
-
 describe('Navbar', () => {
-  const mockNavigate = jest.fn()
-  let originalWindowLocation: string
-
   beforeEach(() => {
-    jest.resetAllMocks()
-    jest.mock('react-router-dom', () => {
-      const actual = jest.requireActual('react-router-dom')
-      return {
-        ...actual,
-        useNavigate: () => mockNavigate,
-        useLocation: () => ({ pathname: '/' }),
-        Link: ({ to, children, className, onClick }: any) => {
-          const handleClick = (e: React.MouseEvent) => {
-            e.preventDefault()
-            if (onClick) onClick(e)
-            else mockNavigate(to)
-          }
-          return <a href={to} className={className} onClick={handleClick}>{children}</a>
-        },
-      }
-    })
-
-    // Mock localStorage
-    originalWindowLocation = window.localStorage
-    Object.defineProperty(window, 'localStorage', {
-      value: {
-        getItem: () => null,
-        setItem: () => {},
-        removeItem: () => {},
-      },
-      writable: true,
-    })
+    mockNavigate.mockClear()
   })
 
   afterEach(() => {
-    jest.resetAllMocks()
-    Object.defineProperty(window, 'localStorage', { value: originalWindowLocation, writable: true })
+    vi.clearAllMocks()
   })
 
   test('renders logo and site name', () => {
@@ -84,8 +43,9 @@ describe('Navbar', () => {
   })
 
   test('renders logout button when authenticated', () => {
-    render(<Navbar />)
-    // Note: This requires auth context setup - we'll test with mock
+    render(<Navbar />, { user: createMockUser({ username: 'testuser' }) })
+
+    expect(screen.getByRole('button', { name: /log out/i })).toBeInTheDocument()
   })
 
   test('renders Guide link for all users', () => {
@@ -95,23 +55,27 @@ describe('Navbar', () => {
   })
 
   test('renders Upload link when authenticated', () => {
-    render(<Navbar />)
-    // Authenticated state needs to be mocked
+    render(<Navbar />, { user: createMockUser({ username: 'testuser' }) })
+
+    expect(screen.getByRole('link', { name: /Upload/i })).toBeInTheDocument()
   })
 
   test('renders Browse link when authenticated', () => {
-    render(<Navbar />)
-    // Authenticated state needs to be mocked
+    render(<Navbar />, { user: createMockUser({ username: 'testuser' }) })
+
+    expect(screen.getByRole('link', { name: /Browse/i })).toBeInTheDocument()
   })
 
   test('renders Vulnerabilities link for admin users', () => {
-    render(<Navbar />)
-    // Admin state needs to be mocked
+    render(<Navbar />, { user: createMockUser({ username: 'admin', roles: ['admin'] }) })
+
+    expect(screen.getByRole('link', { name: /Vulnerabilities/i })).toBeInTheDocument()
   })
 
   test('renders Profile link with username when authenticated', () => {
-    render(<Navbar />)
-    // Authenticated state needs to be mocked
+    render(<Navbar />, { user: createMockUser({ username: 'testuser' }) })
+
+    expect(screen.getByText('testuser')).toBeInTheDocument()
   })
 
   test('navigates to home on logo click', async () => {
@@ -120,35 +84,36 @@ describe('Navbar', () => {
     const logoLink = screen.getByRole('link', { name: /cargobay/i })
     await fireEvent.click(logoLink)
 
-    expect(mockNavigate).toHaveBeenCalledWith('/')
+    expect(logoLink).toHaveAttribute('href', '/')
   })
 
   test('navigates to getting-started on guide click', async () => {
     render(<Navbar />)
 
     const guideLink = screen.getByRole('link', { name: /Guide/i })
-    await fireEvent.click(guideLink)
-
-    expect(mockNavigate).toHaveBeenCalledWith('/getting-started')
+    expect(guideLink).toHaveAttribute('href', '/getting-started')
   })
 
   test('navigates to login on login click', async () => {
     render(<Navbar />)
 
     const loginLink = screen.getByRole('link', { name: /log in/i })
-    await fireEvent.click(loginLink)
-
-    expect(mockNavigate).toHaveBeenCalledWith('/login')
+    expect(loginLink).toHaveAttribute('href', '/login')
   })
 
   test('handles logout correctly', async () => {
-    render(<Navbar />)
-    // Logout button needs auth context
+    render(<Navbar />, { user: createMockUser({ username: 'testuser' }) })
+
+    const logoutButton = screen.getByRole('button', { name: /log out/i })
+    await fireEvent.click(logoutButton)
+
+    expect(mockNavigate).toHaveBeenCalledWith('/')
   })
 
   test('displays user role badge', () => {
-    render(<Navbar />)
-    // Role badge needs auth context
+    render(<Navbar />, { user: createMockUser({ username: 'admin', roles: ['admin'] }) })
+
+    expect(screen.getByText('admin', { selector: '.badge' })).toBeInTheDocument()
   })
 
   test('has proper navigation structure', () => {
@@ -190,36 +155,20 @@ describe('Navbar', () => {
   })
 })
 
-// Test with authenticated user context
 describe('Navbar with Auth', () => {
-  const mockNavigate = jest.fn()
-
-  beforeEach(() => {
-    jest.resetAllMocks()
-    jest.mock('react-router-dom', () => {
-      const actual = jest.requireActual('react-router-dom')
-      return {
-        ...actual,
-        useNavigate: () => mockNavigate,
-        useLocation: () => ({ pathname: '/' }),
-        Link: ({ to, children, className }: any) => (
-          <a href={to} className={className} onClick={(e: React.MouseEvent) => { e.preventDefault(); mockNavigate(to) }}>
-            {children}
-          </a>
-        ),
-      }
-    })
+  afterEach(() => {
+    vi.clearAllMocks()
   })
 
   test('shows username when user is authenticated', () => {
-    render(<Navbar />)
+    render(<Navbar />, { user: createMockUser({ username: 'testuser' }) })
 
-    const user = createMockUser({ username: 'testuser' })
-    // User needs to be passed to AuthProvider
+    expect(screen.getByText('testuser')).toBeInTheDocument()
   })
 
   test('shows admin links when user is admin', () => {
-    render(<Navbar />)
-    // Admin state needs to be mocked
+    render(<Navbar />, { user: createMockUser({ username: 'admin', roles: ['admin'] }) })
+
+    expect(screen.getByRole('link', { name: /Vulnerabilities/i })).toBeInTheDocument()
   })
 })

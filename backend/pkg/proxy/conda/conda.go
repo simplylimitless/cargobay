@@ -105,7 +105,7 @@ func (p *CondaProxy) handlePackage(w http.ResponseWriter, r *http.Request) {
 
 	t := proxypkg.TargetFromContext(r, "conda")
 
-	if data, err := p.storage.GetArtifact("conda", namespace, name, versionKey); err == nil && data != nil {
+	if data, err := p.storage.GetArtifact(t.Label, namespace, name, versionKey); err == nil && data != nil {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", fileName))
 		if err := p.db.IncrementArtifactDownloads(t.Label, namespace, name, versionKey); err != nil {
@@ -137,7 +137,7 @@ func (p *CondaProxy) handlePackage(w http.ResponseWriter, r *http.Request) {
 	if err := p.db.SaveArtifact(artifact); err != nil {
 		fmt.Printf("Warning: failed to save package metadata: %v\n", err)
 	}
-	if _, err := p.storage.SaveArtifact("conda", namespace, name, versionKey, data); err != nil {
+	if _, err := p.storage.SaveArtifact(t.Label, namespace, name, versionKey, data); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to save package: %v", err), http.StatusInternalServerError)
 		return
 	}

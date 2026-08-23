@@ -1,3 +1,4 @@
+/// <reference types="vitest" />
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
@@ -5,6 +6,17 @@ const backendTarget = process.env.BACKEND_URL || 'http://localhost:4500'
 
 export default defineConfig({
   plugins: [react()],
+  test: {
+    globals: true,
+    environment: 'jsdom',
+    setupFiles: ['./src/setupTests.ts'],
+    exclude: ['node_modules/**', 'tests/e2e/**'],
+    coverage: {
+      provider: 'v8',
+      reporter: ['text', 'json', 'html'],
+      exclude: ['node_modules/', 'src/**/*.d.ts', 'src/**/*.stories.*', 'src/**/__tests__/**'],
+    },
+  },
   server: {
     host: true,
     proxy: {

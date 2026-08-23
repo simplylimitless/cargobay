@@ -50,23 +50,18 @@ func ResolveRegistry(db *database.Database, registries []database.RegistryConfig
 // 403 for an authenticated-but-unauthorized user) and returns false — the
 // caller should stop handling the request in that case.
 func CheckAccess(w http.ResponseWriter, rbacMgr *rbac.RBAC, user *middleware.User, reg *database.RegistryConfig, requirePublish bool) bool {
-	userID := ""
-	if user != nil {
-		userID = user.UserID
-	}
-
 	allowed := false
 	if requirePublish {
-		allowed = rbacMgr.CanPublishRegistry(userID, reg)
+		allowed = rbacMgr.CanPublishRegistry(user, reg)
 	} else {
-		allowed = rbacMgr.CanReadRegistry(userID, reg)
+		allowed = rbacMgr.CanReadRegistry(user, reg)
 	}
 	if allowed {
 		return true
 	}
 
 	status := http.StatusForbidden
-	if userID == "" {
+	if user == nil {
 		status = http.StatusUnauthorized
 	}
 	w.Header().Set("Content-Type", "application/json")

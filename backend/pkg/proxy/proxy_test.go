@@ -9,13 +9,22 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/simplylimitless/cargobay/backend/pkg/cache"
 	"github.com/simplylimitless/cargobay/backend/pkg/database"
-	"github.com/simplylimitless/cargobay/backend/pkg/storage"
 )
+
+// withChiParams attaches URL params the way chi's router would, so handlers
+// using chi.URLParam(r, ...) can be unit-tested without a full router.
+func withChiParams(r *http.Request, params map[string]string) *http.Request {
+	rctx := chi.NewRouteContext()
+	for k, v := range params {
+		rctx.URLParams.Add(k, v)
+	}
+	return r.WithContext(context.WithValue(r.Context(), chi.RouteCtxKey, rctx))
+}
 
 // MockDatabase is a mock implementation of database.Database for testing
 type MockDatabase struct {
@@ -60,6 +69,53 @@ func (m *MockStorageAdapter) GetArtifact(registryID, namespace, artifactName, ve
 	return m.artifacts[key], nil
 }
 
+// SaveArtifact implements storage.StorageAdapter interface
+func (m *MockStorageAdapter) SaveArtifact(registryID, namespace, artifactName, version string, data []byte) (string, error) {
+	return "", nil
+}
+
+// DeleteArtifact implements storage.StorageAdapter interface
+func (m *MockStorageAdapter) DeleteArtifact(registryID, namespace, artifactName, version string) error {
+	return nil
+}
+
+// ArtifactExists implements storage.StorageAdapter interface
+func (m *MockStorageAdapter) ArtifactExists(registryID, namespace, artifactName, version string) (bool, error) {
+	key := fmt.Sprintf("%s/%s/%s/%s", registryID, namespace, artifactName, version)
+	_, ok := m.artifacts[key]
+	return ok, nil
+}
+
+// Upload implements storage.StorageAdapter interface
+func (m *MockStorageAdapter) Upload(bucket, key string, data []byte, contentType string) error {
+	return nil
+}
+
+// Download implements storage.StorageAdapter interface
+func (m *MockStorageAdapter) Download(bucket, key string) ([]byte, error) {
+	return nil, nil
+}
+
+// DeleteFile implements storage.StorageAdapter interface
+func (m *MockStorageAdapter) DeleteFile(bucket, key string) error {
+	return nil
+}
+
+// ListFiles implements storage.StorageAdapter interface
+func (m *MockStorageAdapter) ListFiles(bucket, prefix string) ([]string, error) {
+	return []string{}, nil
+}
+
+// Connect implements storage.StorageAdapter interface
+func (m *MockStorageAdapter) Connect() error {
+	return nil
+}
+
+// Disconnect implements storage.StorageAdapter interface
+func (m *MockStorageAdapter) Disconnect() error {
+	return nil
+}
+
 // MockCache is a mock implementation of cache.Cache for testing
 type MockCache struct {
 	data        map[string]interface{}
@@ -77,9 +133,9 @@ func (m *MockCache) Get(key string, value interface{}) error {
 		if b, ok := value.(*map[string]interface{}); ok {
 			*b = v.(map[string]interface{})
 		}
-		return nil
 	}
-	return cache.ErrCacheMiss
+	// Matches cache.Cache.Get: a miss is not an error, it just leaves value unset.
+	return nil
 }
 
 // Set implements cache.Cache interface
@@ -188,7 +244,7 @@ func TestSearchArtifactsCacheHit(t *testing.T) {
 	storage := &MockStorageAdapter{}
 	cache := &MockCache{
 		data: map[string]interface{}{
-			"search:v2:test::::100:0": cacheData,
+			"search:v2:test:::100:0": cacheData,
 		},
 	}
 
@@ -316,13 +372,12 @@ func TestGetArtifactInfoSuccess(t *testing.T) {
 	pm := New(db, storage, cache, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/artifact/test/package/1.0.0?registry=npm", nil)
+	req = withChiParams(req, map[string]string{
+		"namespace":    "test",
+		"artifactName": "package",
+		"version":      "1.0.0",
+	})
 	w := httptest.NewRecorder()
-
-	// Set URL parameters manually since httptest doesn't use router
-	req = req.WithContext(context.WithValue(req.Context(), "namespace", "test"))
-	req = req.WithContext(req.Context())
-	req = req.WithContext(context.WithValue(req.Context(), "artifactName", "package"))
-	req = req.WithContext(context.WithValue(req.Context(), "version", "1.0.0"))
 
 	pm.GetArtifactInfo(w, req)
 
@@ -346,11 +401,12 @@ func TestGetArtifactInfoNotFound(t *testing.T) {
 	pm := New(db, storage, cache, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/artifact/test/package/1.0.0", nil)
+	req = withChiParams(req, map[string]string{
+		"namespace":    "test",
+		"artifactName": "package",
+		"version":      "1.0.0",
+	})
 	w := httptest.NewRecorder()
-
-	req = req.WithContext(context.WithValue(req.Context(), "namespace", "test"))
-	req = req.WithContext(context.WithValue(req.Context(), "artifactName", "package"))
-	req = req.WithContext(context.WithValue(req.Context(), "version", "1.0.0"))
 
 	pm.GetArtifactInfo(w, req)
 
@@ -371,11 +427,12 @@ func TestGetArtifactInfoDatabaseError(t *testing.T) {
 	pm := New(db, storage, cache, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/artifact/test/package/1.0.0", nil)
+	req = withChiParams(req, map[string]string{
+		"namespace":    "test",
+		"artifactName": "package",
+		"version":      "1.0.0",
+	})
 	w := httptest.NewRecorder()
-
-	req = req.WithContext(context.WithValue(req.Context(), "namespace", "test"))
-	req = req.WithContext(context.WithValue(req.Context(), "artifactName", "package"))
-	req = req.WithContext(context.WithValue(req.Context(), "version", "1.0.0"))
 
 	pm.GetArtifactInfo(w, req)
 
@@ -406,12 +463,13 @@ func TestDownloadArtifactSuccess(t *testing.T) {
 
 	pm := New(db, storage, cache, nil)
 
-	req := httptest.NewRequest(http.MethodGet, "/download/test/package/1.0.0", nil)
+	req := httptest.NewRequest(http.MethodGet, "/download/test/package/1.0.0?registry=npm", nil)
+	req = withChiParams(req, map[string]string{
+		"namespace":    "test",
+		"artifactName": "package",
+		"version":      "1.0.0",
+	})
 	w := httptest.NewRecorder()
-
-	req = req.WithContext(context.WithValue(req.Context(), "namespace", "test"))
-	req = req.WithContext(context.WithValue(req.Context(), "artifactName", "package"))
-	req = req.WithContext(context.WithValue(req.Context(), "version", "1.0.0"))
 
 	pm.DownloadArtifact(w, req)
 
@@ -425,20 +483,29 @@ func TestDownloadArtifactSuccess(t *testing.T) {
 
 // TestDownloadArtifactNotFound tests DownloadArtifact with not found
 func TestDownloadArtifactNotFound(t *testing.T) {
+	artifact := &database.ArtifactMetadata{
+		RegistryID:   "npm",
+		Namespace:    "test",
+		ArtifactName: "package",
+		Version:      "1.0.0",
+		Digest:       "sha256:abc123",
+	}
+
 	db := &MockDatabase{
-		artifacts: []database.ArtifactMetadata{},
+		artifacts: []database.ArtifactMetadata{*artifact},
 	}
 	storage := &MockStorageAdapter{}
 	cache := &MockCache{}
 
 	pm := New(db, storage, cache, nil)
 
-	req := httptest.NewRequest(http.MethodGet, "/download/test/package/1.0.0", nil)
+	req := httptest.NewRequest(http.MethodGet, "/download/test/package/1.0.0?registry=npm", nil)
+	req = withChiParams(req, map[string]string{
+		"namespace":    "test",
+		"artifactName": "package",
+		"version":      "1.0.0",
+	})
 	w := httptest.NewRecorder()
-
-	req = req.WithContext(context.WithValue(req.Context(), "namespace", "test"))
-	req = req.WithContext(context.WithValue(req.Context(), "artifactName", "package"))
-	req = req.WithContext(context.WithValue(req.Context(), "version", "1.0.0"))
 
 	pm.DownloadArtifact(w, req)
 
@@ -467,12 +534,13 @@ func TestDownloadArtifactStorageError(t *testing.T) {
 
 	pm := New(db, storage, cache, nil)
 
-	req := httptest.NewRequest(http.MethodGet, "/download/test/package/1.0.0", nil)
+	req := httptest.NewRequest(http.MethodGet, "/download/test/package/1.0.0?registry=npm", nil)
+	req = withChiParams(req, map[string]string{
+		"namespace":    "test",
+		"artifactName": "package",
+		"version":      "1.0.0",
+	})
 	w := httptest.NewRecorder()
-
-	req = req.WithContext(context.WithValue(req.Context(), "namespace", "test"))
-	req = req.WithContext(context.WithValue(req.Context(), "artifactName", "package"))
-	req = req.WithContext(context.WithValue(req.Context(), "version", "1.0.0"))
 
 	pm.DownloadArtifact(w, req)
 
@@ -607,8 +675,9 @@ func TestProxyManagerNilRegistries(t *testing.T) {
 	err := json.Unmarshal(w.Body.Bytes(), &response)
 	require.NoError(t, err)
 
-	registriesResponse := response["registries"].([]interface{})
-	assert.Empty(t, registriesResponse)
+	// A nil registries slice marshals to JSON null, not [], so it decodes
+	// back as a nil interface{} rather than an empty []interface{}.
+	assert.Empty(t, response["registries"])
 }
 
 // TestSearchArtifactsWithArtifactTypeFilter tests search with artifact type filter

@@ -137,7 +137,7 @@ func (p *ConanProxy) handleRecipeFile(w http.ResponseWriter, r *http.Request) {
 
 	t := proxypkg.TargetFromContext(r, "conan")
 
-	if data, err := p.storage.GetArtifact("conan", namespace, name, key); err == nil && data != nil {
+	if data, err := p.storage.GetArtifact(t.Label, namespace, name, key); err == nil && data != nil {
 		p.serveBlob(w, name, version, fileName, data, func() error {
 			return p.db.IncrementArtifactDownloads(t.Label, namespace, name, version)
 		})
@@ -151,7 +151,7 @@ func (p *ConanProxy) handleRecipeFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := p.storage.SaveArtifact("conan", namespace, name, key, data); err != nil {
+	if _, err := p.storage.SaveArtifact(t.Label, namespace, name, key, data); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to save file: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -191,7 +191,7 @@ func (p *ConanProxy) handlePackageFile(w http.ResponseWriter, r *http.Request) {
 
 	t := proxypkg.TargetFromContext(r, "conan")
 
-	if data, err := p.storage.GetArtifact("conan-pkg", namespace, name, key); err == nil && data != nil {
+	if data, err := p.storage.GetArtifact(t.Label, namespace, name, key); err == nil && data != nil {
 		p.serveBlob(w, name, version, fileName, data, func() error {
 			return p.db.IncrementArtifactDownloads(t.Label, namespace, name, version)
 		})
@@ -205,7 +205,7 @@ func (p *ConanProxy) handlePackageFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := p.storage.SaveArtifact("conan-pkg", namespace, name, key, data); err != nil {
+	if _, err := p.storage.SaveArtifact(t.Label, namespace, name, key, data); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to save file: %v", err), http.StatusInternalServerError)
 		return
 	}

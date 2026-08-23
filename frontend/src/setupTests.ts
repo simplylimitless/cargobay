@@ -3,13 +3,22 @@
 // expect(element).toHaveTextContent(/react/i)
 // learn more: https://github.com/testing-library/jest-dom
 import '@testing-library/jest-dom';
+import { afterEach, vi } from 'vitest';
 
-// Mock localStorage
+// Mock localStorage with a real backing store so values actually persist
+// across get/set calls within a test, matching browser behavior.
+let localStorageStore: Record<string, string> = {};
 const mockLocalStorage = {
-  getItem: jest.fn(),
-  setItem: jest.fn(),
-  removeItem: jest.fn(),
-  clear: jest.fn(),
+  getItem: vi.fn((key: string) => localStorageStore[key] ?? null),
+  setItem: vi.fn((key: string, value: string) => {
+    localStorageStore[key] = String(value);
+  }),
+  removeItem: vi.fn((key: string) => {
+    delete localStorageStore[key];
+  }),
+  clear: vi.fn(() => {
+    localStorageStore = {};
+  }),
 };
 
 Object.defineProperty(window, 'localStorage', {
@@ -24,11 +33,11 @@ Object.defineProperty(window, 'matchMedia', {
     matches: false,
     media: query,
     onchange: null,
-    addListener: jest.fn(),
-    removeListener: jest.fn(),
-    addEventListener: jest.fn(),
-    removeEventListener: jest.fn(),
-    dispatchEvent: jest.fn(),
+    addListener: vi.fn(),
+    removeListener: vi.fn(),
+    addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
+    dispatchEvent: vi.fn(),
   }),
 });
 
@@ -58,9 +67,10 @@ console.error = (...args) => {
 
 // Cleanup after each test
 afterEach(() => {
-  jest.clearAllMocks();
+  vi.clearAllMocks();
+  localStorageStore = {};
   document.body.innerHTML = '';
 });
 
 // Global test timeout
-jest.setTimeout(10000);
+vi.setConfig({ testTimeout: 10000 });

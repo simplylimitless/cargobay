@@ -233,14 +233,14 @@ func (p *NPMProxy) handleTarball(w http.ResponseWriter, r *http.Request) {
 	version := chi.URLParam(r, "version")
 
 	// Try to get from local storage first
-	data, err := p.storage.GetArtifact("npm", "", pkgName, version)
+	data, err := p.storage.GetArtifact(t.Label, "", pkgName, version)
 	if err == nil && data != nil {
 		// Check if upstream has a newer version by comparing digest
-		if updated, err := p.fetchIfUpdated(t.Reg, "npm", "", pkgName, version); err == nil && updated != nil {
+		if updated, err := p.fetchIfUpdated(t.Reg, t.Label, "", pkgName, version); err == nil && updated != nil {
 			// Upstream has a newer version, use the updated data
 			data = updated
 			// Save updated data to storage
-			if _, err := p.storage.SaveArtifact("npm", "", pkgName, version, data); err != nil {
+			if _, err := p.storage.SaveArtifact(t.Label, "", pkgName, version, data); err != nil {
 				// Log but don't fail - we still have the local data
 				fmt.Printf("Failed to save updated artifact: %v\n", err)
 			}
@@ -279,7 +279,7 @@ func (p *NPMProxy) handleTarball(w http.ResponseWriter, r *http.Request) {
 	resp.Body.Read(data)
 
 	// Save to storage
-	if _, err := p.storage.SaveArtifact("npm", "", pkgName, version, data); err != nil {
+	if _, err := p.storage.SaveArtifact(t.Label, "", pkgName, version, data); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to save artifact: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -304,7 +304,7 @@ func (p *NPMProxy) handleScopedTarball(w http.ResponseWriter, r *http.Request) {
 	packageName := fmt.Sprintf("@%s/%s", scope, pkgName)
 
 	// Try cache first
-	if data, err := p.storage.GetArtifact("npm", scope, pkgName, version); err == nil && data != nil {
+	if data, err := p.storage.GetArtifact(t.Label, scope, pkgName, version); err == nil && data != nil {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s-%s.tgz", packageName, version))
 		if err := p.db.IncrementArtifactDownloads(t.Label, scope, pkgName, version); err != nil {
@@ -328,7 +328,7 @@ func (p *NPMProxy) handleScopedTarball(w http.ResponseWriter, r *http.Request) {
 	resp.Body.Read(data)
 
 	// Save to storage
-	if _, err := p.storage.SaveArtifact("npm", scope, pkgName, version, data); err != nil {
+	if _, err := p.storage.SaveArtifact(t.Label, scope, pkgName, version, data); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to save artifact: %v", err), http.StatusInternalServerError)
 		return
 	}

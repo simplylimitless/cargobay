@@ -1,6 +1,6 @@
 import { ReactNode, Context } from 'react'
 import { render as testingLibraryRender } from '@testing-library/react'
-import { MemoryRouter } from 'react-router-dom'
+import { MemoryRouter, Routes, Route, matchPath as routerMatchPath } from 'react-router-dom'
 import { AuthProvider, User, Role } from '../context/AuthContext'
 
 // Custom render function that wraps components with providers
@@ -8,18 +8,40 @@ export function render(
   ui: ReactNode,
   {
     route = '/',
+    routePath = [route],
     history = [route],
     user = null,
     ...renderOptions
   }: {
     route?: string
+    // Route pattern(s) (e.g. '/registries/:registryId') to match `route`
+    // against, so components using useParams() get real values. Defaults to
+    // an exact match on `route` itself for callers that don't need params.
+    routePath?: string | string[]
     history?: string[]
     user?: User | null
-  } & Omit<Parameters<typeof testingLibraryRender>[1], 'wrapper'>
+  } & Omit<Parameters<typeof testingLibraryRender>[1], 'wrapper'> = {}
 ) {
+  const patterns = Array.isArray(routePath) ? routePath : [routePath]
+
+  // AuthProvider reads its initial user from localStorage on mount rather
+  // than accepting a prop, so seed (or clear) that key to control the
+  // authenticated user a test renders with.
+  if (user) {
+    window.localStorage.setItem('cargobay_user', JSON.stringify(user))
+  } else {
+    window.localStorage.removeItem('cargobay_user')
+  }
+
   const Wrapper: React.FC<{ children: ReactNode }> = ({ children }) => (
     <MemoryRouter initialEntries={history}>
-      <AuthProvider user={user}>{children}</AuthProvider>
+      <AuthProvider>
+        <Routes>
+          {patterns.map((pattern) => (
+            <Route key={pattern} path={pattern} element={children} />
+          ))}
+        </Routes>
+      </AuthProvider>
     </MemoryRouter>
   )
 
@@ -40,11 +62,11 @@ export const createMockAuthContext = (overrides?: Partial<ReturnType<typeof useA
   currentUser: createMockUser(),
   token: 'test-token',
   isAdmin: false,
-  login: jest.fn(),
-  logout: jest.fn(),
-  canManage: jest.fn().mockReturnValue(true),
-  updateProfile: jest.fn(),
-  setSession: jest.fn(),
+  login: vi.fn(),
+  logout: vi.fn(),
+  canManage: vi.fn().mockReturnValue(true),
+  updateProfile: vi.fn(),
+  setSession: vi.fn(),
   ...overrides,
 })
 
@@ -78,7 +100,7 @@ export const mockLocalStorage = () => {
 export const mockFetch = (responses: Record<string, { ok: boolean; json: any }>) => {
   const originalFetch = global.fetch
 
-  global.fetch = jest.fn((input: RequestInfo | URL) => {
+  global.fetch = vi.fn((input: RequestInfo | URL) => {
     const url = typeof input === 'string' ? input : (input as Request).url
     const path = url ? new URL(url).pathname + (url.includes('?') ? '?' + new URL(url).searchParams.toString() : '') : ''
 
@@ -111,15 +133,13 @@ export const mockFetch = (responses: Record<string, { ok: boolean; json: any }>)
 
 // Mock useNavigate
 export const createMockNavigate = () => {
-  const mockFn = jest.fn()
+  const mockFn = vi.fn()
   return mockFn
 }
 
 // Mock matchPath for Breadcrumbs
 export const mockMatchPath = (patterns: string[], pathname: string) => {
-  const originalMatchPath = jest.requireActual('react-router-dom').matchPath
-
-  return originalMatchPath(patterns[0], pathname)
+  return routerMatchPath(patterns[0], pathname)
 }
 
 // Wait for state updates

@@ -10,22 +10,35 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/simplylimitless/cargobay/backend/pkg/cache"
 	"github.com/simplylimitless/cargobay/backend/pkg/database"
 	"github.com/simplylimitless/cargobay/backend/pkg/storage"
 	"github.com/go-chi/chi/v5"
 )
 
+// proxyStore is the subset of *database.Database's methods ProxyManager
+// depends on. Narrowed to an interface so tests can substitute a fake.
+type proxyStore interface {
+	SearchArtifacts(query string, opts database.SearchOptions) ([]database.ArtifactMetadata, error)
+	GetArtifactByParams(registryID, namespace, artifactName, version string) (*database.ArtifactMetadata, error)
+}
+
+// proxyCache is the subset of *cache.Cache's methods ProxyManager depends
+// on. Narrowed to an interface so tests can substitute a fake.
+type proxyCache interface {
+	Get(key string, value interface{}) error
+	SetWithTTL(key string, value interface{}, ttl time.Duration) error
+}
+
 // ProxyManager manages all proxy handlers
 type ProxyManager struct {
-	db         *database.Database
+	db         proxyStore
 	storage    storage.StorageAdapter
-	cache      *cache.Cache
+	cache      proxyCache
 	registries []database.RegistryConfig
 }
 
 // New creates a new ProxyManager
-func New(db *database.Database, storage storage.StorageAdapter, cache *cache.Cache, registries []database.RegistryConfig) *ProxyManager {
+func New(db proxyStore, storage storage.StorageAdapter, cache proxyCache, registries []database.RegistryConfig) *ProxyManager {
 	return &ProxyManager{
 		db:         db,
 		storage:    storage,

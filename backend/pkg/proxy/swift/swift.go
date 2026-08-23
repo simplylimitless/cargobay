@@ -107,7 +107,7 @@ func (p *SwiftProxy) handleManifest(w http.ResponseWriter, r *http.Request) {
 	version := chi.URLParam(r, "version")
 	t := proxypkg.TargetFromContext(r, "swift")
 
-	if data, err := p.storage.GetArtifact("swift-manifest", scope, name, version); err == nil && data != nil {
+	if data, err := p.storage.GetArtifact(t.Label, scope, name, version); err == nil && data != nil {
 		w.Header().Set("Content-Type", "text/x-swift")
 		w.Write(data)
 		return
@@ -119,7 +119,7 @@ func (p *SwiftProxy) handleManifest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("Failed to fetch manifest: %v", err), http.StatusBadGateway)
 		return
 	}
-	p.storage.SaveArtifact("swift-manifest", scope, name, version, data)
+	p.storage.SaveArtifact(t.Label, scope, name, version, data)
 
 	w.Header().Set("Content-Type", "text/x-swift")
 	w.Write(data)
@@ -132,7 +132,7 @@ func (p *SwiftProxy) handleSourceArchive(w http.ResponseWriter, r *http.Request)
 	version := chi.URLParam(r, "version")
 	t := proxypkg.TargetFromContext(r, "swift")
 
-	if data, err := p.storage.GetArtifact("swift", scope, name, version); err == nil && data != nil {
+	if data, err := p.storage.GetArtifact(t.Label, scope, name, version); err == nil && data != nil {
 		w.Header().Set("Content-Type", "application/zip")
 		if err := p.db.IncrementArtifactDownloads(t.Label, scope, name, version); err != nil {
 			fmt.Printf("failed to record download for %s.%s@%s: %v\n", scope, name, version, err)
@@ -162,7 +162,7 @@ func (p *SwiftProxy) handleSourceArchive(w http.ResponseWriter, r *http.Request)
 	if err := p.db.SaveArtifact(artifact); err != nil {
 		fmt.Printf("Warning: failed to save release metadata: %v\n", err)
 	}
-	if _, err := p.storage.SaveArtifact("swift", scope, name, version, data); err != nil {
+	if _, err := p.storage.SaveArtifact(t.Label, scope, name, version, data); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to save source archive: %v", err), http.StatusInternalServerError)
 		return
 	}

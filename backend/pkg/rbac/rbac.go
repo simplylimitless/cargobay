@@ -282,35 +282,67 @@ func (r *RBAC) HasPermission(userID, permissionID string) bool {
 	return false
 }
 
-// CanReadRegistry reports whether userID (empty = anonymous) may read/pull
+// HasEffectivePermission is HasPermission plus the request credential's
+// scope: a "read"-scoped personal access token can never satisfy a
+// write/delete/sign/replicate/admin permission, regardless of what the
+// underlying user's roles would otherwise allow. Use this (not
+// HasPermission) for any authorization decision keyed off an
+// *middleware.User taken from a request — HasPermission itself stays
+// scope-unaware for non-request callers (the CLI, role management, etc.)
+// that have no credential scope to consult.
+func (r *RBAC) HasEffectivePermission(user *middleware.User, permissionID string) bool {
+	if user == nil {
+		return false
+	}
+	if user.Scope == "read" && !isReadPermission(permissionID) {
+		return false
+	}
+	return r.HasPermission(user.UserID, permissionID)
+}
+
+// isReadPermission reports whether a static permission ID represents a
+// read-only action ("read" or "search"). Permissions not found in the
+// static table (e.g. permissions on custom roles) are treated as
+// non-read, the conservative default for scope enforcement.
+func isReadPermission(permissionID string) bool {
+	perm, ok := staticPermissions[permissionID]
+	if !ok {
+		return false
+	}
+	return perm.Action == "read" || perm.Action == "search"
+}
+
+// CanReadRegistry reports whether user (nil = anonymous) may read/pull
 // from reg. Public registries are open to everyone, including anonymous
 // callers; private registries require an explicit grant (or the
 // registry:write admin bypass).
-func (r *RBAC) CanReadRegistry(userID string, reg *database.RegistryConfig) bool {
+func (r *RBAC) CanReadRegistry(user *middleware.User, reg *database.RegistryConfig) bool {
 	if reg == nil || !reg.Private {
 		return true
 	}
-	if userID == "" {
+	if user == nil {
 		return false
 	}
-	if r.HasPermission(userID, "registry:write") {
+	if r.HasEffectivePermission(user, "registry:write") {
 		return true
 	}
-	access, err := r.db.GetRegistryAccess(reg.ID, userID)
+	access, err := r.db.GetRegistryAccess(reg.ID, user.UserID)
 	return err == nil && access != nil && access.CanRead
 }
 
-// CanPublishRegistry reports whether userID may push to reg. Publishing to
-// a public/upstream registry is never allowed — only private registries
-// accept pushes, and only from explicitly granted users (or admins).
-func (r *RBAC) CanPublishRegistry(userID string, reg *database.RegistryConfig) bool {
-	if reg == nil || userID == "" || !reg.Private {
+// CanPublishRegistry reports whether user may push to reg. Publishing to a
+// public/upstream registry is never allowed — only private registries
+// accept pushes, and only from explicitly granted users (or admins). A
+// read-scoped personal access token can never publish, regardless of the
+// underlying user's roles.
+func (r *RBAC) CanPublishRegistry(user *middleware.User, reg *database.RegistryConfig) bool {
+	if reg == nil || user == nil || !reg.Private || user.Scope == "read" {
 		return false
 	}
-	if r.HasPermission(userID, "registry:write") {
+	if r.HasPermission(user.UserID, "registry:write") {
 		return true
 	}
-	access, err := r.db.GetRegistryAccess(reg.ID, userID)
+	access, err := r.db.GetRegistryAccess(reg.ID, user.UserID)
 	return err == nil && access != nil && access.CanPublish
 }
 
@@ -343,7 +375,7 @@ func (r *RBAC) RequirePermission(permissionID string) func(http.Handler) http.Ha
 				return
 			}
 
-			if !r.HasPermission(user.UserID, permissionID) {
+			if !r.HasEffectivePermission(user, permissionID) {
 				http.Error(w, "Insufficient permissions", http.StatusForbidden)
 				return
 			}

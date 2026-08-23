@@ -126,11 +126,10 @@ func TestVerifyPasswordLongPassword(t *testing.T) {
 		longPassword += longPassword
 	}
 
-	hash, err := HashPassword(longPassword)
-	require.NoError(t, err)
-
-	result := VerifyPassword(hash, longPassword)
-	assert.True(t, result)
+	// bcrypt hard-caps input at 72 bytes; HashPassword doesn't pre-hash or
+	// truncate, so anything longer is expected to error, not succeed.
+	_, err := HashPassword(longPassword)
+	assert.Error(t, err)
 }
 
 // TestHashPasswordCost tests bcrypt cost factor

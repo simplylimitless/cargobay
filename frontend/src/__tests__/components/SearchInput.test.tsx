@@ -1,13 +1,20 @@
-import { render, screen, waitFor, fireEvent } from '@testing-library/react'
+import { screen, waitFor, fireEvent } from '@testing-library/react'
 import { SearchInput } from '../../components/SearchInput'
-import { createMockNavigate } from '../test-utils'
+import { render } from '../test-utils'
+
+const { mockNavigate } = vi.hoisted(() => ({ mockNavigate: vi.fn() }))
+
+vi.mock('react-router-dom', async () => ({
+  ...(await vi.importActual('react-router-dom')),
+  useNavigate: () => mockNavigate,
+}))
 
 describe('SearchInput', () => {
-  const mockNavigate = createMockNavigate()
-
   beforeEach(() => {
+    mockNavigate.mockClear()
+
     // Mock window.fetch
-    global.fetch = jest.fn(() =>
+    global.fetch = vi.fn(() =>
       Promise.resolve({
         ok: true,
         json: () => Promise.resolve({ suggestions: ['nginx', 'nginx:latest', 'nginx:alpine'] }),
@@ -16,7 +23,7 @@ describe('SearchInput', () => {
   })
 
   afterEach(() => {
-    jest.resetAllMocks()
+    vi.clearAllMocks()
   })
 
   test('renders search input correctly', () => {
@@ -49,8 +56,9 @@ describe('SearchInput', () => {
     await new Promise((resolve) => setTimeout(resolve, 250))
 
     const suggestions = await screen.findAllByRole('button', { hidden: true })
-    expect(suggestions).toHaveLength(3)
-    expect(suggestions[0]).toHaveTextContent('nginx')
+    // First button is the submit icon; the rest are suggestions
+    expect(suggestions).toHaveLength(4)
+    expect(suggestions[1]).toHaveTextContent('nginx')
   })
 
   test('clears suggestions when input is empty', async () => {
@@ -76,12 +84,6 @@ describe('SearchInput', () => {
   })
 
   test('navigates on form submit with query', async () => {
-    const mockNavigate = jest.fn()
-    jest.mock('react-router-dom', () => ({
-      ...jest.requireActual('react-router-dom'),
-      useNavigate: () => mockNavigate,
-    }))
-
     render(<SearchInput />)
 
     const input = screen.getByPlaceholderText(/Search artifacts, packages, images/i)
@@ -91,8 +93,7 @@ describe('SearchInput', () => {
       expect(global.fetch).toHaveBeenCalled()
     })
 
-    const form = screen.getByRole('form')
-    fireEvent.submit(form)
+    fireEvent.submit(input.closest('form')!)
 
     expect(mockNavigate).toHaveBeenCalledWith('/search?q=test-query')
   })
@@ -105,8 +106,7 @@ describe('SearchInput', () => {
 
     await waitFor(() => {
       expect(global.fetch).toHaveBeenCalledWith(
-        expect.stringContaining('/api/v1/search/autocomplete'),
-        expect.anything()
+        expect.stringContaining('/api/v1/search/autocomplete')
       )
     })
   })
@@ -123,7 +123,7 @@ describe('SearchInput', () => {
     await new Promise((resolve) => setTimeout(resolve, 250))
 
     // Get suggestion buttons
-    const suggestionButtons = await screen.findAllByRole('button', { hidden: true })
+    await screen.findAllByRole('button', { hidden: true })
 
     // Test ArrowDown - should select first item
     fireEvent.keyDown(input, { key: 'ArrowDown' })
@@ -162,7 +162,7 @@ describe('SearchInput', () => {
     render(<SearchInput />)
 
     const input = screen.getByPlaceholderText(/Search artifacts, packages, images/i)
-    const fetchSpy = jest.spyOn(global, 'fetch')
+    const fetchSpy = vi.spyOn(global, 'fetch')
 
     // Rapid typing
     fireEvent.change(input, { target: { value: 't' } })
@@ -175,13 +175,12 @@ describe('SearchInput', () => {
     // Should only have one fetch call (debounced)
     expect(fetchSpy).toHaveBeenCalledTimes(1)
     expect(fetchSpy).toHaveBeenCalledWith(
-      expect.stringContaining('test'),
-      expect.anything()
+      expect.stringContaining('test')
     )
   })
 
   test('handles fetch error gracefully', async () => {
-    global.fetch = jest.fn(() => Promise.resolve({ ok: false } as Response))
+    global.fetch = vi.fn(() => Promise.resolve({ ok: false } as Response))
 
     render(<SearchInput />)
 

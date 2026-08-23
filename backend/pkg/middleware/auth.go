@@ -24,6 +24,13 @@ type User struct {
 	Email       string
 	Roles       []string
 	Permissions []string
+	// Scope is "full" for password-authenticated and session-token requests,
+	// or "read" when the request authenticated with a read-only personal
+	// access token. RBAC checks that key off the request (see
+	// rbac.HasEffectivePermission) use this to deny write/delete/admin
+	// permissions even if the underlying user's roles would otherwise allow
+	// them.
+	Scope string
 }
 
 // RoleAndPermissionLookup provides a user's roles and their expanded
@@ -51,7 +58,7 @@ type authStore interface {
 // routes that require a user should be wrapped in RequireAuth or
 // rbac.RequirePermission.
 func NewAuthMiddleware(db authStore, roles RoleAndPermissionLookup) func(http.Handler) http.Handler {
-	loadUser := func(dbUser *database.UserRepository) *User {
+	loadUser := func(dbUser *database.UserRepository, scope string) *User {
 		userRoles, _ := roles.GetUserRoles(dbUser.UserID)
 		return &User{
 			UserID:      dbUser.UserID,
@@ -59,6 +66,7 @@ func NewAuthMiddleware(db authStore, roles RoleAndPermissionLookup) func(http.Ha
 			Email:       dbUser.Email,
 			Roles:       userRoles,
 			Permissions: roles.GetUserRolePermissions(dbUser.UserID),
+			Scope:       scope,
 		}
 	}
 
@@ -82,11 +90,26 @@ func NewAuthMiddleware(db authStore, roles RoleAndPermissionLookup) func(http.Ha
 					return
 				}
 				dbUser, err := db.GetUserByUsername(username)
-				if err != nil || dbUser == nil || !dbUser.IsActive || !auth.VerifyPassword(dbUser.PasswordHash, password) {
+				if err != nil || dbUser == nil || !dbUser.IsActive {
 					next.ServeHTTP(w, r)
 					return
 				}
-				ctx := context.WithValue(r.Context(), AuthUserKey, loadUser(dbUser))
+
+				scope := "full"
+				if !auth.VerifyPassword(dbUser.PasswordHash, password) {
+					// Not the account password — check whether it's a
+					// personal access token belonging to this same user
+					// (the docker login/k3s imagePullSecret convention:
+					// real username + PAT as the password).
+					key, err := db.ValidateAccessKey(auth.HashToken(password))
+					if err != nil || key == nil || key.UserID != dbUser.UserID {
+						next.ServeHTTP(w, r)
+						return
+					}
+					scope = accessKeyScope(key)
+				}
+
+				ctx := context.WithValue(r.Context(), AuthUserKey, loadUser(dbUser, scope))
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return
 			}
@@ -98,10 +121,15 @@ func NewAuthMiddleware(db authStore, roles RoleAndPermissionLookup) func(http.Ha
 				return
 			}
 
-			key, err := db.ValidateAccessKey(token)
+			key, err := db.ValidateAccessKey(auth.HashToken(token))
 			if err != nil || key == nil {
-				next.ServeHTTP(w, r)
-				return
+				// Fall back to the legacy unhashed lookup for login-session
+				// tokens, which are still stored as their raw value.
+				key, err = db.ValidateAccessKey(token)
+				if err != nil || key == nil {
+					next.ServeHTTP(w, r)
+					return
+				}
 			}
 
 			dbUser, err := db.GetUserByID(key.UserID)
@@ -110,10 +138,23 @@ func NewAuthMiddleware(db authStore, roles RoleAndPermissionLookup) func(http.Ha
 				return
 			}
 
-			ctx := context.WithValue(r.Context(), AuthUserKey, loadUser(dbUser))
+			ctx := context.WithValue(r.Context(), AuthUserKey, loadUser(dbUser, accessKeyScope(key)))
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
+}
+
+// accessKeyScope derives a request scope from an access key's stored
+// permissions: any key carrying "write" (login sessions, and PATs created
+// with read-write scope) is "full"; a key that only carries "read" is
+// scoped down to "read".
+func accessKeyScope(key *database.AccessKey) string {
+	for _, p := range key.Permissions {
+		if p == "write" {
+			return "full"
+		}
+	}
+	return "read"
 }
 
 // GetUser retrieves the user from request context

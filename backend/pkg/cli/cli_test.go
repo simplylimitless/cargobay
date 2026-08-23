@@ -3,8 +3,21 @@ package cli
 import (
 	"testing"
 
+	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+// assertExactArgs checks that cmd's Args validator behaves like
+// cobra.ExactArgs(n): it accepts exactly n positional args and rejects any
+// other count. cmd.Args is a func type, so it can't be compared to n
+// directly with assert.Equal.
+func assertExactArgs(t *testing.T, cmd *cobra.Command, n int) {
+	t.Helper()
+	require.NotNil(t, cmd.Args)
+	require.NoError(t, cmd.Args(cmd, make([]string, n)))
+	require.Error(t, cmd.Args(cmd, make([]string, n+1)))
+}
 
 // TestRootCommandNew tests creating a new RootCommand
 func TestRootCommandNew(t *testing.T) {
@@ -399,11 +412,11 @@ func TestReplicationCommandHasSync(t *testing.T) {
 
 // TestCLIExecuteMethod tests Execute method signature
 func TestCLIExecuteMethod(t *testing.T) {
-	rc := &RootCommand{}
-	// Just verify the method exists and can be called
+	rc := NewRootCommand(nil, nil)
+	// With no subcommand specified, cobra prints help and returns nil
+	// (there's no Run func on the root command), not an error.
 	err := rc.Execute()
-	// Should return an error since no command was specified
-	assert.Error(t, err)
+	assert.NoError(t, err)
 }
 
 // TestCLINewMethod tests New method
@@ -414,7 +427,7 @@ func TestCLINewMethod(t *testing.T) {
 
 // TestCLIHasCommands tests that CLI has commands
 func TestCLIHasCommands(t *testing.T) {
-	rc := New()
+	rc := NewRootCommand(nil, nil)
 	assert.NotNil(t, rc.cmd)
 }
 
@@ -425,15 +438,15 @@ func TestArtifactCommandArgs(t *testing.T) {
 
 	// Test get command requires exactly 1 arg
 	getCmd := cmd.Commands()[1] // get <artifact-id>
-	assert.Equal(t, 1, getCmd.Args)
+	assertExactArgs(t, getCmd, 1)
 
 	// Test delete command requires exactly 1 arg
-	deleteCmd := cmd.Commands()[2] // delete <artifact-id>
-	assert.Equal(t, 1, deleteCmd.Args)
+	deleteCmd := cmd.Commands()[0] // delete <artifact-id>
+	assertExactArgs(t, deleteCmd, 1)
 
 	// Test scan command requires exactly 1 arg
 	scanCmd := cmd.Commands()[3] // scan <artifact-id>
-	assert.Equal(t, 1, scanCmd.Args)
+	assertExactArgs(t, scanCmd, 1)
 }
 
 // TestUserCommandArgs tests user command args validation
@@ -443,11 +456,11 @@ func TestUserCommandArgs(t *testing.T) {
 
 	// Test delete command requires exactly 1 arg
 	deleteCmd := cmd.Commands()[2] // delete <username>
-	assert.Equal(t, 1, deleteCmd.Args)
+	assertExactArgs(t, deleteCmd, 1)
 
 	// Test assign-role command requires exactly 2 args
-	assignRoleCmd := cmd.Commands()[3] // assign-role <username> <role>
-	assert.Equal(t, 2, assignRoleCmd.Args)
+	assignRoleCmd := cmd.Commands()[0] // assign-role <username> <role>
+	assertExactArgs(t, assignRoleCmd, 2)
 }
 
 // TestRoleCommandArgs tests role command args validation
@@ -456,16 +469,16 @@ func TestRoleCommandArgs(t *testing.T) {
 	cmd := rc.newRoleCommand()
 
 	// Test create command requires exactly 1 arg
-	createCmd := cmd.Commands()[1] // create <name>
-	assert.Equal(t, 1, createCmd.Args)
+	createCmd := cmd.Commands()[0] // create <name>
+	assertExactArgs(t, createCmd, 1)
 
 	// Test delete command requires exactly 1 arg
-	deleteCmd := cmd.Commands()[2] // delete <role>
-	assert.Equal(t, 1, deleteCmd.Args)
+	deleteCmd := cmd.Commands()[1] // delete <role>
+	assertExactArgs(t, deleteCmd, 1)
 
 	// Test grant command requires exactly 2 args
-	grantCmd := cmd.Commands()[3] // grant <role> <permission>
-	assert.Equal(t, 2, grantCmd.Args)
+	grantCmd := cmd.Commands()[2] // grant <role> <permission>
+	assertExactArgs(t, grantCmd, 2)
 }
 
 // TestRegistryCommandArgs tests registry command args validation
@@ -475,7 +488,7 @@ func TestRegistryCommandArgs(t *testing.T) {
 
 	// Test remove command requires exactly 1 arg
 	removeCmd := cmd.Commands()[2] // remove <registry-id>
-	assert.Equal(t, 1, removeCmd.Args)
+	assertExactArgs(t, removeCmd, 1)
 }
 
 // TestScanCommandArgs tests scan command args validation
@@ -484,12 +497,12 @@ func TestScanCommandArgs(t *testing.T) {
 	cmd := rc.newScanCommand()
 
 	// Test artifact command requires exactly 1 arg
-	artifactCmd := cmd.Commands()[0] // artifact <artifact-id>
-	assert.Equal(t, 1, artifactCmd.Args)
+	artifactCmd := cmd.Commands()[1] // artifact <artifact-id>
+	assertExactArgs(t, artifactCmd, 1)
 
 	// Test results command requires exactly 1 arg
 	resultsCmd := cmd.Commands()[2] // results <artifact-id>
-	assert.Equal(t, 1, resultsCmd.Args)
+	assertExactArgs(t, resultsCmd, 1)
 }
 
 // TestCLICommandsCount tests that CLI has correct number of commands
@@ -520,7 +533,7 @@ func TestCLICommandsCount(t *testing.T) {
 
 // TestRootCommandUse tests root command use
 func TestRootCommandUse(t *testing.T) {
-	cmd := New()
+	cmd := NewRootCommand(nil, nil)
 	assert.NotNil(t, cmd.cmd)
 	// The Use field should be set in NewRootCommand
 }

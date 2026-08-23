@@ -1,6 +1,6 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { screen, waitFor } from '@testing-library/react'
 import { Breadcrumbs } from '../../components/Breadcrumbs'
-import { createMockNavigate } from '../test-utils'
+import { render } from '../test-utils'
 
 describe('Breadcrumbs', () => {
   const registryId = 'registry-1'
@@ -11,7 +11,7 @@ describe('Breadcrumbs', () => {
 
   beforeEach(() => {
     // Mock window.fetch for registries API
-    global.fetch = jest.fn(() =>
+    global.fetch = vi.fn(() =>
       Promise.resolve({
         ok: true,
         json: () =>
@@ -28,7 +28,7 @@ describe('Breadcrumbs', () => {
   })
 
   afterEach(() => {
-    jest.resetAllMocks()
+    vi.resetAllMocks()
   })
 
   test('returns null when not on registry route', () => {
@@ -78,7 +78,9 @@ describe('Breadcrumbs', () => {
   })
 
   test('renders breadcrumbs for namespace page', async () => {
-    const route = `/registries/${registryId}/${artifactType}/${namespace}`
+    // Use a non-docker artifact type so the "library" namespace isn't
+    // collapsed out of the trail (that behavior is covered separately below).
+    const route = `/registries/${registryId}/npm/${namespace}`
     render(
       <Breadcrumbs />,
       {
@@ -134,7 +136,10 @@ describe('Breadcrumbs', () => {
     render(
       <Breadcrumbs />,
       {
+        // The default exact-match route pattern chokes on the percent-encoded
+        // segment here (a react-router matching quirk), so use a wildcard.
         route,
+        routePath: '*',
         history: [route],
       }
     )
@@ -179,7 +184,7 @@ describe('Breadcrumbs', () => {
 
   test('uses registry ID when name is not available', async () => {
     // Mock fetch returning no registries
-    global.fetch = jest.fn(() =>
+    global.fetch = vi.fn(() =>
       Promise.resolve({
         ok: true,
         json: () => Promise.resolve({ registries: [] }),
@@ -201,6 +206,10 @@ describe('Breadcrumbs', () => {
   })
 
   test('handles missing registry ID gracefully', async () => {
+    // With no registryId segment, this URL is structurally indistinguishable
+    // from a valid /registries/:registryId/:artifactType route, so it's
+    // matched as registryId="docker", artifactType="namespace" rather than
+    // being rejected outright.
     const route = `/registries/${artifactType}/namespace`
     render(
       <Breadcrumbs />,
@@ -211,7 +220,7 @@ describe('Breadcrumbs', () => {
     )
 
     await waitFor(() => {
-      expect(screen.getByText('Docker')).toBeInTheDocument()
+      expect(screen.getByText('Namespace')).toBeInTheDocument()
     })
   })
 

@@ -177,7 +177,7 @@ func (p *PyPIProxy) handlePackageFile(w http.ResponseWriter, r *http.Request) {
 	t := proxypkg.TargetFromContext(r, "pypi")
 
 	// Try to get from storage first
-	data, err := p.storage.GetArtifact("pypi", "", packageName, version)
+	data, err := p.storage.GetArtifact(t.Label, "", packageName, version)
 	if err == nil && data != nil {
 		// Determine content type based on file extension
 		contentType := "application/octet-stream"
@@ -206,7 +206,7 @@ func (p *PyPIProxy) handlePackageFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Save to storage
-	if _, err = p.storage.SaveArtifact("pypi", "", packageName, version, data); err != nil {
+	if _, err = p.storage.SaveArtifact(t.Label, "", packageName, version, data); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to save artifact: %v", err), http.StatusInternalServerError)
 		return
 	}

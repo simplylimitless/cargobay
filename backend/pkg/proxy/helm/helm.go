@@ -246,7 +246,7 @@ func (h *HelmProxy) handleChartDownload(w http.ResponseWriter, r *http.Request) 
 	t := proxypkg.TargetFromContext(r, "helm")
 
 	// Try to get from storage first
-	data, err := h.storage.GetArtifact("helm", "", chartName, version)
+	data, err := h.storage.GetArtifact(t.Label, "", chartName, version)
 	if err == nil && data != nil {
 		w.Header().Set("Content-Type", "application/x-gzip")
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", fileName))
@@ -265,7 +265,7 @@ func (h *HelmProxy) handleChartDownload(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Save to storage
-	if _, err = h.storage.SaveArtifact("helm", "", chartName, version, data); err != nil {
+	if _, err = h.storage.SaveArtifact(t.Label, "", chartName, version, data); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to save chart: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -288,7 +288,7 @@ func (h *HelmProxy) handleChartDownloadAlt(w http.ResponseWriter, r *http.Reques
 	t := proxypkg.TargetFromContext(r, "helm")
 
 	// Try to get from storage first
-	data, err := h.storage.GetArtifact("helm", "", chartName, version)
+	data, err := h.storage.GetArtifact(t.Label, "", chartName, version)
 	if err == nil && data != nil {
 		w.Header().Set("Content-Type", "application/x-gzip")
 		if err := h.db.IncrementArtifactDownloads(t.Label, "", chartName, version); err != nil {
@@ -307,7 +307,7 @@ func (h *HelmProxy) handleChartDownloadAlt(w http.ResponseWriter, r *http.Reques
 	}
 
 	// Save to storage
-	if _, err = h.storage.SaveArtifact("helm", "", chartName, version, data); err != nil {
+	if _, err = h.storage.SaveArtifact(t.Label, "", chartName, version, data); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to save chart: %v", err), http.StatusInternalServerError)
 		return
 	}

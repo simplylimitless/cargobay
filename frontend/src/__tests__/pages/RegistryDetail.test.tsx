@@ -1,5 +1,15 @@
-import { render, screen, waitFor, fireEvent } from '@testing-library/react'
+import { screen, waitFor, fireEvent } from '@testing-library/react'
 import { RegistryDetail } from '../../pages/RegistryDetail'
+import { render } from '../test-utils'
+
+const ROUTE_PATH = '/registries/:registryId'
+
+const { mockNavigate } = vi.hoisted(() => ({ mockNavigate: vi.fn() }))
+
+vi.mock('react-router-dom', async () => ({
+  ...(await vi.importActual('react-router-dom')),
+  useNavigate: () => mockNavigate,
+}))
 
 describe('RegistryDetail', () => {
   const registryId = 'registry-1'
@@ -15,8 +25,10 @@ describe('RegistryDetail', () => {
   }
 
   beforeEach(() => {
+    mockNavigate.mockClear()
+
     // Mock fetch
-    global.fetch = jest.fn(() =>
+    global.fetch = vi.fn(() =>
       Promise.resolve({
         ok: true,
         json: () => Promise.resolve(mockRegistry),
@@ -25,7 +37,7 @@ describe('RegistryDetail', () => {
   })
 
   afterEach(() => {
-    jest.resetAllMocks()
+    vi.clearAllMocks()
   })
 
   test('renders loading state', () => {
@@ -39,6 +51,7 @@ describe('RegistryDetail', () => {
       <RegistryDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -54,6 +67,7 @@ describe('RegistryDetail', () => {
       <RegistryDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -69,6 +83,7 @@ describe('RegistryDetail', () => {
       <RegistryDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -84,6 +99,7 @@ describe('RegistryDetail', () => {
       <RegistryDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -99,7 +115,7 @@ describe('RegistryDetail', () => {
       enabled: false,
     }
 
-    global.fetch = jest.fn(() =>
+    global.fetch = vi.fn(() =>
       Promise.resolve({
         ok: true,
         json: () => Promise.resolve(disabledRegistry),
@@ -111,6 +127,7 @@ describe('RegistryDetail', () => {
       <RegistryDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -126,7 +143,7 @@ describe('RegistryDetail', () => {
       private: true,
     }
 
-    global.fetch = jest.fn(() =>
+    global.fetch = vi.fn(() =>
       Promise.resolve({
         ok: true,
         json: () => Promise.resolve(privateRegistry),
@@ -138,6 +155,7 @@ describe('RegistryDetail', () => {
       <RegistryDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -153,6 +171,7 @@ describe('RegistryDetail', () => {
       <RegistryDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -168,6 +187,7 @@ describe('RegistryDetail', () => {
       <RegistryDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -183,6 +203,7 @@ describe('RegistryDetail', () => {
       <RegistryDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -198,6 +219,7 @@ describe('RegistryDetail', () => {
       <RegistryDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -217,7 +239,7 @@ describe('RegistryDetail', () => {
       type: 'npm',
     }
 
-    global.fetch = jest.fn(() =>
+    global.fetch = vi.fn(() =>
       Promise.resolve({
         ok: true,
         json: () => Promise.resolve(npmRegistry),
@@ -229,6 +251,7 @@ describe('RegistryDetail', () => {
       <RegistryDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -245,7 +268,7 @@ describe('RegistryDetail', () => {
       type: 'maven',
     }
 
-    global.fetch = jest.fn(() =>
+    global.fetch = vi.fn(() =>
       Promise.resolve({
         ok: true,
         json: () => Promise.resolve(mavenRegistry),
@@ -257,6 +280,7 @@ describe('RegistryDetail', () => {
       <RegistryDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -273,7 +297,7 @@ describe('RegistryDetail', () => {
       type: 'pypi',
     }
 
-    global.fetch = jest.fn(() =>
+    global.fetch = vi.fn(() =>
       Promise.resolve({
         ok: true,
         json: () => Promise.resolve(pypiRegistry),
@@ -285,6 +309,7 @@ describe('RegistryDetail', () => {
       <RegistryDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -301,7 +326,7 @@ describe('RegistryDetail', () => {
       type: 'nuget',
     }
 
-    global.fetch = jest.fn(() =>
+    global.fetch = vi.fn(() =>
       Promise.resolve({
         ok: true,
         json: () => Promise.resolve(nugetRegistry),
@@ -313,6 +338,7 @@ describe('RegistryDetail', () => {
       <RegistryDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -324,24 +350,12 @@ describe('RegistryDetail', () => {
   })
 
   test('navigates to artifact type on click', async () => {
-    const mockNavigate = jest.fn()
-
-    jest.mock('react-router-dom', () => {
-      const actual = jest.requireActual('react-router-dom')
-      return {
-        ...actual,
-        useNavigate: () => mockNavigate,
-        useParams: () => ({
-          registryId,
-        }),
-      }
-    })
-
     const route = `/registries/${registryId}`
     render(
       <RegistryDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -358,7 +372,7 @@ describe('RegistryDetail', () => {
   })
 
   test('displays 404 for unknown registry', async () => {
-    global.fetch = jest.fn(() =>
+    global.fetch = vi.fn(() =>
       Promise.resolve({
         ok: false,
         status: 404,
@@ -371,6 +385,7 @@ describe('RegistryDetail', () => {
       <RegistryDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -381,7 +396,7 @@ describe('RegistryDetail', () => {
   })
 
   test('handles server error', async () => {
-    global.fetch = jest.fn(() =>
+    global.fetch = vi.fn(() =>
       Promise.resolve({
         ok: false,
         status: 500,
@@ -394,6 +409,7 @@ describe('RegistryDetail', () => {
       <RegistryDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -410,6 +426,7 @@ describe('RegistryDetail', () => {
       <RegistryDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
@@ -425,12 +442,13 @@ describe('RegistryDetail', () => {
       <RegistryDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )
 
     await waitFor(() => {
-      expect(screen.getByText('Explore')).toBeInTheDocument()
+      expect(screen.getAllByText('Explore').length).toBeGreaterThan(0)
     })
   })
 
@@ -447,6 +465,7 @@ describe('RegistryDetail', () => {
       <RegistryDetail />,
       {
         route,
+        routePath: ROUTE_PATH,
         history: [route],
       }
     )

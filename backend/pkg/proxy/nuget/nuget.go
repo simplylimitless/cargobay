@@ -244,7 +244,7 @@ func (n *NuGetProxy) handleDownload(w http.ResponseWriter, r *http.Request) {
 	t := proxypkg.TargetFromContext(r, "nuget")
 
 	// Try to get from storage first
-	data, err := n.storage.GetArtifact("nuget", "", packageId, version)
+	data, err := n.storage.GetArtifact(t.Label, "", packageId, version)
 	if err == nil && data != nil {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", fileName))
@@ -264,7 +264,7 @@ func (n *NuGetProxy) handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Save to storage
-	if _, err = n.storage.SaveArtifact("nuget", "", packageId, version, data); err != nil {
+	if _, err = n.storage.SaveArtifact(t.Label, "", packageId, version, data); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to save artifact: %v", err), http.StatusInternalServerError)
 		return
 	}

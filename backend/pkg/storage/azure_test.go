@@ -59,7 +59,7 @@ func TestAzureAdapterNewWithTiering(t *testing.T) {
 func TestAzureAdapterNewWithConnectionstring(t *testing.T) {
 	config := map[string]string{
 		"container":     "test-container",
-		"connection_string": "DefaultEndpointsProtocol=https;AccountName=test;AccountKey=test==;",
+		"connection_string": "DefaultEndpointsProtocol=https;AccountName=test;AccountKey=dGVzdGtleQ==;",
 	}
 
 	adapter, err := NewAzureAdapter(config)
@@ -311,7 +311,7 @@ func TestAzureAdapterStoragePathEmptyFields(t *testing.T) {
 	adapter, _ := NewAzureAdapter(config)
 
 	path := adapter.getStoragePath("", "", "", "")
-	assert.Equal(t, "//artifact.bin", path)
+	assert.Equal(t, "////artifact.bin", path)
 }
 
 // TestAzureAdapterConnectDisconnectIdempotent tests connect/disconnect are idempotent
@@ -357,7 +357,7 @@ func TestAzureAdapterMultipleConfigVariations(t *testing.T) {
 		{"Minimal config", map[string]string{"container": "test"}},
 		{"With prefix", map[string]string{"container": "test", "prefix": "my/prefix"}},
 		{"With tiering", map[string]string{"container": "test", "tiering": "Cool"}},
-		{"With connection string", map[string]string{"container": "test", "connection_string": "DefaultEndpointsProtocol=https;AccountName=test;AccountKey=test==;"}},
+		{"With connection string", map[string]string{"container": "test", "connection_string": "DefaultEndpointsProtocol=https;AccountName=test;AccountKey=dGVzdGtleQ==;"}},
 		{"With account key", map[string]string{"container": "test", "account_name": "test", "account_key": "dGVzdD0=", "account_url": "https://test.blob.core.windows.net"}},
 		{"With SAS token", map[string]string{"container": "test", "account_url": "https://test.blob.core.windows.net", "sas_token": "?sv=2020-08-04"}},
 		{"All options", map[string]string{

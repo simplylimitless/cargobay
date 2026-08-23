@@ -62,7 +62,7 @@ type Backup struct {
 // backup_settings row specifies a dedicated storage type (configured from
 // Settings), in which case resolveStorage builds an independent adapter
 // for that instead.
-func New(db *database.Database, defaultStorage storage.StorageAdapter) *Backup {
+func New(db backupStore, defaultStorage storage.StorageAdapter) *Backup {
 	return &Backup{db: db, defaultStorage: defaultStorage}
 }
 

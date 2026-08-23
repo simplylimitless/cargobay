@@ -127,7 +127,7 @@ func (p *PubProxy) handleArchive(w http.ResponseWriter, r *http.Request) {
 	version := chi.URLParam(r, "version")
 	t := proxypkg.TargetFromContext(r, "dart")
 
-	if data, err := p.storage.GetArtifact("dart", "", name, version); err == nil && data != nil {
+	if data, err := p.storage.GetArtifact(t.Label, "", name, version); err == nil && data != nil {
 		w.Header().Set("Content-Type", "application/gzip")
 		if err := p.db.IncrementArtifactDownloads(t.Label, "", name, version); err != nil {
 			fmt.Printf("failed to record download for %s@%s: %v\n", name, version, err)
@@ -156,7 +156,7 @@ func (p *PubProxy) handleArchive(w http.ResponseWriter, r *http.Request) {
 	if err := p.db.SaveArtifact(artifact); err != nil {
 		fmt.Printf("Warning: failed to save package metadata: %v\n", err)
 	}
-	if _, err := p.storage.SaveArtifact("dart", "", name, version, data); err != nil {
+	if _, err := p.storage.SaveArtifact(t.Label, "", name, version, data); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to save archive: %v", err), http.StatusInternalServerError)
 		return
 	}

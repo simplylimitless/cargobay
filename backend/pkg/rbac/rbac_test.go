@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/simplylimitless/cargobay/backend/pkg/database"
+	"github.com/simplylimitless/cargobay/backend/pkg/middleware"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -267,4 +268,84 @@ func TestRBACRolePermissionCount(t *testing.T) {
 	viewer := rbac.GetRole("viewer")
 	assert.GreaterOrEqual(t, len(viewer.Permissions), 1)
 	assert.LessOrEqual(t, len(viewer.Permissions), 4)
+}
+
+// TestHasEffectivePermissionNilUser tests that a nil user is always denied.
+func TestHasEffectivePermissionNilUser(t *testing.T) {
+	rbac := newTestRBAC()
+	assert.False(t, rbac.HasEffectivePermission(nil, "artifact:read"))
+}
+
+// TestHasEffectivePermissionReadScopeDeniesWrite tests that a read-scoped
+// credential (a read-only PAT) can never satisfy a write/delete/admin
+// permission, regardless of the underlying user's roles — this check
+// short-circuits before ever touching the database, so it's safe to run
+// against an unconnected RBAC.
+func TestHasEffectivePermissionReadScopeDeniesWrite(t *testing.T) {
+	rbac := newTestRBAC()
+	user := &middleware.User{UserID: "user-1", Scope: "read"}
+
+	assert.False(t, rbac.HasEffectivePermission(user, "artifact:write"))
+	assert.False(t, rbac.HasEffectivePermission(user, "artifact:delete"))
+	assert.False(t, rbac.HasEffectivePermission(user, "user:admin"))
+}
+
+// TestHasEffectivePermissionReadScopeUnknownPermissionDenied tests that a
+// permission ID not present in the static table is treated as non-read (the
+// conservative default) and denied for a read-scoped credential.
+func TestHasEffectivePermissionReadScopeUnknownPermissionDenied(t *testing.T) {
+	rbac := newTestRBAC()
+	user := &middleware.User{UserID: "user-1", Scope: "read"}
+	assert.False(t, rbac.HasEffectivePermission(user, "custom:action"))
+}
+
+// TestCanReadRegistryPublicAlwaysAllowed tests that a public (non-private)
+// registry is always readable, including by anonymous (nil) callers.
+func TestCanReadRegistryPublicAlwaysAllowed(t *testing.T) {
+	rbac := newTestRBAC()
+	reg := &database.RegistryConfig{ID: "reg-1", Private: false}
+
+	assert.True(t, rbac.CanReadRegistry(nil, reg))
+	assert.True(t, rbac.CanReadRegistry(&middleware.User{UserID: "user-1"}, reg))
+}
+
+// TestCanReadRegistryPrivateAnonymousDenied tests that an anonymous caller
+// is denied read access to a private registry.
+func TestCanReadRegistryPrivateAnonymousDenied(t *testing.T) {
+	rbac := newTestRBAC()
+	reg := &database.RegistryConfig{ID: "reg-1", Private: true}
+	assert.False(t, rbac.CanReadRegistry(nil, reg))
+}
+
+// TestCanPublishRegistryReadScopeAlwaysDenied tests that a read-scoped
+// credential can never publish, even to a private registry with a nominal
+// admin role attached — this is the scoping guarantee a read-only PAT
+// depends on.
+func TestCanPublishRegistryReadScopeAlwaysDenied(t *testing.T) {
+	rbac := newTestRBAC()
+	reg := &database.RegistryConfig{ID: "reg-1", Private: true}
+	user := &middleware.User{UserID: "user-1", Scope: "read"}
+
+	assert.False(t, rbac.CanPublishRegistry(user, reg))
+}
+
+// TestCanPublishRegistryNonPrivateAlwaysDenied tests that publishing to a
+// public/upstream registry is never allowed, regardless of scope.
+func TestCanPublishRegistryNonPrivateAlwaysDenied(t *testing.T) {
+	rbac := newTestRBAC()
+	reg := &database.RegistryConfig{ID: "reg-1", Private: false}
+	user := &middleware.User{UserID: "user-1", Scope: "full"}
+
+	assert.False(t, rbac.CanPublishRegistry(user, reg))
+}
+
+// TestCanPublishRegistryNilCasesDenied tests the nil-registry and nil-user
+// guard clauses.
+func TestCanPublishRegistryNilCasesDenied(t *testing.T) {
+	rbac := newTestRBAC()
+	reg := &database.RegistryConfig{ID: "reg-1", Private: true}
+	user := &middleware.User{UserID: "user-1", Scope: "full"}
+
+	assert.False(t, rbac.CanPublishRegistry(nil, reg))
+	assert.False(t, rbac.CanPublishRegistry(user, nil))
 }
