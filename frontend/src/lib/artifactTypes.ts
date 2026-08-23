@@ -214,3 +214,10 @@ export function getArtifactTypeConfig(artifactType: string | undefined): Artifac
 export function isContainerType(artifactType: string | undefined): boolean {
   return artifactType === 'docker' || artifactType === 'oci'
 }
+
+// Docker's official images live under the "library" namespace, but Docker
+// Hub itself never shows it (hub.docker.com/_/nginx, `docker pull nginx`) —
+// mirror that by collapsing it out of any namespace/name display.
+export function isHiddenDockerLibraryNamespace(artifactType?: string, namespace?: string): boolean {
+  return artifactType === 'docker' && namespace === 'library'
+}

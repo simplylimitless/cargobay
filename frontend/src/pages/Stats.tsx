@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { isHiddenDockerLibraryNamespace } from '../lib/artifactTypes'
 
 interface TopArtifact {
   ID: string
@@ -111,7 +112,9 @@ export function Stats() {
                         <td className="px-3 py-3 text-gray-500">{index + 1}</td>
                         <td className="px-3 py-3">
                           <span className="font-mono text-blue-400">
-                            {artifact.Namespace ? `${artifact.Namespace}/${artifact.ArtifactName}` : artifact.ArtifactName}
+                            {artifact.Namespace && !isHiddenDockerLibraryNamespace(artifact.ArtifactType, artifact.Namespace)
+                              ? `${artifact.Namespace}/${artifact.ArtifactName}`
+                              : artifact.ArtifactName}
                           </span>
                           <span className="ml-2 text-xs text-gray-500">{artifact.Version}</span>
                         </td>

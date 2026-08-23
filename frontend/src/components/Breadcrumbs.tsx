@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Link, matchPath, useLocation } from 'react-router-dom'
+import { isHiddenDockerLibraryNamespace } from '../lib/artifactTypes'
 
 interface RegistrySummary {
   id: string
@@ -18,13 +19,6 @@ interface Crumb {
   label: string
   to?: string
 }
-
-// Docker's official images live under the "library" namespace, but Docker
-// Hub itself never shows it (hub.docker.com/_/nginx, `docker pull nginx`) —
-// mirror that by collapsing it out of the trail rather than showing a
-// meaningless segment.
-const isHiddenDockerLibraryNamespace = (artifactType?: string, namespace?: string) =>
-  artifactType === 'docker' && namespace === 'library'
 
 export function Breadcrumbs() {
   const location = useLocation()
