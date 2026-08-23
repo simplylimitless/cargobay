@@ -3,3 +3,4 @@ backend/server
 .codegraph/
 backend/coverage.out
 frontend/node_modules/.vitest/
+frontend/dist/
