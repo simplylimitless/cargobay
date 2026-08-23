@@ -15,6 +15,7 @@ type ArtifactMetadata struct {
 	Digest          string         `db:"digest"`
 	DigestAlgorithm string         `db:"digest_algorithm"`
 	Size            int64          `db:"size"`
+	TotalSize       int64          `db:"total_size"`
 	Created         time.Time      `db:"created"`
 	Updated         time.Time      `db:"updated"`
 	Metadata        map[string]any `db:"metadata"`

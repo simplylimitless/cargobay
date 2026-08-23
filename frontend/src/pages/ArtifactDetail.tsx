@@ -14,6 +14,7 @@ interface Artifact {
   Digest: string
   DigestAlgorithm: string
   Size: number
+  TotalSize: number
   Created: string
   Tags: string[] | null
   Signatures: { type: string; verified: boolean }[] | null
@@ -301,7 +302,7 @@ export function ArtifactDetail() {
                       {vulnBadge(v)}
                     </div>
                     <div className="text-sm text-gray-500">
-                      Last pushed {timeAgo(v.Created)} · {formatSize(v.Size)} · {formatPulls(v.Downloads || 0)} pulls
+                      Last pushed {timeAgo(v.Created)} · {formatSize(v.TotalSize || v.Size)} · {formatPulls(v.Downloads || 0)} pulls
                     </div>
                   </div>
                   {canManage(v.Metadata?.uploadedBy) && (

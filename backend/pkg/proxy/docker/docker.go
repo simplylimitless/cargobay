@@ -410,6 +410,40 @@ func (p *DockerProxy) cacheManifestFromUpstream(t target, repository, reference 
 		metadata["childManifests"] = children
 	}
 
+	// Calculate total size: manifest size + all layer sizes for each platform
+	totalSize := int64(len(body))
+	if children := childManifestsFromList(body); children != nil {
+		// For manifest lists, fetch each platform manifest to get layer sizes
+		for _, child := range children {
+			if childDigest, ok := child["digest"].(string); ok && childDigest != "" {
+				// Fetch the platform manifest to get its layer sizes
+				platformBody, _, err := p.fetchManifestFromUpstream(t.reg, repository, childDigest)
+				if err == nil {
+					totalSize += int64(len(platformBody))
+					// Parse platform manifest to get layer sizes
+					var platformManifest map[string]interface{}
+					if err := json.Unmarshal(platformBody, &platformManifest); err == nil {
+						if layers, ok := platformManifest["layers"].([]interface{}); ok {
+							for _, layer := range layers {
+								if layerMap, ok := layer.(map[string]interface{}); ok {
+									if size, ok := layerMap["size"].(float64); ok {
+										totalSize += int64(size)
+									}
+								}
+							}
+						}
+						// Also include config blob size if present
+						if config, ok := platformManifest["config"].(map[string]interface{}); ok {
+											if size, ok := config["size"].(float64); ok {
+												totalSize += int64(size)
+											}
+										}
+					}
+				}
+			}
+		}
+	}
+
 	cached := &database.ArtifactMetadata{
 		ID:              fmt.Sprintf("docker:%s:%s:%s", t.label, strings.ReplaceAll(repository, "/", "_"), reference),
 		RegistryID:      t.label,
@@ -420,6 +454,7 @@ func (p *DockerProxy) cacheManifestFromUpstream(t target, repository, reference 
 		Digest:          digest,
 		DigestAlgorithm: "sha256",
 		Size:            int64(len(body)),
+		TotalSize:       totalSize,
 		Created:         time.Now(),
 		Updated:         time.Now(),
 		Metadata:        metadata,
@@ -611,6 +646,40 @@ func (p *DockerProxy) handlePutManifest(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
+	// Calculate total size: manifest size + all layer sizes for each platform
+	totalSize := int64(len(body))
+	if children := childManifestsFromList(body); children != nil {
+		// For manifest lists, fetch each platform manifest to get layer sizes
+		for _, child := range children {
+			if childDigest, ok := child["digest"].(string); ok && childDigest != "" {
+				// Fetch the platform manifest to get its layer sizes
+				platformBody, _, err := p.fetchManifestFromUpstream(t.reg, repository, childDigest)
+				if err == nil {
+					totalSize += int64(len(platformBody))
+					// Parse platform manifest to get layer sizes
+					var platformManifest map[string]interface{}
+					if err := json.Unmarshal(platformBody, &platformManifest); err == nil {
+						if layers, ok := platformManifest["layers"].([]interface{}); ok {
+							for _, layer := range layers {
+								if layerMap, ok := layer.(map[string]interface{}); ok {
+									if size, ok := layerMap["size"].(float64); ok {
+										totalSize += int64(size)
+									}
+								}
+							}
+						}
+						// Also include config blob size if present
+						if config, ok := platformManifest["config"].(map[string]interface{}); ok {
+							if size, ok := config["size"].(float64); ok {
+								totalSize += int64(size)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
 	// Save to database
 	artifact := &database.ArtifactMetadata{
 		ID:              fmt.Sprintf("docker:%s:%s:%s", t.label, strings.ReplaceAll(repository, "/", "_"), reference),
@@ -622,6 +691,7 @@ func (p *DockerProxy) handlePutManifest(w http.ResponseWriter, r *http.Request, 
 		Digest:          digest,
 		DigestAlgorithm: "sha256",
 		Size:            int64(len(body)),
+		TotalSize:       totalSize,
 		Created:         time.Now(),
 		Updated:         time.Now(),
 		Metadata:        map[string]interface{}{"manifest": string(body)},

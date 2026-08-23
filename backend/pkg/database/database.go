@@ -151,7 +151,7 @@ func (db *Database) GetArtifactByParams(registryID, namespace, artifactName, ver
 	row := db.pool.QueryRow(
 		context.Background(),
 		`SELECT id, registry_id, artifact_type, namespace, artifact_name, version,
-			 digest, digest_algorithm, size, created, updated, metadata, tags, signatures, downloads
+			 digest, digest_algorithm, size, total_size, created, updated, metadata, tags, signatures, downloads
 		 FROM artifacts
 		 WHERE registry_id = $1 AND namespace = $2 AND artifact_name = $3 AND version = $4`,
 		registryID, namespace, artifactName, version,
@@ -161,7 +161,7 @@ func (db *Database) GetArtifactByParams(registryID, namespace, artifactName, ver
 	err := row.Scan(
 		&artifact.ID, &artifact.RegistryID, &artifact.ArtifactType,
 		&artifact.Namespace, &artifact.ArtifactName, &artifact.Version,
-		&artifact.Digest, &artifact.DigestAlgorithm, &artifact.Size,
+		&artifact.Digest, &artifact.DigestAlgorithm, &artifact.Size, &artifact.TotalSize,
 		&artifact.Created, &artifact.Updated, &artifact.Metadata, &artifact.Tags, &artifact.Signatures, &artifact.Downloads,
 	)
 	if err != nil {
@@ -178,7 +178,7 @@ func (db *Database) GetArtifactByDigest(registryID, digest string) (*ArtifactMet
 	row := db.pool.QueryRow(
 		context.Background(),
 		`SELECT id, registry_id, artifact_type, namespace, artifact_name, version,
-			 digest, digest_algorithm, size, created, updated, metadata, tags, signatures, downloads
+			 digest, digest_algorithm, size, total_size, created, updated, metadata, tags, signatures, downloads
 		 FROM artifacts
 		 WHERE registry_id = $1 AND digest = $2
 		 ORDER BY created DESC`,
@@ -189,7 +189,7 @@ func (db *Database) GetArtifactByDigest(registryID, digest string) (*ArtifactMet
 	err := row.Scan(
 		&artifact.ID, &artifact.RegistryID, &artifact.ArtifactType,
 		&artifact.Namespace, &artifact.ArtifactName, &artifact.Version,
-		&artifact.Digest, &artifact.DigestAlgorithm, &artifact.Size,
+		&artifact.Digest, &artifact.DigestAlgorithm, &artifact.Size, &artifact.TotalSize,
 		&artifact.Created, &artifact.Updated, &artifact.Metadata, &artifact.Tags, &artifact.Signatures, &artifact.Downloads,
 	)
 	if err != nil {
@@ -215,7 +215,7 @@ type ListOptions struct {
 // ListArtifacts lists artifacts with optional filtering and pagination
 func (db *Database) ListArtifacts(registryID string, opts ListOptions) ([]ArtifactMetadata, error) {
 	query := `SELECT id, registry_id, artifact_type, namespace, artifact_name, version,
-				 digest, digest_algorithm, size, created, updated, metadata, tags, signatures, downloads
+				 digest, digest_algorithm, size, total_size, created, updated, metadata, tags, signatures, downloads
 			  FROM artifacts WHERE registry_id = $1`
 	params := []any{registryID}
 
@@ -260,7 +260,7 @@ func (db *Database) ListArtifacts(registryID string, opts ListOptions) ([]Artifa
 	for rows.Next() {
 		var a ArtifactMetadata
 		err := rows.Scan(&a.ID, &a.RegistryID, &a.ArtifactType, &a.Namespace,
-			&a.ArtifactName, &a.Version, &a.Digest, &a.DigestAlgorithm, &a.Size,
+			&a.ArtifactName, &a.Version, &a.Digest, &a.DigestAlgorithm, &a.Size, &a.TotalSize,
 			&a.Created, &a.Updated, &a.Metadata, &a.Tags, &a.Signatures, &a.Downloads)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan artifact: %w", err)
@@ -326,7 +326,7 @@ func (db *Database) ListArtifactsMulti(registryIDs []string, opts ListOptions) (
 	for rows.Next() {
 		var a ArtifactMetadata
 		err := rows.Scan(&a.ID, &a.RegistryID, &a.ArtifactType, &a.Namespace,
-			&a.ArtifactName, &a.Version, &a.Digest, &a.DigestAlgorithm, &a.Size,
+			&a.ArtifactName, &a.Version, &a.Digest, &a.DigestAlgorithm, &a.Size, &a.TotalSize,
 			&a.Created, &a.Updated, &a.Metadata, &a.Tags, &a.Signatures, &a.Downloads)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan artifact: %w", err)
@@ -383,7 +383,7 @@ type SearchResults struct {
 // SearchArtifacts searches artifacts by query string using tsvector index
 func (db *Database) SearchArtifacts(query string, opts SearchOptions) ([]ArtifactMetadata, error) {
 	searchQuery := `SELECT id, registry_id, artifact_type, namespace, artifact_name, version,
-					 digest, digest_algorithm, size, created, updated, metadata, tags, signatures, downloads
+					 digest, digest_algorithm, size, total_size, created, updated, metadata, tags, signatures, downloads
 				  FROM artifacts
 				  WHERE to_tsvector('english', artifact_name || ' ' || namespace) @@ to_tsquery('english', $1)`
 
@@ -423,7 +423,7 @@ func (db *Database) SearchArtifacts(query string, opts SearchOptions) ([]Artifac
 	for rows.Next() {
 		var a ArtifactMetadata
 		err := rows.Scan(&a.ID, &a.RegistryID, &a.ArtifactType, &a.Namespace,
-			&a.ArtifactName, &a.Version, &a.Digest, &a.DigestAlgorithm, &a.Size,
+			&a.ArtifactName, &a.Version, &a.Digest, &a.DigestAlgorithm, &a.Size, &a.TotalSize,
 			&a.Created, &a.Updated, &a.Metadata, &a.Tags, &a.Signatures, &a.Downloads)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan artifact: %w", err)
@@ -503,14 +503,15 @@ func (db *Database) SaveArtifact(metadata *ArtifactMetadata) error {
 		context.Background(),
 		`INSERT INTO artifacts (
 			 id, registry_id, artifact_type, namespace, artifact_name, version,
-			 digest, digest_algorithm, size, created, updated, metadata, tags, signatures,
+			 digest, digest_algorithm, size, total_size, created, updated, metadata, tags, signatures,
 			 search_vector
-		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, to_tsvector('english', $5 || ' ' || $4))
+		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, to_tsvector('english', $5 || ' ' || $4))
 		 ON CONFLICT (registry_id, namespace, artifact_name, version)
 		 DO UPDATE SET
 		   digest = EXCLUDED.digest,
 		   digest_algorithm = EXCLUDED.digest_algorithm,
 		   size = EXCLUDED.size,
+		   total_size = EXCLUDED.total_size,
 		   updated = EXCLUDED.updated,
 		   metadata = EXCLUDED.metadata,
 		   tags = EXCLUDED.tags,
@@ -518,7 +519,7 @@ func (db *Database) SaveArtifact(metadata *ArtifactMetadata) error {
 		   search_vector = to_tsvector('english', EXCLUDED.artifact_name || ' ' || EXCLUDED.namespace)`,
 		metadata.ID, metadata.RegistryID, metadata.ArtifactType, metadata.Namespace,
 		metadata.ArtifactName, metadata.Version, metadata.Digest, metadata.DigestAlgorithm,
-		metadata.Size, metadata.Created, metadata.Updated, metadata.Metadata, metadata.Tags, metadata.Signatures,
+		metadata.Size, metadata.TotalSize, metadata.Created, metadata.Updated, metadata.Metadata, metadata.Tags, metadata.Signatures,
 	)
 	if err != nil {
 		// Fallback: try without tsvector if column doesn't exist (legacy schema)
@@ -526,20 +527,21 @@ func (db *Database) SaveArtifact(metadata *ArtifactMetadata) error {
 			context.Background(),
 			`INSERT INTO artifacts (
 				 id, registry_id, artifact_type, namespace, artifact_name, version,
-				 digest, digest_algorithm, size, created, updated, metadata, tags, signatures
-			 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+				 digest, digest_algorithm, size, total_size, created, updated, metadata, tags, signatures
+			 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 			 ON CONFLICT (registry_id, namespace, artifact_name, version)
 			 DO UPDATE SET
 			   digest = EXCLUDED.digest,
 			   digest_algorithm = EXCLUDED.digest_algorithm,
 			   size = EXCLUDED.size,
+			   total_size = EXCLUDED.total_size,
 			   updated = EXCLUDED.updated,
 			   metadata = EXCLUDED.metadata,
 			   tags = EXCLUDED.tags,
 			   signatures = EXCLUDED.signatures`,
 			metadata.ID, metadata.RegistryID, metadata.ArtifactType, metadata.Namespace,
 			metadata.ArtifactName, metadata.Version, metadata.Digest, metadata.DigestAlgorithm,
-			metadata.Size, metadata.Created, metadata.Updated, metadata.Metadata, metadata.Tags, metadata.Signatures,
+			metadata.Size, metadata.TotalSize, metadata.Created, metadata.Updated, metadata.Metadata, metadata.Tags, metadata.Signatures,
 		)
 		if err2 != nil {
 			return fmt.Errorf("failed to save artifact: %w", err)
@@ -601,7 +603,7 @@ func (db *Database) TopArtifactsByDownloads(limit int) ([]ArtifactMetadata, erro
 	rows, err := db.pool.Query(
 		context.Background(),
 		`SELECT id, registry_id, artifact_type, namespace, artifact_name, version,
-			 digest, digest_algorithm, size, created, updated, metadata, tags, signatures, downloads
+			 digest, digest_algorithm, size, total_size, created, updated, metadata, tags, signatures, downloads
 		 FROM artifacts
 		 WHERE downloads > 0
 		 ORDER BY downloads DESC
@@ -617,7 +619,7 @@ func (db *Database) TopArtifactsByDownloads(limit int) ([]ArtifactMetadata, erro
 	for rows.Next() {
 		var a ArtifactMetadata
 		err := rows.Scan(&a.ID, &a.RegistryID, &a.ArtifactType, &a.Namespace,
-			&a.ArtifactName, &a.Version, &a.Digest, &a.DigestAlgorithm, &a.Size,
+			&a.ArtifactName, &a.Version, &a.Digest, &a.DigestAlgorithm, &a.Size, &a.TotalSize,
 			&a.Created, &a.Updated, &a.Metadata, &a.Tags, &a.Signatures, &a.Downloads)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan artifact: %w", err)
@@ -1389,7 +1391,7 @@ func (db *Database) RemoveRolePermission(roleID, permission string) error {
 func (db *Database) GetPendingReplicationArtifacts(limit int) ([]ArtifactMetadata, error) {
 	query := `
 		SELECT id, registry_id, artifact_type, namespace, artifact_name, version,
-			   digest, digest_algorithm, size, created, updated, metadata, tags, signatures, downloads
+			   digest, digest_algorithm, size, total_size, created, updated, metadata, tags, signatures, downloads
 		FROM artifacts
 		WHERE id NOT IN (
 			SELECT artifact_id FROM replication_status WHERE status = 'complete'
@@ -1408,7 +1410,7 @@ func (db *Database) GetPendingReplicationArtifacts(limit int) ([]ArtifactMetadat
 	for rows.Next() {
 		var a ArtifactMetadata
 		err := rows.Scan(&a.ID, &a.RegistryID, &a.ArtifactType, &a.Namespace,
-			&a.ArtifactName, &a.Version, &a.Digest, &a.DigestAlgorithm, &a.Size,
+			&a.ArtifactName, &a.Version, &a.Digest, &a.DigestAlgorithm, &a.Size, &a.TotalSize,
 			&a.Created, &a.Updated, &a.Metadata, &a.Tags, &a.Signatures, &a.Downloads)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan artifact: %w", err)
@@ -1458,7 +1460,7 @@ func (db *Database) GetArtifact(id string) (*ArtifactMetadata, error) {
 	row := db.pool.QueryRow(
 		context.Background(),
 		`SELECT id, registry_id, artifact_type, namespace, artifact_name, version,
-			 digest, digest_algorithm, size, created, updated, metadata, tags, signatures, downloads
+			 digest, digest_algorithm, size, total_size, created, updated, metadata, tags, signatures, downloads
 		 FROM artifacts WHERE id = $1`,
 		id,
 	)
@@ -1467,7 +1469,7 @@ func (db *Database) GetArtifact(id string) (*ArtifactMetadata, error) {
 	err := row.Scan(
 		&artifact.ID, &artifact.RegistryID, &artifact.ArtifactType,
 		&artifact.Namespace, &artifact.ArtifactName, &artifact.Version,
-		&artifact.Digest, &artifact.DigestAlgorithm, &artifact.Size,
+		&artifact.Digest, &artifact.DigestAlgorithm, &artifact.Size, &artifact.TotalSize,
 		&artifact.Created, &artifact.Updated, &artifact.Metadata, &artifact.Tags, &artifact.Signatures, &artifact.Downloads,
 	)
 	if err != nil {
@@ -1719,7 +1721,7 @@ func (db *Database) ListArtifactsCursor(opts CursorPaginationOptions) ([]Artifac
 	// Main query with LIMIT + 1 for "has next" detection
 	query := fmt.Sprintf(`
 		SELECT a.id, a.registry_id, a.artifact_type, a.namespace, a.artifact_name, a.version,
-			   a.digest, a.digest_algorithm, a.size, a.created, a.updated, a.metadata, a.tags, a.signatures
+			   a.digest, a.digest_algorithm, a.size, a.total_size, a.created, a.updated, a.metadata, a.tags, a.signatures
 		FROM artifacts a
 		WHERE 1=1%s
 		ORDER BY a.%s %s
@@ -1736,7 +1738,7 @@ func (db *Database) ListArtifactsCursor(opts CursorPaginationOptions) ([]Artifac
 	for rows.Next() {
 		var a ArtifactMetadata
 		err := rows.Scan(&a.ID, &a.RegistryID, &a.ArtifactType, &a.Namespace,
-			&a.ArtifactName, &a.Version, &a.Digest, &a.DigestAlgorithm, &a.Size,
+			&a.ArtifactName, &a.Version, &a.Digest, &a.DigestAlgorithm, &a.Size, &a.TotalSize,
 			&a.Created, &a.Updated, &a.Metadata, &a.Tags, &a.Signatures, &a.Downloads)
 		if err != nil {
 			return nil, "", false, fmt.Errorf("failed to scan artifact: %w", err)
