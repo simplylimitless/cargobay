@@ -76,15 +76,26 @@ export function Setup() {
     setError(null)
     setSubmitting(true)
     try {
-      const registries = REGISTRY_OPTIONS.filter((r) => selected.has(r.id)).map((r, i) => ({
-        id: r.id,
-        name: r.name,
-        url: r.url,
-        type: r.type,
-        enabled: true,
-        proxy: r.proxy,
-        priority: i,
-      }))
+      const seenTypes = new Set<string>()
+      const registries = REGISTRY_OPTIONS.filter((r) => selected.has(r.id)).map((r, i) => {
+        // The first selected registry of each type is the unbound default —
+        // reachable at cargobay's own hostname with zero client config.
+        // Every additional registry of that type defaults its Host to its
+        // upstream hostname, so a DNS/mirror override pointed at that
+        // hostname routes here instead of falling through to the default.
+        const isFirstOfType = !seenTypes.has(r.type)
+        seenTypes.add(r.type)
+        return {
+          id: r.id,
+          name: r.name,
+          url: r.url,
+          type: r.type,
+          enabled: true,
+          proxy: r.proxy,
+          priority: i,
+          host: isFirstOfType ? '' : new URL(r.url).host,
+        }
+      })
 
       const res = await fetch('/api/v1/setup', {
         method: 'POST',

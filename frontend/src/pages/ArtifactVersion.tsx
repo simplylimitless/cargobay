@@ -5,6 +5,36 @@ import { useConfirm } from '../hooks/useConfirm'
 import { getArtifactTypeConfig, isContainerType } from '../lib/artifactTypes'
 import { formatDateTime } from '../lib/datetime'
 
+// Field names here match the backend's plain Go json tags verbatim
+// (encoding/json does no camelCase conversion) — see
+// vulnerability.Vulnerability / vulnerability.ScanResult in scanner.go.
+interface ApiCVE {
+  id: string
+  package: string
+  version: string
+  pkg_type: string
+  severity: 'critical' | 'high' | 'medium' | 'low' | 'none'
+  cvss: number
+  installed: string
+  fixed: string
+  description: string
+  references: string[]
+  discovery: string
+}
+
+interface ApiScanResult {
+  artifact_id: string
+  artifact_type: string
+  registry_id: string
+  namespace: string
+  artifact_name: string
+  version: string
+  scan_time: string
+  severity: 'critical' | 'high' | 'medium' | 'low' | 'none'
+  vulnerabilities: ApiCVE[]
+  scanned_by: string
+}
+
 interface Artifact {
   ID: string
   RegistryID: string
@@ -49,6 +79,7 @@ export function ArtifactVersion() {
   const [error, setError] = useState<string | null>(null)
   const [deleting, setDeleting] = useState(false)
   const [registryHost, setRegistryHost] = useState<string | null>(null)
+  const [scanResults, setScanResults] = useState<ApiScanResult[]>([])
 
   useEffect(() => {
     if (!registryId) return
@@ -78,6 +109,14 @@ export function ArtifactVersion() {
       .finally(() => setLoading(false))
   }, [registryId, artifactType, namespace, artifactName, version])
 
+  useEffect(() => {
+    if (!artifact) return
+    fetch(`/api/v1/vulnerability-scans?artifactId=${encodeURIComponent(artifact.ID)}`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => setScanResults(data?.results || []))
+      .catch(() => setScanResults([]))
+  }, [artifact])
+
   const formatSize = (bytes: number) => {
     if (bytes < 1024) return `${bytes} B`
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
@@ -93,6 +132,17 @@ export function ArtifactVersion() {
       hour: '2-digit',
       minute: '2-digit',
     })
+  }
+
+  const getSeverityColor = (severity: string): string => {
+    switch (severity) {
+      case 'critical': return 'bg-red-600 text-white'
+      case 'high': return 'bg-orange-500 text-white'
+      case 'medium': return 'bg-yellow-500 text-white'
+      case 'low': return 'bg-blue-500 text-white'
+      case 'none': return 'bg-green-500 text-white'
+      default: return 'bg-gray-500 text-white'
+    }
   }
 
   const handleDelete = async () => {
@@ -174,7 +224,7 @@ export function ArtifactVersion() {
                 {namespace && !isDockerLibrary ? `${namespace}/${artifactName}` : artifactName}
               </h1>
               <span className="px-3 py-1.5 bg-blue-600 rounded-lg text-sm font-medium text-white">
-                v{version}
+                {isContainerType(artifactType) ? version : `v${version}`}
               </span>
             </div>
           </div>
@@ -287,6 +337,72 @@ export function ArtifactVersion() {
           )}
         </div>
       </div>
+
+      {scanResults.length > 0 && (
+        <div className="card">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-lg font-semibold text-gray-100">Vulnerabilities</h2>
+            <a
+              href={`/vulnerabilities/${encodeURIComponent(artifact.ID)}`}
+              className="text-sm text-blue-400 hover:text-blue-300 font-medium"
+            >
+              View full scan history
+            </a>
+          </div>
+          {(() => {
+            const latestScan = scanResults
+              .slice()
+              .sort((a, b) => new Date(b.scan_time).getTime() - new Date(a.scan_time).getTime())[0]
+            const cves = (latestScan.vulnerabilities || [])
+              .slice()
+              .sort((a, b) => b.cvss - a.cvss)
+            return (
+              <>
+                <div className="text-sm text-gray-500 mb-4">
+                  Last scanned {formatTimestamp(latestScan.scan_time)}
+                  {latestScan.scanned_by ? ` by ${latestScan.scanned_by}` : ''}
+                </div>
+                {cves.length === 0 ? (
+                  <div className="p-3 bg-green-500/10 border border-green-500/30 rounded-lg text-green-400 text-sm">
+                    No known vulnerabilities found
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-sm">
+                      <thead className="text-gray-500">
+                        <tr>
+                          <th className="py-1.5 pr-4 font-medium">Severity</th>
+                          <th className="py-1.5 pr-4 font-medium">CVE</th>
+                          <th className="py-1.5 pr-4 font-medium">Package</th>
+                          <th className="py-1.5 pr-4 font-medium">Installed</th>
+                          <th className="py-1.5 pr-4 font-medium">Fixed</th>
+                          <th className="py-1.5 pr-4 font-medium">Score</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-800">
+                        {cves.map((cve) => (
+                          <tr key={cve.id}>
+                            <td className="py-2 pr-4">
+                              <span className={`px-2 py-0.5 text-xs rounded-full font-medium ${getSeverityColor(cve.severity)}`}>
+                                {cve.severity}
+                              </span>
+                            </td>
+                            <td className="py-2 pr-4 text-blue-400 font-medium">{cve.id}</td>
+                            <td className="py-2 pr-4 text-gray-300">{cve.package}</td>
+                            <td className="py-2 pr-4 text-gray-400 font-mono text-xs">{cve.installed}</td>
+                            <td className="py-2 pr-4 text-gray-400 font-mono text-xs">{cve.fixed || 'no fix'}</td>
+                            <td className="py-2 pr-4 text-gray-300">{cve.cvss}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </>
+            )
+          })()}
+        </div>
+      )}
 
       <div className="card">
         <h2 className="text-lg font-semibold text-gray-100 mb-4">Pull/Install Command</h2>

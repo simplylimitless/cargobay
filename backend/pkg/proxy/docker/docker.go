@@ -730,9 +730,12 @@ func (p *DockerProxy) triggerAsyncScan(registryLabel, repository, namespace, nam
 	go func() {
 		result, err := p.scanner.ScanArtifact(artifact, nil)
 		if err != nil {
+			log.Printf("vulnerability scan-on-push: scan failed for %s: %v", artifact.ID, err)
 			return
 		}
-		_ = p.scanner.SaveScanResult(result)
+		if err := p.scanner.SaveScanResult(result); err != nil {
+			log.Printf("vulnerability scan-on-push: failed to save result for %s: %v", artifact.ID, err)
+		}
 	}()
 }
 

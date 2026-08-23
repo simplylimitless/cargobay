@@ -714,6 +714,21 @@ export function Settings() {
       setRegistrySaveError('id, name, and url are required')
       return
     }
+    // A newly created proxy registry that leaves Host blank, when another
+    // registry of the same type already exists, would silently compete for
+    // the same unbound default slot. Default it to the upstream hostname
+    // instead, so it's reachable via a DNS/mirror override pointed at that
+    // hostname rather than falling through to whichever registry already
+    // holds the default.
+    let host = registryForm.host
+    if (!editingRegistry && !host && registryForm.proxy && registries.some((r) => r.type === registryForm.type)) {
+      try {
+        host = new URL(registryForm.url).host
+      } catch {
+        // leave host blank if the URL isn't parseable yet; server-side
+        // validation will surface the bad URL anyway
+      }
+    }
     try {
       const res = await fetch('/api/v1/registries', {
         method: 'POST',
@@ -721,7 +736,7 @@ export function Settings() {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify(registryForm),
+        body: JSON.stringify({ ...registryForm, host }),
       })
       if (!res.ok) {
         const data = await res.json().catch(() => ({}))

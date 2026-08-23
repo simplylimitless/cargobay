@@ -2245,6 +2245,7 @@ func (s *Server) handleSetupInit(w http.ResponseWriter, r *http.Request) {
 			Enabled  bool   `json:"enabled"`
 			Proxy    bool   `json:"proxy"`
 			Priority int    `json:"priority"`
+			Host     string `json:"host"`
 		} `json:"registries"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
@@ -2287,6 +2288,7 @@ func (s *Server) handleSetupInit(w http.ResponseWriter, r *http.Request) {
 			Enabled:  reg.Enabled,
 			Proxy:    reg.Proxy,
 			Priority: reg.Priority,
+			Host:     reg.Host,
 		}
 		if err := s.db.SaveRegistry(&registry); err != nil {
 			s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to save registry %s: %v", reg.ID, err))
