@@ -281,7 +281,7 @@ func (db *Database) ListArtifactsMulti(registryIDs []string, opts ListOptions) (
 	}
 
 	query := `SELECT id, registry_id, artifact_type, namespace, artifact_name, version,
-				 digest, digest_algorithm, size, created, updated, metadata, tags, signatures, downloads
+				 digest, digest_algorithm, size, total_size, created, updated, metadata, tags, signatures, downloads
 			  FROM artifacts WHERE registry_id = ANY($1)`
 	params := []any{registryIDs}
 
