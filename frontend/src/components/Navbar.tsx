@@ -16,8 +16,8 @@ export function Navbar() {
       <div className="container mx-auto px-4 py-3">
         <div className="flex items-center justify-between gap-4">
           <Link to="/" className="flex items-center gap-3 group">
-            <div className="w-10 h-10 bg-gradient-to-br from-blue-600 to-purple-600 rounded-xl flex items-center justify-center shadow-lg shadow-blue-600/20 group-hover:shadow-purple-600/20 transition-all">
-              <span className="text-white font-bold text-xl">C</span>
+            <div className="w-10 h-10 rounded-xl overflow-hidden shadow-lg shadow-blue-600/20 group-hover:shadow-purple-600/20 transition-all">
+              <img src="/apple-touch-icon.png" alt="cargobay" className="w-full h-full object-cover" />
             </div>
             <div className="hidden md:block">
               <span className="text-xl font-bold text-white tracking-tight">cargobay</span>
