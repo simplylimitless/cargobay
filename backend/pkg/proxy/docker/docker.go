@@ -196,37 +196,59 @@ type target struct {
 	label string
 }
 
-// resolveTarget picks which registry a request addresses, purely from the
-// Host header the client connected on — repository names are never
-// touched, so downstream docker clients need zero reconfiguration beyond
-// pointing at the right hostname for a private registry.
-func (p *DockerProxy) resolveTarget(r *http.Request) target {
-	reg := proxy.ResolveRegistry(p.db, p.registries, r.Host, "docker")
+// dockerPathPrefixSegment marks a request as addressing a registry by path
+// rather than by Host: cargobay-host/dkr/ghcr.io/org/image. Requiring this
+// literal segment (rather than treating any leading path component as a
+// possible registry selector) keeps the namespace unambiguous — a plain
+// pull like cargobay-host/library/nginx is never mistaken for a registry
+// selector, and everything under /dkr/ is legible at a glance as Docker
+// registry proxying.
+const dockerPathPrefixSegment = "dkr/"
+
+// resolveTarget picks which registry a request addresses. A Host header
+// bound to a specific registry wins outright; otherwise, if the path starts
+// with the dockerPathPrefixSegment marker, the segment after it is matched
+// against a registry (by ID or by its upstream hostname, e.g. "ghcr.io")
+// and both are stripped, so a client can address any configured upstream
+// through a single cargobay hostname (cargobay-host/dkr/ghcr.io/org/image)
+// without per-registry DNS. Falls back to the default docker registry, path
+// unchanged, if neither matches. Returns the resolved target along with the
+// path handlers should parse the repository/reference/digest out of.
+func (p *DockerProxy) resolveTarget(r *http.Request) (target, string) {
+	path := strings.TrimPrefix(r.URL.Path, "/v2/")
+
+	var reg *database.RegistryConfig
+	if rest, ok := strings.CutPrefix(path, dockerPathPrefixSegment); ok {
+		reg, path = proxy.ResolveRegistryWithPathPrefix(p.db, r.Host, rest, "docker")
+	} else {
+		reg = proxy.ResolveRegistry(p.db, p.registries, r.Host, "docker")
+	}
+
 	label := "docker"
 	if reg != nil {
 		label = reg.ID
 	}
-	return target{reg: reg, label: label}
+	return target{reg: reg, label: label}, path
 }
 
-// checkAccess resolves the target registry for r and enforces read/publish
-// access on it, writing a 401/403 and returning ok=false if denied.
-func (p *DockerProxy) checkAccess(w http.ResponseWriter, r *http.Request, requirePublish bool) (t target, ok bool) {
-	t = p.resolveTarget(r)
+// checkAccess resolves the target registry (and repository-parseable path)
+// for r and enforces read/publish access on it, writing a 401/403 and
+// returning ok=false if denied.
+func (p *DockerProxy) checkAccess(w http.ResponseWriter, r *http.Request, requirePublish bool) (t target, path string, ok bool) {
+	t, path = p.resolveTarget(r)
 	if !proxy.CheckAccess(w, p.rbac, middleware.GetUser(r), t.reg, requirePublish) {
-		return t, false
+		return t, path, false
 	}
-	return t, true
+	return t, path, true
 }
 
 // handleV2Read dispatches GET requests under /v2/ to the manifest, tag
 // list, or blob handler based on the request path shape.
 func (p *DockerProxy) handleV2Read(w http.ResponseWriter, r *http.Request) {
-	t, ok := p.checkAccess(w, r, false)
+	t, path, ok := p.checkAccess(w, r, false)
 	if !ok {
 		return
 	}
-	path := strings.TrimPrefix(r.URL.Path, "/v2/")
 
 	if repo, ref, ok := splitAtLast(path, "/manifests/"); ok {
 		p.handleManifest(w, r, t, repo, ref)
@@ -244,11 +266,10 @@ func (p *DockerProxy) handleV2Read(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *DockerProxy) handleV2Head(w http.ResponseWriter, r *http.Request) {
-	t, ok := p.checkAccess(w, r, false)
+	t, path, ok := p.checkAccess(w, r, false)
 	if !ok {
 		return
 	}
-	path := strings.TrimPrefix(r.URL.Path, "/v2/")
 
 	if repo, ref, ok := splitAtLast(path, "/manifests/"); ok {
 		p.handleHeadManifest(w, r, t, repo, ref)
@@ -262,11 +283,10 @@ func (p *DockerProxy) handleV2Head(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *DockerProxy) handleV2Put(w http.ResponseWriter, r *http.Request) {
-	t, ok := p.checkAccess(w, r, true)
+	t, path, ok := p.checkAccess(w, r, true)
 	if !ok {
 		return
 	}
-	path := strings.TrimPrefix(r.URL.Path, "/v2/")
 
 	if repo, uploadID, ok := splitAtLast(path, "/blobs/uploads/"); ok {
 		p.handleFinishUpload(w, r, t, repo, uploadID)
@@ -280,11 +300,10 @@ func (p *DockerProxy) handleV2Put(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *DockerProxy) handleV2Post(w http.ResponseWriter, r *http.Request) {
-	t, ok := p.checkAccess(w, r, true)
+	t, path, ok := p.checkAccess(w, r, true)
 	if !ok {
 		return
 	}
-	path := strings.TrimPrefix(r.URL.Path, "/v2/")
 
 	if repo, ok := trimSuffixSep(path, "/blobs/uploads/"); ok {
 		p.handleStartUpload(w, r, t, repo)
@@ -298,11 +317,10 @@ func (p *DockerProxy) handleV2Post(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *DockerProxy) handleV2Patch(w http.ResponseWriter, r *http.Request) {
-	t, ok := p.checkAccess(w, r, true)
+	t, path, ok := p.checkAccess(w, r, true)
 	if !ok {
 		return
 	}
-	path := strings.TrimPrefix(r.URL.Path, "/v2/")
 
 	if repo, uploadID, ok := splitAtLast(path, "/blobs/uploads/"); ok {
 		p.handlePatchUpload(w, r, t, repo, uploadID)
@@ -312,11 +330,10 @@ func (p *DockerProxy) handleV2Patch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *DockerProxy) handleV2Delete(w http.ResponseWriter, r *http.Request) {
-	t, ok := p.checkAccess(w, r, true)
+	t, path, ok := p.checkAccess(w, r, true)
 	if !ok {
 		return
 	}
-	path := strings.TrimPrefix(r.URL.Path, "/v2/")
 
 	if repo, ref, ok := splitAtLast(path, "/manifests/"); ok {
 		p.handleDeleteManifest(w, r, t, repo, ref)
@@ -326,10 +343,10 @@ func (p *DockerProxy) handleV2Delete(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleCatalog lists repositories in the registry resolved for this
-// request (by Host header) — a caller only ever sees repositories in the
-// registry they're actually talking to.
+// request (by Host header, or a leading path-prefix selector) — a caller
+// only ever sees repositories in the registry they're actually talking to.
 func (p *DockerProxy) handleCatalog(w http.ResponseWriter, r *http.Request) {
-	t, ok := p.checkAccess(w, r, false)
+	t, _, ok := p.checkAccess(w, r, false)
 	if !ok {
 		return
 	}

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"net/url"
+	"strings"
 
 	"github.com/simplylimitless/cargobay/backend/pkg/database"
 	"github.com/simplylimitless/cargobay/backend/pkg/middleware"
@@ -43,6 +45,63 @@ func ResolveRegistry(db *database.Database, registries []database.RegistryConfig
 		return reg
 	}
 	return nil
+}
+
+// ResolveRegistryWithPathPrefix behaves like ResolveRegistry (Host-header
+// binding takes priority), but additionally recognizes a leading path
+// segment as a registry selector: if the segment matches an enabled,
+// proxy-enabled registry of artifactType — by ID or by the hostname of its
+// configured upstream URL — that registry is used and the matched segment
+// is stripped from the returned path. Callers should only invoke this once
+// they've already established (e.g. by requiring a literal marker segment
+// like "dkr/" ahead of path) that path-prefix addressing applies to this
+// request at all — this function itself treats any leading segment as a
+// possible selector. Falls back to the default registry (path unchanged)
+// if nothing matches either way.
+func ResolveRegistryWithPathPrefix(db *database.Database, requestHost, path, artifactType string) (*database.RegistryConfig, string) {
+	if host := HostOnly(requestHost); host != "" {
+		if reg, err := db.GetRegistryByHost(host); err == nil && reg != nil && reg.Type == artifactType {
+			return reg, path
+		}
+	}
+
+	if prefix, rest, ok := strings.Cut(path, "/"); ok {
+		if reg := matchRegistryByPrefix(db, prefix, artifactType); reg != nil {
+			return reg, rest
+		}
+	}
+
+	if reg, err := db.GetDefaultRegistry(artifactType); err == nil && reg != nil {
+		return reg, path
+	}
+	return nil, path
+}
+
+// matchRegistryByPrefix finds an enabled, proxy-enabled registry of
+// artifactType whose ID or configured upstream hostname equals prefix.
+func matchRegistryByPrefix(db *database.Database, prefix, artifactType string) *database.RegistryConfig {
+	regs, err := db.ListRegistries()
+	if err != nil {
+		return nil
+	}
+	for i := range regs {
+		reg := &regs[i]
+		if reg.Type != artifactType || !reg.Proxy {
+			continue
+		}
+		if reg.ID == prefix || urlHost(reg.URL) == prefix {
+			return reg
+		}
+	}
+	return nil
+}
+
+func urlHost(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return u.Host
 }
 
 // CheckAccess enforces CanReadRegistry/CanPublishRegistry for a protocol

@@ -415,7 +415,7 @@ func TestCheckAccessPublicReadAllowsAnonymous(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/v2/_catalog", nil)
 	rec := httptest.NewRecorder()
 
-	_, ok := p.checkAccess(rec, req, false)
+	_, _, ok := p.checkAccess(rec, req, false)
 
 	assert.True(t, ok)
 }
@@ -428,10 +428,72 @@ func TestCheckAccessWriteRequiresAuth(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPut, "/v2/library/nginx/manifests/1.0.0", nil)
 	rec := httptest.NewRecorder()
 
-	_, ok := p.checkAccess(rec, req, true)
+	_, _, ok := p.checkAccess(rec, req, true)
 
 	assert.False(t, ok)
 	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+}
+
+func TestResolveTargetPathPrefix(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p := newTestProxy(t, db, c)
+
+	// A proxy-enabled registry with no bound Host, addressable only by
+	// prefixing the request path with its upstream hostname.
+	reg := &database.RegistryConfig{
+		ID:       uniqueID("ghcr-reg"),
+		Name:     "ghcr",
+		URL:      "https://ghcr.io",
+		Type:     "docker",
+		Enabled:  true,
+		Priority: 10,
+		Private:  false,
+		Proxy:    true,
+	}
+	require.NoError(t, db.SaveRegistry(reg))
+	t.Cleanup(func() { db.DeleteRegistry(reg.ID) })
+
+	req := httptest.NewRequest(http.MethodGet, "/v2/dkr/ghcr.io/blakeblackshear/frigate/manifests/stable", nil)
+	rec := httptest.NewRecorder()
+
+	t2, path, ok := p.checkAccess(rec, req, false)
+
+	require.True(t, ok)
+	assert.Equal(t, reg.ID, t2.label)
+	assert.Equal(t, "blakeblackshear/frigate/manifests/stable", path)
+}
+
+func TestResolveTargetWithoutDkrPrefixIgnoresRegistryLikeSegments(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p := newTestProxy(t, db, c)
+
+	// Even if a registry named "ghcr.io" exists, a request that doesn't
+	// start with the dkr/ marker must not be treated as path-prefix
+	// addressing — a plain pull of a repo that happens to be named
+	// "ghcr.io/..." falls through to Host/default resolution instead.
+	reg := &database.RegistryConfig{
+		ID:       uniqueID("ghcr-reg"),
+		Name:     "ghcr",
+		URL:      "https://ghcr.io",
+		Type:     "docker",
+		Enabled:  true,
+		Priority: 10,
+		Private:  false,
+		Proxy:    true,
+	}
+	require.NoError(t, db.SaveRegistry(reg))
+	t.Cleanup(func() { db.DeleteRegistry(reg.ID) })
+
+	req := httptest.NewRequest(http.MethodGet, "/v2/ghcr.io/blakeblackshear/frigate/manifests/stable", nil)
+	rec := httptest.NewRecorder()
+
+	t2, path, ok := p.checkAccess(rec, req, false)
+
+	require.True(t, ok)
+	assert.NotEqual(t, reg.ID, t2.label)
+	assert.Equal(t, "ghcr.io/blakeblackshear/frigate/manifests/stable", path)
 }
 
 func TestDockerProxyIntegration(t *testing.T) {
