@@ -10,6 +10,7 @@ interface Artifact {
   ArtifactName: string
   Version: string
   Size: number
+  TotalSize: number
   Tags: string[] | null
 }
 
@@ -64,7 +65,7 @@ export function ArtifactList() {
         namespace: latest.Namespace,
         artifactName: latest.ArtifactName,
         latestVersion: latest.Version,
-        size: latest.Size,
+        size: latest.TotalSize || latest.Size,
         versionCount: versions.length,
       }
     })

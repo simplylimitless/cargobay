@@ -45,6 +45,7 @@ interface Artifact {
   Digest: string
   DigestAlgorithm: string
   Size: number
+  TotalSize: number
   Created: string
   Tags: string[] | null
   Signatures: { type: string; verified: boolean; timestamp?: string }[] | null
@@ -311,7 +312,7 @@ export function ArtifactVersion() {
           <div className="grid grid-cols-2 gap-4">
             <div>
               <div className="text-sm text-gray-500">Size</div>
-              <div className="font-medium text-white">{formatSize(artifact.Size)}</div>
+              <div className="font-medium text-white">{formatSize(artifact.TotalSize || artifact.Size)}</div>
             </div>
             <div>
               <div className="text-sm text-gray-500">Created</div>

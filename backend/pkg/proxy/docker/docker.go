@@ -175,6 +175,29 @@ func childManifestsFromList(body []byte) []map[string]interface{} {
 	return children
 }
 
+// manifestContentSize sums the config and layer blob sizes declared inside a
+// single-platform image manifest — the actual bytes a client pulls for that
+// manifest, as opposed to the manifest JSON document itself (a few hundred
+// bytes to a few KB, and not representative of image size on its own).
+func manifestContentSize(body []byte) int64 {
+	var m struct {
+		Config struct {
+			Size int64 `json:"size"`
+		} `json:"config"`
+		Layers []struct {
+			Size int64 `json:"size"`
+		} `json:"layers"`
+	}
+	if err := json.Unmarshal(body, &m); err != nil {
+		return 0
+	}
+	total := m.Config.Size
+	for _, layer := range m.Layers {
+		total += layer.Size
+	}
+	return total
+}
+
 // splitDockerRepository splits a Docker repository path like "library/nginx"
 // into its namespace ("library") and image name ("nginx"), so the two are
 // stored as distinct fields instead of duplicating the full path into both.
@@ -447,42 +470,27 @@ func (p *DockerProxy) cacheManifestFromUpstream(t target, repository, reference 
 		"manifest":    string(body),
 		"contentType": contentType,
 	}
-	if children := childManifestsFromList(body); children != nil {
-		metadata["childManifests"] = children
-	}
 
-	// Calculate total size: manifest size + all layer sizes for each platform
+	// Calculate total size: manifest document size + the real pullable
+	// content (config + layer blobs). For a manifest list, that content
+	// lives in each platform's own manifest, not the list itself, so each
+	// child's declared "size" (the list's summary of its manifest doc size)
+	// is corrected here to its real content size before being stored.
 	totalSize := int64(len(body))
 	if children := childManifestsFromList(body); children != nil {
-		// For manifest lists, fetch each platform manifest to get layer sizes
 		for _, child := range children {
 			if childDigest, ok := child["digest"].(string); ok && childDigest != "" {
-				// Fetch the platform manifest to get its layer sizes
 				platformBody, _, err := p.fetchManifestFromUpstream(t.reg, repository, childDigest)
 				if err == nil {
-					totalSize += int64(len(platformBody))
-					// Parse platform manifest to get layer sizes
-					var platformManifest map[string]interface{}
-					if err := json.Unmarshal(platformBody, &platformManifest); err == nil {
-						if layers, ok := platformManifest["layers"].([]interface{}); ok {
-							for _, layer := range layers {
-								if layerMap, ok := layer.(map[string]interface{}); ok {
-									if size, ok := layerMap["size"].(float64); ok {
-										totalSize += int64(size)
-									}
-								}
-							}
-						}
-						// Also include config blob size if present
-						if config, ok := platformManifest["config"].(map[string]interface{}); ok {
-											if size, ok := config["size"].(float64); ok {
-												totalSize += int64(size)
-											}
-										}
-					}
+					platformSize := int64(len(platformBody)) + manifestContentSize(platformBody)
+					child["size"] = platformSize
+					totalSize += platformSize
 				}
 			}
 		}
+		metadata["childManifests"] = children
+	} else {
+		totalSize += manifestContentSize(body)
 	}
 
 	cached := &database.ArtifactMetadata{
@@ -690,38 +698,20 @@ func (p *DockerProxy) handlePutManifest(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	// Calculate total size: manifest size + all layer sizes for each platform
+	// Calculate total size: manifest document size + the real pullable
+	// content (config + layer blobs) — see manifestContentSize.
 	totalSize := int64(len(body))
 	if children := childManifestsFromList(body); children != nil {
-		// For manifest lists, fetch each platform manifest to get layer sizes
 		for _, child := range children {
 			if childDigest, ok := child["digest"].(string); ok && childDigest != "" {
-				// Fetch the platform manifest to get its layer sizes
 				platformBody, _, err := p.fetchManifestFromUpstream(t.reg, repository, childDigest)
 				if err == nil {
-					totalSize += int64(len(platformBody))
-					// Parse platform manifest to get layer sizes
-					var platformManifest map[string]interface{}
-					if err := json.Unmarshal(platformBody, &platformManifest); err == nil {
-						if layers, ok := platformManifest["layers"].([]interface{}); ok {
-							for _, layer := range layers {
-								if layerMap, ok := layer.(map[string]interface{}); ok {
-									if size, ok := layerMap["size"].(float64); ok {
-										totalSize += int64(size)
-									}
-								}
-							}
-						}
-						// Also include config blob size if present
-						if config, ok := platformManifest["config"].(map[string]interface{}); ok {
-							if size, ok := config["size"].(float64); ok {
-								totalSize += int64(size)
-							}
-						}
-					}
+					totalSize += int64(len(platformBody)) + manifestContentSize(platformBody)
 				}
 			}
 		}
+	} else {
+		totalSize += manifestContentSize(body)
 	}
 
 	// Save to database

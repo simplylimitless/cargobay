@@ -355,7 +355,7 @@ export function ArtifactDetail() {
                             <td className="py-1.5 pr-4 font-mono text-gray-400 truncate max-w-xs">
                               {v.DigestAlgorithm || 'sha256'}:{v.Digest.replace(/^sha256:/, '').slice(-12)}
                             </td>
-                            <td className="py-1.5 pr-4 text-gray-400">{formatSize(v.Size)}</td>
+                            <td className="py-1.5 pr-4 text-gray-400">{formatSize(v.TotalSize || v.Size)}</td>
                           </tr>
                         )}
                       </tbody>
