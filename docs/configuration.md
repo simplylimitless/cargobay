@@ -196,8 +196,11 @@ docker pull cargobay.example.com/dkr/<registry-selector>/<repo>:<tag>
 ```
 
 `<registry-selector>` matches a registry either by its `id` or by the
-hostname of its configured `url`. For example, with a registry configured
-as:
+hostname of its configured `url` — the exact `url` on that registry's
+config, not a "known" hostname for the provider. Docker Hub, for instance,
+is normally configured with `url: https://registry-1.docker.io` (its real
+v2 API endpoint), not `docker.io`, so the selector for it is
+`registry-1.docker.io`. For example, with a registry configured as:
 
 ```yaml
 registries:
