@@ -211,12 +211,14 @@ CREATE TABLE IF NOT EXISTS backup_settings (
 );
 INSERT INTO backup_settings (id) VALUES (1) ON CONFLICT DO NOTHING;
 
--- Singleton row accumulating instance-wide stats. Currently tracks bytes
--- served from local storage on a cache hit (i.e. bytes that did not need to
--- be re-fetched from an upstream registry) — backs the Stats page's
--- "bandwidth saved" figure (see migrations/011_add_stats.sql).
+-- Singleton row accumulating instance-wide stats: bytes served from local
+-- storage on a cache hit (see migrations/011_add_stats.sql) and total pull
+-- count (see migrations/018_add_stats_total_pulls.sql). Both are running
+-- accumulators independent of the artifacts table, so they survive artifact
+-- deletion/cache clears — unlike a SUM() over live artifact rows would.
 CREATE TABLE IF NOT EXISTS stats (
     id                     INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-    bandwidth_saved_bytes  BIGINT NOT NULL DEFAULT 0
+    bandwidth_saved_bytes  BIGINT NOT NULL DEFAULT 0,
+    total_pulls            BIGINT NOT NULL DEFAULT 0
 );
 INSERT INTO stats (id) VALUES (1) ON CONFLICT DO NOTHING;

@@ -578,17 +578,35 @@ func (db *Database) UpdateArtifactTags(registryID, namespace, artifactName, vers
 }
 
 // IncrementArtifactDownloads atomically bumps the pull/download counter for
-// one artifact version. Called from proxy handlers at the point they serve
-// artifact bytes to a client.
+// one artifact version, plus the instance-wide total_pulls accumulator in
+// the stats table. Called from proxy handlers at the point they serve
+// artifact bytes to a client. The stats accumulator is kept separate from
+// the per-artifact count because the artifact row (and its count) can later
+// be deleted, e.g. by clearing the cache, and the Stats page's "Total
+// Pulls" figure should survive that.
 func (db *Database) IncrementArtifactDownloads(registryID, namespace, artifactName, version string) error {
-	_, err := db.pool.Exec(
-		context.Background(),
+	ctx := context.Background()
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(
+		ctx,
 		`UPDATE artifacts SET downloads = downloads + 1
 		 WHERE registry_id = $1 AND namespace = $2 AND artifact_name = $3 AND version = $4`,
 		registryID, namespace, artifactName, version,
-	)
-	if err != nil {
+	); err != nil {
 		return fmt.Errorf("failed to increment artifact downloads: %w", err)
+	}
+
+	if _, err := tx.Exec(ctx, `UPDATE stats SET total_pulls = total_pulls + 1 WHERE id = 1`); err != nil {
+		return fmt.Errorf("failed to increment total pulls: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit download increment: %w", err)
 	}
 	return nil
 }
@@ -629,12 +647,14 @@ func (db *Database) TopArtifactsByDownloads(limit int) ([]ArtifactMetadata, erro
 	return artifacts, rows.Err()
 }
 
-// TotalDownloads sums the download counter across every artifact version.
+// TotalDownloads returns the instance-wide running total of pulls, tracked
+// independently of the artifacts table (see IncrementArtifactDownloads) so
+// it isn't reset when artifacts are deleted or the cache is cleared.
 func (db *Database) TotalDownloads() (int64, error) {
 	var total int64
-	err := db.pool.QueryRow(context.Background(), `SELECT COALESCE(SUM(downloads), 0) FROM artifacts`).Scan(&total)
+	err := db.pool.QueryRow(context.Background(), `SELECT total_pulls FROM stats WHERE id = 1`).Scan(&total)
 	if err != nil {
-		return 0, fmt.Errorf("failed to sum artifact downloads: %w", err)
+		return 0, fmt.Errorf("failed to get total pulls: %w", err)
 	}
 	return total, nil
 }
