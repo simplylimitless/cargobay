@@ -18,6 +18,7 @@ export function RegistryDetail() {
   const [registry, setRegistry] = useState<Registry | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [logoFailed, setLogoFailed] = useState(false)
 
   useEffect(() => {
     setLoading(true)
@@ -33,6 +34,33 @@ export function RegistryDetail() {
       .catch((err) => setError(err.message))
       .finally(() => setLoading(false))
   }, [registryId])
+
+  // Logos for known providers, matched by registry id first (so e.g. a
+  // 'ghcr' registry gets the GitHub mark rather than the generic Docker
+  // whale) and falling back to registry type. Registries that don't match
+  // either (custom/self-hosted upstreams) fall back to the letter avatar.
+  const getRegistryLogo = (reg: Registry): string | null => {
+    switch (reg.id) {
+      case 'ghcr':
+        return '/registries/github.svg'
+      case 'quay':
+        return '/registries/redhat.svg'
+    }
+    switch (reg.type) {
+      case 'docker':
+        return '/registries/docker.svg'
+      case 'npm':
+        return '/registries/npm.svg'
+      case 'maven':
+        return '/registries/maven.svg'
+      case 'pypi':
+        return '/registries/pypi.svg'
+      case 'nuget':
+        return '/registries/nuget.svg'
+      default:
+        return null
+    }
+  }
 
   const getArtifactTypes = (registryType: string) => {
     switch (registryType) {
@@ -79,14 +107,26 @@ export function RegistryDetail() {
   }
 
   const artifactTypes = getArtifactTypes(registry.type)
+  const logo = logoFailed ? null : getRegistryLogo(registry)
 
   return (
     <div className="space-y-8">
       <div className="card">
         <div className="flex items-start gap-6">
-          <div className="w-20 h-20 bg-gradient-to-br from-blue-600 to-purple-600 rounded-2xl flex items-center justify-center flex-shrink-0 text-5xl shadow-lg shadow-blue-600/20">
-            {registry.name.charAt(0)}
-          </div>
+          {logo ? (
+            <div className="w-20 h-20 bg-white rounded-2xl flex items-center justify-center flex-shrink-0 p-3 shadow-lg shadow-blue-600/20">
+              <img
+                src={logo}
+                alt={`${registry.name} logo`}
+                className="w-full h-full object-contain"
+                onError={() => setLogoFailed(true)}
+              />
+            </div>
+          ) : (
+            <div className="w-20 h-20 bg-gradient-to-br from-blue-600 to-purple-600 rounded-2xl flex items-center justify-center flex-shrink-0 text-5xl shadow-lg shadow-blue-600/20">
+              {registry.name.charAt(0)}
+            </div>
+          )}
           <div className="flex-1">
             <div className="flex flex-wrap items-center gap-3 mb-2">
               <h1 className="text-3xl font-bold text-white">{registry.name}</h1>
