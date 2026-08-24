@@ -15,6 +15,7 @@ interface RegistryOption {
 const REGISTRY_OPTIONS: RegistryOption[] = [
   { id: 'dockerhub', name: 'Docker Hub', url: 'https://registry-1.docker.io', type: 'docker', icon: '🐳', defaultChecked: true, proxy: true },
   { id: 'ghcr', name: 'GitHub Container Registry', url: 'https://ghcr.io', type: 'docker', icon: '🐳', defaultChecked: false, proxy: true },
+  { id: 'quay', name: 'Red Hat (Quay) Container Registry', url: 'https://quay.io', type: 'docker', icon: '🐳', defaultChecked: false, proxy: true },
   { id: 'npm', name: 'NPM Registry', url: 'https://registry.npmjs.org', type: 'npm', icon: '📦', defaultChecked: true, proxy: true },
   { id: 'maven-central', name: 'Maven Central', url: 'https://repo.maven.apache.org/maven2', type: 'maven', icon: '☕', defaultChecked: true, proxy: true },
   { id: 'pypi', name: 'PyPI', url: 'https://pypi.org', type: 'pypi', icon: '🐍', defaultChecked: false, proxy: true },
