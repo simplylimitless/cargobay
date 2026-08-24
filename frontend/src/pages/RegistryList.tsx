@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { getRegistryLogo, REGISTRY_EMOJI } from '../lib/registryLogos'
 
 interface Registry {
   id: string
@@ -11,13 +12,31 @@ interface Registry {
   private: boolean
 }
 
-const ICONS: Record<string, string> = {
-  docker: '🐳',
-  npm: '📦',
-  maven: '☕',
-  pypi: '🐍',
-  nuget: '🔨',
-  helm: '⚓',
+// A logo image that falls back to the classic emoji icon (and then 📁) on
+// load failure — kept as its own component so each card tracks its own
+// failed-load state independently.
+function RegistryIcon({ registry }: { registry: Registry }) {
+  const [failed, setFailed] = useState(false)
+  const logo = failed ? null : getRegistryLogo(registry)
+
+  if (logo) {
+    return (
+      <div className="w-14 h-14 bg-white rounded-xl flex items-center justify-center p-2.5 group-hover:ring-2 group-hover:ring-blue-500/50 transition-all">
+        <img
+          src={logo}
+          alt={`${registry.name} logo`}
+          className="w-full h-full object-contain"
+          onError={() => setFailed(true)}
+        />
+      </div>
+    )
+  }
+
+  return (
+    <div className="w-14 h-14 bg-gray-800 rounded-xl flex items-center justify-center text-3xl group-hover:bg-blue-600/20 group-hover:text-blue-400 transition-colors">
+      {REGISTRY_EMOJI[registry.type] || '📁'}
+    </div>
+  )
 }
 
 export function RegistryList() {
@@ -81,9 +100,7 @@ export function RegistryList() {
                 className="card cursor-pointer hover:border-blue-500/50 hover:shadow-xl hover:shadow-blue-500/10 hover:-translate-y-1 transition-all group"
               >
                 <div className="flex items-start justify-between mb-4">
-                  <div className="w-14 h-14 bg-gray-800 rounded-xl flex items-center justify-center text-3xl group-hover:bg-blue-600/20 group-hover:text-blue-400 transition-colors">
-                    {ICONS[registry.type] || '📁'}
-                  </div>
+                  <RegistryIcon registry={registry} />
                   <div className="flex flex-col items-end gap-1">
                     <span className="px-3 py-1 bg-gray-800 rounded-full text-xs font-medium text-gray-400 uppercase tracking-wide">
                       {registry.type}

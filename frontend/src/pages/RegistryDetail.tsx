@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
+import { getRegistryLogo, REGISTRY_EMOJI } from '../lib/registryLogos'
 
 interface Registry {
   id: string
@@ -34,33 +35,6 @@ export function RegistryDetail() {
       .catch((err) => setError(err.message))
       .finally(() => setLoading(false))
   }, [registryId])
-
-  // Logos for known providers, matched by registry id first (so e.g. a
-  // 'ghcr' registry gets the GitHub mark rather than the generic Docker
-  // whale) and falling back to registry type. Registries that don't match
-  // either (custom/self-hosted upstreams) fall back to the letter avatar.
-  const getRegistryLogo = (reg: Registry): string | null => {
-    switch (reg.id) {
-      case 'ghcr':
-        return '/registries/github.svg'
-      case 'quay':
-        return '/registries/redhat.svg'
-    }
-    switch (reg.type) {
-      case 'docker':
-        return '/registries/docker.svg'
-      case 'npm':
-        return '/registries/npm.svg'
-      case 'maven':
-        return '/registries/maven.svg'
-      case 'pypi':
-        return '/registries/pypi.svg'
-      case 'nuget':
-        return '/registries/nuget.svg'
-      default:
-        return null
-    }
-  }
 
   const getArtifactTypes = (registryType: string) => {
     switch (registryType) {
@@ -121,6 +95,10 @@ export function RegistryDetail() {
                 className="w-full h-full object-contain"
                 onError={() => setLogoFailed(true)}
               />
+            </div>
+          ) : REGISTRY_EMOJI[registry.type] ? (
+            <div className="w-20 h-20 bg-gray-800 rounded-2xl flex items-center justify-center flex-shrink-0 text-5xl shadow-lg shadow-blue-600/20">
+              {REGISTRY_EMOJI[registry.type]}
             </div>
           ) : (
             <div className="w-20 h-20 bg-gradient-to-br from-blue-600 to-purple-600 rounded-2xl flex items-center justify-center flex-shrink-0 text-5xl shadow-lg shadow-blue-600/20">
