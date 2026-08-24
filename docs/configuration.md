@@ -178,6 +178,59 @@ directly; anything else falls back to the first enabled public proxy
 registry of that type. See [Registries](api.md#registries) in the API
 reference.
 
+### Reaching a non-mirrored upstream: the `dkr/` path prefix
+
+`registry-mirrors` only ever intercepts pulls from Docker Hub — a plain
+`docker pull ghcr.io/org/image` (or quay.io, gcr.io, etc.) goes straight to
+that upstream and never touches cargobay, no matter what's in
+`daemon.json`. Host binding (above) solves this, but needs its own
+DNS/hostname and TLS cert per upstream.
+
+As an alternative, the Docker proxy also recognizes a `dkr/` marker as the
+first path segment of a request, addressing any configured, proxy-enabled
+docker registry by path instead of by hostname — no extra DNS needed, just
+one cargobay hostname for everything:
+
+```
+docker pull cargobay.example.com/dkr/<registry-selector>/<repo>:<tag>
+```
+
+`<registry-selector>` matches a registry either by its `id` or by the
+hostname of its configured `url`. For example, with a registry configured
+as:
+
+```yaml
+registries:
+  - id: ghcr
+    name: GitHub Container Registry
+    type: docker
+    url: https://ghcr.io
+    proxy: true
+    enabled: true
+    priority: 3
+```
+
+either of these reach it:
+
+```
+docker pull cargobay.example.com/dkr/ghcr.io/org/image:tag   # by url hostname
+docker pull cargobay.example.com/dkr/ghcr/org/image:tag      # by registry id
+```
+
+The matched segment (`dkr/ghcr.io/` or `dkr/ghcr/`) is stripped before the
+remaining path is parsed as the repository/reference, so the upstream
+receives the plain `org/image:tag` reference it expects. A Host header bound
+to a specific registry still takes priority over `dkr/` matching, and a
+request path that doesn't start with `dkr/` is never treated as
+path-prefix addressing — it always resolves via Host binding or the default
+registry, exactly as before. This means an unprefixed pull, e.g.
+`docker pull cargobay.example.com/nginx:latest`, always resolves to
+whichever docker registry is configured as default (see priority above) —
+so if you drop `registry-mirrors` entirely and rely only on `dkr/`
+addressing, remember to prefix every pull explicitly, including Docker Hub
+ones: `docker pull cargobay.example.com/dkr/registry-1.docker.io/library/nginx:latest`
+(note official images need the `library/` namespace).
+
 ## Storage Backend Configuration
 
 ### Local Storage
