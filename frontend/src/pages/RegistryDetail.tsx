@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { getRegistryLogo, REGISTRY_EMOJI } from '../lib/registryLogos'
+import { useAuth } from '../context/AuthContext'
 
 interface Registry {
   id: string
@@ -16,6 +17,7 @@ interface Registry {
 export function RegistryDetail() {
   const { registryId } = useParams<{ registryId: string }>()
   const navigate = useNavigate()
+  const { token } = useAuth()
   const [registry, setRegistry] = useState<Registry | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -89,13 +91,17 @@ export function RegistryDetail() {
   const handlePrefetch = async () => {
     const reference = prefetchRef.trim()
     if (!reference || prefetching) return
+    if (!token) {
+      setPrefetchResult({ ok: false, message: 'Please log in to force-cache artifacts.' })
+      return
+    }
 
     setPrefetching(true)
     setPrefetchResult(null)
     try {
       const res = await fetch(`/api/v1/registries/${encodeURIComponent(registryId!)}/prefetch`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({ reference }),
       })
       const text = await res.text()
