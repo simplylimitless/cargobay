@@ -20,6 +20,9 @@ export function RegistryDetail() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [logoFailed, setLogoFailed] = useState(false)
+  const [prefetchRef, setPrefetchRef] = useState('')
+  const [prefetching, setPrefetching] = useState(false)
+  const [prefetchResult, setPrefetchResult] = useState<{ ok: boolean; message: string } | null>(null)
 
   useEffect(() => {
     setLoading(true)
@@ -82,6 +85,37 @@ export function RegistryDetail() {
 
   const artifactTypes = getArtifactTypes(registry.type)
   const logo = logoFailed ? null : getRegistryLogo(registry)
+
+  const handlePrefetch = async () => {
+    const reference = prefetchRef.trim()
+    if (!reference || prefetching) return
+
+    setPrefetching(true)
+    setPrefetchResult(null)
+    try {
+      const res = await fetch(`/api/v1/registries/${encodeURIComponent(registryId!)}/prefetch`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reference }),
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        setPrefetchResult({ ok: false, message: data.error || `Request failed: ${res.status}` })
+        return
+      }
+      setPrefetchResult({
+        ok: true,
+        message: data.alreadyCached
+          ? `${reference} is already cached.`
+          : `${reference} fetched from upstream and cached.`,
+      })
+      setPrefetchRef('')
+    } catch (err) {
+      setPrefetchResult({ ok: false, message: err instanceof Error ? err.message : 'Prefetch failed' })
+    } finally {
+      setPrefetching(false)
+    }
+  }
 
   return (
     <div className="space-y-8">
@@ -149,6 +183,45 @@ export function RegistryDetail() {
           </div>
         </div>
       </div>
+
+      {registry.type === 'docker' && registry.proxy && (
+        <div className="card">
+          <h2 className="text-lg font-semibold text-gray-100 mb-2">Force Cache an Artifact</h2>
+          <p className="text-sm text-gray-500 mb-4">
+            Not cached yet? Enter an image reference (e.g. <code className="text-gray-400">ubuntu:latest</code>) to
+            fetch it from upstream right now.
+          </p>
+          <div className="flex flex-col sm:flex-row gap-3">
+            <input
+              type="text"
+              value={prefetchRef}
+              onChange={(e) => setPrefetchRef(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && handlePrefetch()}
+              placeholder="ubuntu:latest"
+              className="flex-1 px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg text-gray-100 font-mono placeholder-gray-600 focus:outline-none focus:border-blue-500"
+              disabled={prefetching}
+            />
+            <button
+              onClick={handlePrefetch}
+              disabled={prefetching || !prefetchRef.trim()}
+              className="px-6 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded-lg font-medium transition-colors"
+            >
+              {prefetching ? 'Fetching...' : 'Fetch & Cache'}
+            </button>
+          </div>
+          {prefetchResult && (
+            <div
+              className={`mt-3 px-4 py-2 rounded-lg text-sm ${
+                prefetchResult.ok
+                  ? 'bg-green-500/10 border border-green-500/30 text-green-400'
+                  : 'bg-red-500/10 border border-red-500/30 text-red-400'
+              }`}
+            >
+              {prefetchResult.message}
+            </div>
+          )}
+        </div>
+      )}
 
       <div>
         <h2 className="text-2xl font-semibold text-gray-100 mb-6">Available Artifact Types</h2>

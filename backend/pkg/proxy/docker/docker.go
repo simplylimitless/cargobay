@@ -85,6 +85,36 @@ func NewDockerProxy(db *database.Database, storage storage.StorageAdapter, cache
 	return r
 }
 
+// PrefetchManifest fetches and caches a manifest for "repository:reference"
+// (e.g. "library/ubuntu" + "latest") from reg's upstream, if it isn't already
+// cached locally — the same path a real client pull of that reference would
+// take, without waiting for a client to actually request it. Returns
+// alreadyCached=true (and does not touch upstream) if a matching artifact is
+// already stored. Used by the API's on-demand cache-populate endpoint (see
+// api.Server.handlePrefetchArtifact).
+func PrefetchManifest(db *database.Database, storageAdapter storage.StorageAdapter, cacheClient *cache.Cache, scanner *vulnerability.VulnerabilityScanner, reg *database.RegistryConfig, repository, reference string) (alreadyCached bool, err error) {
+	namespace, name := splitDockerRepository(repository)
+
+	artifacts, err := db.ListArtifacts(reg.ID, database.ListOptions{
+		ArtifactType: "docker",
+		Namespace:    namespace,
+	})
+	if err != nil {
+		return false, err
+	}
+	for _, a := range artifacts {
+		if a.ArtifactName == name && (a.Version == reference || a.Digest == reference) {
+			return true, nil
+		}
+	}
+
+	p := &DockerProxy{db: db, storage: storageAdapter, cache: cacheClient, scanner: scanner}
+	if _, _, _, err := p.cacheManifestFromUpstream(target{reg: reg, label: reg.ID}, repository, reference); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
 // splitAtLast splits path at the last occurrence of sep, e.g.
 // splitAtLast("library/nginx/manifests/latest", "/manifests/") returns
 // ("library/nginx", "latest", true). Repository names never contain the

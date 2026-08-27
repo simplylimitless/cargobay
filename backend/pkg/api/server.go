@@ -14,6 +14,7 @@ import (
 	"github.com/simplylimitless/cargobay/backend/pkg/cache"
 	"github.com/simplylimitless/cargobay/backend/pkg/database"
 	"github.com/simplylimitless/cargobay/backend/pkg/middleware"
+	"github.com/simplylimitless/cargobay/backend/pkg/proxy/docker"
 	"github.com/simplylimitless/cargobay/backend/pkg/rbac"
 	"github.com/simplylimitless/cargobay/backend/pkg/searchindex"
 	"github.com/simplylimitless/cargobay/backend/pkg/storage"
@@ -159,6 +160,7 @@ func (s *Server) setupRoutes() {
 		api.Post("/registries/{id}/access", s.handleGrantRegistryAccess)
 		api.Delete("/registries/{id}/access/{userId}", s.handleRevokeRegistryAccess)
 		api.Get("/registries/{id}/access", s.handleListRegistryAccess)
+		api.Post("/registries/{id}/prefetch", s.handlePrefetchArtifact)
 
 		api.Post("/replication/sync", s.handleReplicationSync)
 
@@ -1394,6 +1396,79 @@ func (s *Server) handleDeleteRegistry(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSON(w, http.StatusOK, map[string]string{"message": "Registry deleted successfully"})
+}
+
+// handlePrefetchArtifact fetches an artifact reference (e.g. "ubuntu:latest")
+// from a registry's upstream on demand, caching it locally if it isn't
+// already cached — without waiting for a real client pull to trigger it.
+// Currently only supported for docker registries.
+func (s *Server) handlePrefetchArtifact(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	user := middleware.GetUser(r)
+	if user == nil || !s.rbac.HasEffectivePermission(user, "registry:write") {
+		s.writeJSONError(w, http.StatusForbidden, "Permission denied: registry:write required")
+		return
+	}
+
+	var body struct {
+		Reference string `json:"reference"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		s.writeJSONError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	reference := strings.TrimSpace(body.Reference)
+	if reference == "" {
+		s.writeJSONError(w, http.StatusBadRequest, "reference is required")
+		return
+	}
+
+	reg, err := s.db.GetRegistry(id)
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to load registry: %v", err))
+		return
+	}
+	if reg == nil {
+		s.writeJSONError(w, http.StatusNotFound, "Registry not found")
+		return
+	}
+	if reg.Type != "docker" {
+		s.writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("Prefetch is only supported for docker registries (got %q)", reg.Type))
+		return
+	}
+	if !reg.Proxy {
+		s.writeJSONError(w, http.StatusBadRequest, "Registry is not configured as a pull-through cache")
+		return
+	}
+
+	repository, ref := parseDockerReference(reference)
+
+	alreadyCached, err := docker.PrefetchManifest(s.db, s.storageAdapter, s.cache, s.scanner, reg, repository, ref)
+	if err != nil {
+		s.writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("Failed to fetch from upstream: %v", err))
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"repository":    repository,
+		"reference":     ref,
+		"alreadyCached": alreadyCached,
+	})
+}
+
+// parseDockerReference splits a user-supplied docker reference like
+// "ubuntu:latest", "library/ubuntu@sha256:abc...", or "myorg/myimage" (no
+// tag, defaults to "latest") into its repository and reference (tag or
+// digest) parts.
+func parseDockerReference(ref string) (repository, reference string) {
+	if idx := strings.Index(ref, "@"); idx != -1 {
+		return ref[:idx], ref[idx+1:]
+	}
+	if idx := strings.LastIndex(ref, ":"); idx != -1 {
+		return ref[:idx], ref[idx+1:]
+	}
+	return ref, "latest"
 }
 
 // handleListUsers handles listing users
