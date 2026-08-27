@@ -14,6 +14,7 @@ interface Artifact {
   Version: string
   Digest: string
   Size: number
+  TotalSize: number
   Created: string
   Tags: string[] | null
 }
@@ -260,7 +261,7 @@ export function ArtifactBrowse() {
                 <tr
                   key={artifact.ID}
                   className="hover:bg-gray-800/50 transition-colors"
-                  onClick={() => navigate(`/artifacts/${artifact.RegistryID}/${artifact.ArtifactType}/${artifact.Namespace}/${artifact.ArtifactName}/${artifact.Version}`)}
+                  onClick={() => navigate(`/registries/${artifact.RegistryID}/${artifact.ArtifactType}/${encodeURIComponent(artifact.Namespace)}/${encodeURIComponent(artifact.ArtifactName)}/${encodeURIComponent(artifact.Version)}`)}
                 >
                   <td className="px-6 py-4">
                     <div className="font-medium text-white">{artifact.ArtifactName}</div>
@@ -272,7 +273,7 @@ export function ArtifactBrowse() {
                   </td>
                   <td className="px-6 py-4 text-gray-300">{artifact.Version}</td>
                   <td className="px-6 py-4 text-gray-300">{artifact.Namespace || '-'}</td>
-                  <td className="px-6 py-4 text-gray-300">{formatSize(artifact.Size)}</td>
+                  <td className="px-6 py-4 text-gray-300">{formatSize(artifact.TotalSize || artifact.Size)}</td>
                   <td className="px-6 py-4">
                     <div className="flex flex-wrap gap-1">
                       {(artifact.Tags || []).map((tag, idx) => (
