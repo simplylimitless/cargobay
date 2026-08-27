@@ -112,22 +112,16 @@ func TestNewPyPIProxy(t *testing.T) {
 	assert.NotNil(t, router)
 }
 
-// TestHandleSimpleRootAlwaysServesFromCache exercises the "/simple/" index
-// via the full router (so the target/registry label context that
+// TestHandleSimpleRootMissFallsThroughToDatabase exercises the "/simple/"
+// index via the full router (so the target/registry label context that
 // handleSimpleRoot depends on is populated by RequireReadAccess middleware,
 // the same way it would be in production).
 //
-// Quirk (real production behavior, not a test artifact): cache.Cache.Get
-// returns a nil error on a Redis miss (redis.Nil) WITHOUT populating the
-// output value, so PyPIProxy.cacheGet reports a "hit" with nil/empty data
-// even when the key was never set. handleSimpleRoot's `if data, err :=
-// p.cacheGet(...); err == nil { ...write(data); return }` therefore always
-// takes the cache branch and returns — it never falls through to query the
-// database, regardless of whether anything was ever actually cached. So the
-// index is always StatusOK with an EMPTY body, even with matching artifacts
-// freshly seeded in the DB. We assert that real (if surprising) behavior
-// here rather than the intended one.
-func TestHandleSimpleRootAlwaysServesFromCache(t *testing.T) {
+// On a genuine cache miss, cache.Cache.Get now returns cache.ErrCacheMiss
+// (see pkg/cache/redis.go), so PyPIProxy.cacheGet correctly reports a miss
+// and handleSimpleRoot falls through to query the database instead of
+// serving an empty cached body.
+func TestHandleSimpleRootMissFallsThroughToDatabase(t *testing.T) {
 	db := connectTestDB(t)
 	c := connectTestCache(t)
 	p := newTestProxy(t, db, c)
@@ -157,16 +151,14 @@ func TestHandleSimpleRootAlwaysServesFromCache(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, "text/html", rec.Header().Get("Content-Type"))
-	assert.Empty(t, rec.Body.String())
+	assert.Contains(t, rec.Body.String(), pkgName)
 }
 
-// TestHandlePackageIndexAlwaysServesFromCache exercises
-// "/simple/{packageName}/", which hits the same cacheGet-always-"hits" quirk
-// documented on TestHandleSimpleRootAlwaysServesFromCache: even with two
-// versions freshly seeded in the DB, the handler serves an empty body from
-// its (never actually populated) cache branch instead of ever calling
-// db.ListArtifacts.
-func TestHandlePackageIndexAlwaysServesFromCache(t *testing.T) {
+// TestHandlePackageIndexMissFallsThroughToDatabase exercises
+// "/simple/{packageName}/" on a genuine cache miss: with two versions
+// freshly seeded in the DB, the handler now falls through to db.ListArtifacts
+// and serves them instead of an empty cached body.
+func TestHandlePackageIndexMissFallsThroughToDatabase(t *testing.T) {
 	db := connectTestDB(t)
 	c := connectTestCache(t)
 	p := newTestProxy(t, db, c)
@@ -198,7 +190,8 @@ func TestHandlePackageIndexAlwaysServesFromCache(t *testing.T) {
 	router.ServeHTTP(rec, req)
 
 	assert.Equal(t, http.StatusOK, rec.Code)
-	assert.Empty(t, rec.Body.String())
+	assert.Contains(t, rec.Body.String(), pkgName+"-1.0.0")
+	assert.Contains(t, rec.Body.String(), pkgName+"-2.0.0")
 }
 
 // TestHandlePackageVersionFound exercises "/simple/{packageName}/{version}/"

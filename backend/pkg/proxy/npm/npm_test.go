@@ -197,18 +197,14 @@ func TestHandlePackageCacheHit(t *testing.T) {
 	assert.Equal(t, pkgName, body["name"])
 }
 
-// TestHandlePackageCacheMissReturnsEmptyBody documents a real (and
-// surprising) behavior discovered while rewriting these tests against a
-// live Redis instance: cache.Cache.Get returns a nil error on a cache miss
-// (it only errors on an actual Redis/unmarshal failure — see
-// pkg/cache/redis.go's Get, which returns nil immediately on redis.Nil).
-// handlePackage's cache check is `if data, err := p.cacheGet(...); err ==
-// nil`, so a genuine miss satisfies that condition too: it never falls
-// through to fetchFromUpstream, and instead "succeeds" with a 200 and an
-// empty body. This mirrors the docker Tags/Metadata NOT NULL discovery: the
-// test is written to match the real, live-dependency behavior rather than
-// the old mock's (incorrect) assumption that a miss returns an error.
-func TestHandlePackageCacheMissReturnsEmptyBody(t *testing.T) {
+// TestHandlePackageCacheMissFetchesUpstream covers handlePackage on a
+// genuine cache miss: cache.Cache.Get now returns cache.ErrCacheMiss rather
+// than a nil error (see pkg/cache/redis.go), so handlePackage's
+// `if data, err := p.cacheGet(...); err == nil` check correctly falls
+// through to fetchFromUpstream instead of "succeeding" with an empty body.
+// With no upstream registry resolvable from context in this direct handler
+// call, that fetch fails and the real response is 502.
+func TestHandlePackageCacheMissFetchesUpstream(t *testing.T) {
 	db := connectTestDB(t)
 	c := connectTestCache(t)
 	p := newTestProxy(t, db, c, nil)
@@ -222,9 +218,7 @@ func TestHandlePackageCacheMissReturnsEmptyBody(t *testing.T) {
 
 	p.handlePackage(rec, req)
 
-	assert.Equal(t, http.StatusOK, rec.Code)
-	assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
-	assert.Empty(t, rec.Body.Bytes())
+	assert.Equal(t, http.StatusBadGateway, rec.Code)
 }
 
 func TestHandlePackageVersionCacheHit(t *testing.T) {
@@ -560,16 +554,16 @@ func TestCacheGetAndSet(t *testing.T) {
 	assert.Equal(t, data, retrieved)
 }
 
-// TestCacheGetMissReturnsNilNoError documents cache.Cache.Get's real
-// contract at the cacheGet wrapper level: a miss is not an error, and the
-// returned slice is simply nil/unpopulated.
-func TestCacheGetMissReturnsNilNoError(t *testing.T) {
+// TestCacheGetMissReturnsErrCacheMiss documents cache.Cache.Get's real
+// contract at the cacheGet wrapper level: a miss returns cache.ErrCacheMiss,
+// distinguishing it from a genuine hit, and the returned slice is nil.
+func TestCacheGetMissReturnsErrCacheMiss(t *testing.T) {
 	db := connectTestDB(t)
 	c := connectTestCache(t)
 	p := newTestProxy(t, db, c, nil)
 
 	retrieved, err := p.cacheGet(uniqueID("never-set-key"))
-	require.NoError(t, err)
+	require.ErrorIs(t, err, cache.ErrCacheMiss)
 	assert.Nil(t, retrieved)
 }
 

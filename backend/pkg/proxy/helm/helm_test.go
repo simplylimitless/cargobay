@@ -151,15 +151,6 @@ func TestHandleIndexRoute(t *testing.T) {
 	p := newTestProxy(t, db, c)
 	rbacMgr := rbac.New(db)
 
-	// Cache.Get (pkg/cache/redis.go) has a real bug: on a Redis cache-miss
-	// (redis.Nil) it returns a nil error instead of a miss error, and never
-	// touches the destination value. handleIndex's cache check
-	// ("if data, err := h.cacheGet(...); err == nil") therefore always
-	// looks like a hit, even on a cold cache — it just serves whatever
-	// zero-value []byte that non-error produced (empty), and the
-	// DB-generation code path below the cache check is unreachable unless
-	// the key was already populated by an earlier successful write. This
-	// is exercised directly, not worked around.
 	require.NoError(t, c.Delete("-helm-index-"))
 
 	host := uniqueID("index-host") + ".test"
@@ -192,9 +183,7 @@ func TestHandleIndexRoute(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, "application/x-yaml", rec.Header().Get("Content-Type"))
-	// A cold cache "hits" empty due to the Cache.Get bug above, so the
-	// freshly-seeded artifact never actually makes it into the response.
-	assert.Empty(t, rec.Body.String())
+	assert.Contains(t, rec.Body.String(), "nginx-ingress")
 }
 
 // TestHandleIndexServesFromCacheWhenPopulated exercises the path of

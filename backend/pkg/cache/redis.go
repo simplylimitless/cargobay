@@ -3,12 +3,18 @@ package cache
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
+
+// ErrCacheMiss is returned by Get when the key does not exist in the cache,
+// distinguishing a genuine miss from a real Redis/unmarshal error so callers
+// can tell "not cached" apart from "success."
+var ErrCacheMiss = errors.New("cache: key not found")
 
 // Cache provides Redis-based caching with multi-tier support
 type Cache struct {
@@ -103,7 +109,7 @@ func (c *Cache) Get(key string, value interface{}) error {
 	data, err := c.client.Get(ctx, key).Bytes()
 	if err != nil {
 		if err == redis.Nil {
-			return nil
+			return ErrCacheMiss
 		}
 		c.statsLock.Lock()
 		c.stats.Errors++

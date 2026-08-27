@@ -176,19 +176,11 @@ func TestHandleServiceIndex(t *testing.T) {
 	assert.Contains(t, first["@id"], "http://cargobay.test/nuget/query")
 }
 
-// TestHandleQuery documents a real bug found while writing this test against
-// a live Redis: Cache.Get treats a cache miss (redis.Nil) as success and
-// leaves the destination slice nil rather than returning a distinguishable
-// "miss" error, and handleQuery's `if data, err := n.cacheGet(...); err ==
-// nil` check can't tell that apart from an actual hit. So on a cold cache,
-// handleQuery always short-circuits and writes an empty 200 response —
-// SearchArtifacts is never even called. (The old hand-written MockCache
-// happened to return cache.ErrCacheMiss on a miss, which is why the
-// mock-based version of this test could pass.) Since this is a real,
-// pre-existing behavior and not something this test suite is allowed to
-// fix, the test asserts what actually happens over HTTP, then separately
-// verifies the DB-backed search logic it would use on a cache hit still
-// works correctly.
+// TestHandleQuery covers handleQuery on a cold cache: cache.Cache.Get now
+// returns cache.ErrCacheMiss on a miss (see pkg/cache/redis.go), so
+// handleQuery's `if data, err := n.cacheGet(...); err == nil` check
+// correctly falls through to SearchArtifacts instead of short-circuiting to
+// an empty body.
 func TestHandleQuery(t *testing.T) {
 	db := connectTestDB(t)
 	c := connectTestCache(t)
@@ -204,18 +196,16 @@ func TestHandleQuery(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
-	assert.Equal(t, 0, rec.Body.Len(), "cold-cache handleQuery short-circuits to an empty body (see comment above)")
 
-	// The DB-backed search logic handleQuery would use on an actual cache
-	// hit still works correctly.
-	artifacts, err := p.db.SearchArtifacts(name, database.SearchOptions{ArtifactType: "nuget"})
-	require.NoError(t, err)
-	require.Len(t, artifacts, 1)
-	assert.Equal(t, name, artifacts[0].ArtifactName)
+	var body map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&body))
+	results := body["data"].([]interface{})
+	require.Len(t, results, 1)
+	assert.Equal(t, name, results[0].(map[string]interface{})["id"])
 }
 
-// TestHandleSearchV2 documents the same cold-cache short-circuit bug as
-// TestHandleQuery (see its comment), for the V2 search endpoint.
+// TestHandleSearchV2 covers the same cold-cache-miss fallthrough as
+// TestHandleQuery, for the V2 search endpoint.
 func TestHandleSearchV2(t *testing.T) {
 	db := connectTestDB(t)
 	c := connectTestCache(t)
@@ -230,12 +220,7 @@ func TestHandleSearchV2(t *testing.T) {
 	p.handleSearchV2(rec, req)
 
 	assert.Equal(t, http.StatusOK, rec.Code)
-	assert.Equal(t, 0, rec.Body.Len(), "cold-cache handleSearchV2 short-circuits to an empty body (see TestHandleQuery)")
-
-	artifacts, err := p.db.SearchArtifacts(name, database.SearchOptions{ArtifactType: "nuget"})
-	require.NoError(t, err)
-	require.Len(t, artifacts, 1)
-	assert.Equal(t, name, artifacts[0].ArtifactName)
+	assert.Contains(t, rec.Body.String(), name)
 }
 
 // TestHandlePackageMetadataFound seeds under registryID "nuget" (not a
