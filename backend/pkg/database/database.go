@@ -895,12 +895,19 @@ func (db *Database) CreatePersonalAccessToken(userID, name, tokenHash string, sc
 	return &key, nil
 }
 
-// ValidateAccessKey validates an access key and updates last used timestamp
+// ValidateAccessKey validates an access key and updates its last used
+// timestamp. Session keys (key_type = 'session') also have their expires_at
+// pushed forward by 24h on every successful validation, turning the fixed
+// login expiry into a sliding idle timeout: an active session never expires,
+// while one that goes unused for 24h has a stale expires_at that the WHERE
+// clause below then excludes. Personal access tokens keep the fixed expiry
+// the user chose when creating them.
 func (db *Database) ValidateAccessKey(keyHash string) (*AccessKey, error) {
 	now := time.Now()
 	row := db.pool.QueryRow(
 		context.Background(),
-		`UPDATE access_keys SET last_used = $1
+		`UPDATE access_keys SET last_used = $1,
+		 expires_at = CASE WHEN key_type = 'session' THEN $1 + INTERVAL '24 hours' ELSE expires_at END
 		 WHERE key_hash = $2 AND is_active = TRUE AND (expires_at IS NULL OR expires_at > $1)
 		 RETURNING id, user_id, name, key_hash, permissions, created_at, last_used, expires_at, is_active, key_type`,
 		now, keyHash,
