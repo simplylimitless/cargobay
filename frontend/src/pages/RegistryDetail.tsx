@@ -98,9 +98,19 @@ export function RegistryDetail() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ reference }),
       })
-      const data = await res.json()
+      const text = await res.text()
+      let data: { error?: string; alreadyCached?: boolean } = {}
+      try {
+        data = text ? JSON.parse(text) : {}
+      } catch {
+        // Non-JSON body (e.g. a plain-text 401 from auth middleware) — fall through
+        // to the raw text/status below instead of throwing.
+      }
       if (!res.ok) {
-        setPrefetchResult({ ok: false, message: data.error || `Request failed: ${res.status}` })
+        setPrefetchResult({
+          ok: false,
+          message: res.status === 401 ? 'Please log in to force-cache artifacts.' : data.error || text || `Request failed: ${res.status}`,
+        })
         return
       }
       setPrefetchResult({
