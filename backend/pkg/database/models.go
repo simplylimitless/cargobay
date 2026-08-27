@@ -22,6 +22,7 @@ type ArtifactMetadata struct {
 	Tags            []string       `db:"tags"`
 	Signatures      []Signature    `db:"signatures"`
 	Downloads       int64          `db:"downloads"`
+	BandwidthSaved  int64          `db:"bandwidth_saved"`
 }
 
 // Signature represents a digital signature on an artifact

@@ -10,6 +10,7 @@ interface TopArtifact {
   ArtifactName: string
   Version: string
   Downloads: number
+  BandwidthSaved: number
 }
 
 interface StatsResponse {
@@ -99,6 +100,7 @@ export function Stats() {
                       <th className="px-3 py-2">#</th>
                       <th className="px-3 py-2">Artifact</th>
                       <th className="px-3 py-2">Registry</th>
+                      <th className="px-3 py-2 text-right">Bandwidth Saved</th>
                       <th className="px-3 py-2 text-right">Pulls</th>
                     </tr>
                   </thead>
@@ -121,6 +123,7 @@ export function Stats() {
                         <td className="px-3 py-3">
                           <span className="badge badge-info">{artifact.ArtifactType}</span>
                         </td>
+                        <td className="px-3 py-3 text-right text-gray-400">{formatBytes(artifact.BandwidthSaved || 0)}</td>
                         <td className="px-3 py-3 text-right text-gray-200 font-medium">{formatCount(artifact.Downloads)}</td>
                       </tr>
                     ))}

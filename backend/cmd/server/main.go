@@ -79,8 +79,8 @@ func main() {
 	// page. Used everywhere artifacts are actually served to a client;
 	// scanning/readiness checks keep the untracked adapter since those reads
 	// don't represent bandwidth a client would otherwise have consumed.
-	trackedStorage := storage.NewTrackingAdapter(storageAdapter, func(bytesServed int64) {
-		if err := db.IncrementBandwidthSaved(bytesServed); err != nil {
+	trackedStorage := storage.NewTrackingAdapter(storageAdapter, func(registryID, namespace, artifactName, version string, bytesServed int64) {
+		if err := db.IncrementArtifactBandwidthSaved(registryID, namespace, artifactName, version, bytesServed); err != nil {
 			log.Printf("failed to record bandwidth saved: %v", err)
 		}
 	})
