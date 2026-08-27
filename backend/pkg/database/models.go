@@ -98,6 +98,12 @@ type RegistryConfig struct {
 	// the frontend can show "credential configured" without ever receiving
 	// the secret itself.
 	HasUpstreamSecret bool `db:"-" json:"hasUpstreamSecret"`
+	// Members is an ordered list of other registry IDs this registry
+	// aggregates, used by "virtual" registry types (e.g. "maven-virtual")
+	// that have no upstream URL of their own -- artifacts are resolved by
+	// trying each member in order until one has it. Empty/nil for a normal,
+	// single-upstream registry.
+	Members []string `db:"members" json:"members,omitempty"`
 }
 
 // RegistryAccess grants a specific user read and/or publish rights on a

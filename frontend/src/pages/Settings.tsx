@@ -7,7 +7,7 @@ import { formatDateTime, listTimezones } from '../lib/datetime'
 
 const REGISTRY_TYPE_GROUPS: [string, string[]][] = [
   ['Containers & Orchestration', ['docker', 'oci', 'helm']],
-  ['Java & JVM', ['maven', 'gradle', 'sbt']],
+  ['Java & JVM', ['maven', 'maven-virtual', 'gradle', 'sbt']],
   ['JavaScript & Web', ['npm', 'bower']],
   ['Python', ['pypi', 'conda']],
   ['.NET', ['nuget']],
@@ -50,6 +50,9 @@ interface Registry {
   upstreamAuthType: string
   upstreamUsername: string
   hasUpstreamSecret: boolean
+  // Ordered member registry IDs for a "maven-virtual" registry (see
+  // backend RegistryConfig.Members) - empty/absent for a normal registry.
+  members?: string[]
 }
 
 interface RegistryAccessGrant {
@@ -74,6 +77,7 @@ const EMPTY_REGISTRY_FORM = {
   upstreamUsername: '',
   upstreamSecret: '',
   hasUpstreamSecret: false,
+  members: [] as string[],
 }
 const EMPTY_USER_FORM = { username: '', email: '', password: '', role: 'viewer' }
 const AVAILABLE_ROLES = ['admin', 'publisher', 'viewer']
@@ -700,7 +704,7 @@ export function Settings() {
     setEditingRegistry(true)
     // upstreamSecret is never returned by the API (write-only) - leaving it
     // blank here means "keep whatever's already stored" on save.
-    setRegistryForm({ ...reg, upstreamSecret: '' })
+    setRegistryForm({ ...reg, upstreamSecret: '', members: reg.members || [] })
     setRegistrySaveError(null)
     setShowRegistryForm(true)
     setAccessGrants([])
@@ -710,8 +714,13 @@ export function Settings() {
 
   const saveRegistry = async () => {
     if (!token) return
-    if (!registryForm.id || !registryForm.name || !registryForm.url) {
+    const isVirtual = registryForm.type === 'maven-virtual'
+    if (!registryForm.id || !registryForm.name || (!isVirtual && !registryForm.url)) {
       setRegistrySaveError('id, name, and url are required')
+      return
+    }
+    if (isVirtual && registryForm.members.length === 0) {
+      setRegistrySaveError('A virtual Maven repository requires at least one member registry')
       return
     }
     // A newly created proxy registry that leaves Host blank, when another
@@ -1013,18 +1022,20 @@ export function Settings() {
                     placeholder="e.g. My NPM Mirror"
                   />
                 </label>
-                <label className="text-sm text-gray-400 md:col-span-2">
-                  {registryForm.proxy ? 'Upstream URL' : 'URL'}
-                  <input
-                    className="mt-1 w-full bg-gray-900 border border-gray-700 rounded px-3 py-1.5 text-gray-100 font-mono"
-                    value={registryForm.url}
-                    onChange={(e) => setRegistryForm({ ...registryForm, url: e.target.value })}
-                    placeholder="https://registry.npmjs.org"
-                  />
-                  {registryForm.proxy && (
-                    <span className="text-xs text-gray-600 font-normal">Cargobay pulls from and caches this URL on demand.</span>
-                  )}
-                </label>
+                {registryForm.type !== 'maven-virtual' && (
+                  <label className="text-sm text-gray-400 md:col-span-2">
+                    {registryForm.proxy ? 'Upstream URL' : 'URL'}
+                    <input
+                      className="mt-1 w-full bg-gray-900 border border-gray-700 rounded px-3 py-1.5 text-gray-100 font-mono"
+                      value={registryForm.url}
+                      onChange={(e) => setRegistryForm({ ...registryForm, url: e.target.value })}
+                      placeholder="https://registry.npmjs.org"
+                    />
+                    {registryForm.proxy && (
+                      <span className="text-xs text-gray-600 font-normal">Cargobay pulls from and caches this URL on demand.</span>
+                    )}
+                  </label>
+                )}
                 <label className="text-sm text-gray-400">
                   Type
                   <select
@@ -1068,14 +1079,16 @@ export function Settings() {
                     />
                     Enabled
                   </label>
-                  <label className="flex items-center gap-2 text-sm text-gray-400">
-                    <input
-                      type="checkbox"
-                      checked={registryForm.proxy}
-                      onChange={(e) => setRegistryForm({ ...registryForm, proxy: e.target.checked })}
-                    />
-                    Upstream Proxy
-                  </label>
+                  {registryForm.type !== 'maven-virtual' && (
+                    <label className="flex items-center gap-2 text-sm text-gray-400">
+                      <input
+                        type="checkbox"
+                        checked={registryForm.proxy}
+                        onChange={(e) => setRegistryForm({ ...registryForm, proxy: e.target.checked })}
+                      />
+                      Upstream Proxy
+                    </label>
+                  )}
                   <label className="flex items-center gap-2 text-sm text-gray-400">
                     <input
                       type="checkbox"
@@ -1087,7 +1100,81 @@ export function Settings() {
                 </div>
               </div>
 
-              {registryForm.proxy && (
+              {registryForm.type === 'maven-virtual' && (
+                <div className="pt-3 border-t border-gray-700 space-y-3">
+                  <h4 className="text-sm font-medium text-gray-300">
+                    Member Repositories
+                    <span className="text-gray-600 font-normal"> — tried in order; the first one with the artifact is used and cached</span>
+                  </h4>
+                  <div className="flex gap-2">
+                    <select
+                      className="flex-1 bg-gray-900 border border-gray-700 rounded px-3 py-1.5 text-gray-100"
+                      value=""
+                      onChange={(e) => {
+                        const id = e.target.value
+                        if (id && !registryForm.members.includes(id)) {
+                          setRegistryForm({ ...registryForm, members: [...registryForm.members, id] })
+                        }
+                      }}
+                    >
+                      <option value="">Add member registry…</option>
+                      {registries
+                        .filter((r) => r.type === 'maven' && !registryForm.members.includes(r.id))
+                        .map((r) => (
+                          <option key={r.id} value={r.id}>{r.name} ({r.id})</option>
+                        ))}
+                    </select>
+                  </div>
+                  {registryForm.members.length === 0 ? (
+                    <p className="text-sm text-gray-500">No members added yet.</p>
+                  ) : (
+                    <ul className="space-y-1">
+                      {registryForm.members.map((memberId, idx) => (
+                        <li
+                          key={memberId}
+                          className="flex items-center gap-2 bg-gray-900 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200"
+                        >
+                          <span className="text-gray-500 w-5">{idx + 1}.</span>
+                          <span className="flex-1 font-mono">{memberId}</span>
+                          <button
+                            type="button"
+                            className="text-gray-400 hover:text-white disabled:opacity-30"
+                            disabled={idx === 0}
+                            onClick={() => {
+                              const members = [...registryForm.members]
+                              ;[members[idx - 1], members[idx]] = [members[idx], members[idx - 1]]
+                              setRegistryForm({ ...registryForm, members })
+                            }}
+                          >
+                            ↑
+                          </button>
+                          <button
+                            type="button"
+                            className="text-gray-400 hover:text-white disabled:opacity-30"
+                            disabled={idx === registryForm.members.length - 1}
+                            onClick={() => {
+                              const members = [...registryForm.members]
+                              ;[members[idx + 1], members[idx]] = [members[idx], members[idx + 1]]
+                              setRegistryForm({ ...registryForm, members })
+                            }}
+                          >
+                            ↓
+                          </button>
+                          <button
+                            type="button"
+                            className="text-red-400 hover:text-red-300"
+                            onClick={() => setRegistryForm({ ...registryForm, members: registryForm.members.filter((m) => m !== memberId) })}
+                          >
+                            Remove
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )}
+
+              {registryForm.proxy && registryForm.type !== 'maven-virtual' && (
                 <div className="pt-3 border-t border-gray-700 space-y-3">
                   <h4 className="text-sm font-medium text-gray-300">
                     Upstream authentication

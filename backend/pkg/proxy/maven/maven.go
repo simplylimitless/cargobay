@@ -12,12 +12,14 @@ package maven
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/simplylimitless/cargobay/backend/pkg/cache"
 	"github.com/simplylimitless/cargobay/backend/pkg/database"
+	"github.com/simplylimitless/cargobay/backend/pkg/middleware"
 	proxypkg "github.com/simplylimitless/cargobay/backend/pkg/proxy"
 	"github.com/simplylimitless/cargobay/backend/pkg/rbac"
 	"github.com/simplylimitless/cargobay/backend/pkg/storage"
@@ -26,11 +28,12 @@ import (
 
 // MavenProxy implements the Maven Repository API proxy
 type MavenProxy struct {
-	db       *database.Database
-	storage  storage.StorageAdapter
-	cache    *cache.Cache
+	db         *database.Database
+	storage    storage.StorageAdapter
+	cache      *cache.Cache
+	rbacMgr    *rbac.RBAC
 	registries []database.RegistryConfig
-	registry string
+	registry   string
 }
 
 // NewMavenProxy creates a new Maven proxy instance
@@ -55,6 +58,7 @@ func newMavenProxy(db *database.Database, storage storage.StorageAdapter, cache 
 		db:         db,
 		storage:    storage,
 		cache:      cache,
+		rbacMgr:    rbacMgr,
 		registries: registries,
 		registry:   artifactType,
 	}
@@ -119,26 +123,12 @@ func (p *MavenProxy) handleJAR(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Fetch from upstream
-	tarballURL, err := p.getUpstreamURL(t.Reg, group, artifact, version, "jar")
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to get JAR upstream URL: %v", err), http.StatusBadGateway)
-		return
-	}
-	req, err := http.NewRequest(http.MethodGet, tarballURL, nil)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to build JAR request: %v", err), http.StatusInternalServerError)
-		return
-	}
-	proxypkg.ApplyUpstreamAuth(req, t.Reg)
-	resp, err := http.DefaultClient.Do(req)
+	candidates := p.resolveUpstreamCandidates(middleware.GetUser(r), t.Reg)
+	data, err := p.fetchUpstream(candidates, group, artifact, version, "jar")
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to download JAR: %v", err), http.StatusBadGateway)
 		return
 	}
-	defer resp.Body.Close()
-
-	data := make([]byte, resp.ContentLength)
-	resp.Body.Read(data)
 
 	// Save to storage
 	if _, err := p.storage.SaveArtifact("maven", group, artifact, version, data); err != nil {
@@ -173,26 +163,12 @@ func (p *MavenProxy) handlePOM(w http.ResponseWriter, r *http.Request) {
 
 	// Fetch from upstream
 	t := proxypkg.TargetFromContext(r, "maven")
-	tarballURL, err := p.getUpstreamURL(t.Reg, group, artifact, version, "pom")
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to get POM upstream URL: %v", err), http.StatusBadGateway)
-		return
-	}
-	req, err := http.NewRequest(http.MethodGet, tarballURL, nil)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to build POM request: %v", err), http.StatusInternalServerError)
-		return
-	}
-	proxypkg.ApplyUpstreamAuth(req, t.Reg)
-	resp, err := http.DefaultClient.Do(req)
+	candidates := p.resolveUpstreamCandidates(middleware.GetUser(r), t.Reg)
+	data, err := p.fetchUpstream(candidates, group, artifact, version, "pom")
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to download POM: %v", err), http.StatusBadGateway)
 		return
 	}
-	defer resp.Body.Close()
-
-	data := make([]byte, resp.ContentLength)
-	resp.Body.Read(data)
 
 	// Save to storage
 	if _, err := p.storage.SaveArtifact("maven", group, artifact, version, data); err != nil {
@@ -239,26 +215,12 @@ func (p *MavenProxy) handleArtifactFile(w http.ResponseWriter, r *http.Request, 
 
 	// Fetch from upstream
 	t := proxypkg.TargetFromContext(r, "maven")
-	upstreamURL, err := p.getUpstreamURL(t.Reg, group, artifact, version, ext)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to get %s upstream URL: %v", ext, err), http.StatusBadGateway)
-		return
-	}
-	req, err := http.NewRequest(http.MethodGet, upstreamURL, nil)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to build %s request: %v", ext, err), http.StatusInternalServerError)
-		return
-	}
-	proxypkg.ApplyUpstreamAuth(req, t.Reg)
-	resp, err := http.DefaultClient.Do(req)
+	candidates := p.resolveUpstreamCandidates(middleware.GetUser(r), t.Reg)
+	data, err := p.fetchUpstream(candidates, group, artifact, version, ext)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to download %s: %v", ext, err), http.StatusBadGateway)
 		return
 	}
-	defer resp.Body.Close()
-
-	data := make([]byte, resp.ContentLength)
-	resp.Body.Read(data)
 
 	// Save to storage
 	if _, err := p.storage.SaveArtifact("maven", group, artifact, version, data); err != nil {
@@ -400,4 +362,78 @@ func (p *MavenProxy) getUpstreamURL(reg *database.RegistryConfig, group, artifac
 	// Maven path: group/artifact/version/artifact-version.ext
 	groupPath := strings.ReplaceAll(group, ".", "/")
 	return fmt.Sprintf("%s/%s/%s/%s/%s-%s.%s", reg.URL, groupPath, artifact, version, artifact, version, ext), nil
+}
+
+// resolveUpstreamCandidates returns the ordered registries to try upstream
+// for reg. A plain registry is just itself. A "maven-virtual" registry has
+// no upstream URL of its own -- it resolves each of its Members by ID,
+// skipping any that are missing, disabled, not type "maven" (no nested
+// virtuals), or that the requesting user can't read -- so a public virtual
+// repo can't be used to route around a private member's own access grants.
+func (p *MavenProxy) resolveUpstreamCandidates(user *middleware.User, reg *database.RegistryConfig) []*database.RegistryConfig {
+	if reg == nil {
+		return nil
+	}
+	if reg.Type != "maven-virtual" {
+		return []*database.RegistryConfig{reg}
+	}
+
+	candidates := make([]*database.RegistryConfig, 0, len(reg.Members))
+	for _, memberID := range reg.Members {
+		member, err := p.db.GetRegistry(memberID)
+		if err != nil || member == nil || !member.Enabled || member.Type != "maven" {
+			continue
+		}
+		if !p.rbacMgr.CanReadRegistry(user, member) {
+			continue
+		}
+		candidates = append(candidates, member)
+	}
+	return candidates
+}
+
+// fetchUpstream tries each candidate in order, building the upstream URL via
+// getUpstreamURL and applying the candidate's own upstream auth, and returns
+// the first successful (HTTP 200) body. Returns an error naming the last
+// failure if every candidate fails or none are eligible.
+func (p *MavenProxy) fetchUpstream(candidates []*database.RegistryConfig, group, artifact, version, ext string) ([]byte, error) {
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("no upstream proxy configured for this registry")
+	}
+
+	var lastErr error
+	for _, cand := range candidates {
+		upstreamURL, err := p.getUpstreamURL(cand, group, artifact, version, ext)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		req, err := http.NewRequest(http.MethodGet, upstreamURL, nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		proxypkg.ApplyUpstreamAuth(req, cand)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			lastErr = fmt.Errorf("upstream %s returned status %d", cand.ID, resp.StatusCode)
+			continue
+		}
+		data, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return data, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no upstream candidate available")
+	}
+	return nil, lastErr
 }

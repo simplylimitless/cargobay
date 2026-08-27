@@ -1279,6 +1279,28 @@ func (s *Server) handleCreateRegistry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if registry.Type == "maven-virtual" {
+		if len(registry.Members) == 0 {
+			s.writeJSONError(w, http.StatusBadRequest, "A virtual Maven repository requires at least one member registry")
+			return
+		}
+		for _, memberID := range registry.Members {
+			member, err := s.db.GetRegistry(memberID)
+			if err != nil || member == nil {
+				s.writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("Member registry %q not found", memberID))
+				return
+			}
+			if !member.Enabled {
+				s.writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("Member registry %q must be enabled", memberID))
+				return
+			}
+			if member.Type != "maven" {
+				s.writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("Member registry %q must be of type \"maven\" (nested virtual repositories are not supported)", memberID))
+				return
+			}
+		}
+	}
+
 	err := s.db.SaveRegistry(&registry)
 	if err != nil {
 		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to save registry: %v", err))

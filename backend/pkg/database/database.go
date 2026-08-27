@@ -1026,7 +1026,8 @@ func (db *Database) listRegistries(whereClause string) ([]RegistryConfig, error)
 	rows, err := db.pool.Query(
 		context.Background(),
 		`SELECT id, name, url, type, enabled, priority, private, proxy, COALESCE(host, ''),
-		        upstream_auth_type, COALESCE(upstream_username, ''), (upstream_secret IS NOT NULL AND upstream_secret != '')
+		        upstream_auth_type, COALESCE(upstream_username, ''), (upstream_secret IS NOT NULL AND upstream_secret != ''),
+		        COALESCE(members, '{}')
 		 FROM registries `+whereClause+`ORDER BY priority ASC`,
 	)
 	if err != nil {
@@ -1038,7 +1039,7 @@ func (db *Database) listRegistries(whereClause string) ([]RegistryConfig, error)
 	for rows.Next() {
 		var r RegistryConfig
 		err := rows.Scan(&r.ID, &r.Name, &r.URL, &r.Type, &r.Enabled, &r.Priority, &r.Private, &r.Proxy, &r.Host,
-			&r.UpstreamAuthType, &r.UpstreamUsername, &r.HasUpstreamSecret)
+			&r.UpstreamAuthType, &r.UpstreamUsername, &r.HasUpstreamSecret, &r.Members)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan registry: %w", err)
 		}
@@ -1052,14 +1053,15 @@ func (db *Database) GetRegistry(id string) (*RegistryConfig, error) {
 	row := db.pool.QueryRow(
 		context.Background(),
 		`SELECT id, name, url, type, enabled, priority, private, proxy, COALESCE(host, ''),
-		        upstream_auth_type, COALESCE(upstream_username, ''), COALESCE(upstream_secret, '')
+		        upstream_auth_type, COALESCE(upstream_username, ''), COALESCE(upstream_secret, ''),
+		        COALESCE(members, '{}')
 		 FROM registries WHERE id = $1`,
 		id,
 	)
 
 	var r RegistryConfig
 	err := row.Scan(&r.ID, &r.Name, &r.URL, &r.Type, &r.Enabled, &r.Priority, &r.Private, &r.Proxy, &r.Host,
-		&r.UpstreamAuthType, &r.UpstreamUsername, &r.UpstreamSecret)
+		&r.UpstreamAuthType, &r.UpstreamUsername, &r.UpstreamSecret, &r.Members)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -1081,14 +1083,15 @@ func (db *Database) GetRegistryByHost(host string) (*RegistryConfig, error) {
 	row := db.pool.QueryRow(
 		context.Background(),
 		`SELECT id, name, url, type, enabled, priority, private, proxy, COALESCE(host, ''),
-		        upstream_auth_type, COALESCE(upstream_username, ''), COALESCE(upstream_secret, '')
+		        upstream_auth_type, COALESCE(upstream_username, ''), COALESCE(upstream_secret, ''),
+		        COALESCE(members, '{}')
 		 FROM registries WHERE host = $1 AND enabled = TRUE`,
 		host,
 	)
 
 	var r RegistryConfig
 	err := row.Scan(&r.ID, &r.Name, &r.URL, &r.Type, &r.Enabled, &r.Priority, &r.Private, &r.Proxy, &r.Host,
-		&r.UpstreamAuthType, &r.UpstreamUsername, &r.UpstreamSecret)
+		&r.UpstreamAuthType, &r.UpstreamUsername, &r.UpstreamSecret, &r.Members)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -1103,19 +1106,27 @@ func (db *Database) GetRegistryByHost(host string) (*RegistryConfig, error) {
 // proxy-enabled registry of the given type — the fallback target for
 // protocol-proxy requests that don't match any registry's bound Host.
 func (db *Database) GetDefaultRegistry(artifactType string) (*RegistryConfig, error) {
+	// "maven-virtual" registries have no upstream URL/proxy of their own —
+	// they aggregate other "maven" registries via Members — but they still
+	// need to be selectable as the default registry for "maven" requests.
+	types := []string{artifactType}
+	if artifactType == "maven" {
+		types = append(types, "maven-virtual")
+	}
 	row := db.pool.QueryRow(
 		context.Background(),
 		`SELECT id, name, url, type, enabled, priority, private, proxy, COALESCE(host, ''),
-		        upstream_auth_type, COALESCE(upstream_username, ''), COALESCE(upstream_secret, '')
+		        upstream_auth_type, COALESCE(upstream_username, ''), COALESCE(upstream_secret, ''),
+		        COALESCE(members, '{}')
 		 FROM registries
-		 WHERE type = $1 AND enabled = TRUE AND private = FALSE AND proxy = TRUE
+		 WHERE type = ANY($1) AND enabled = TRUE AND private = FALSE AND (proxy = TRUE OR type = 'maven-virtual')
 		 ORDER BY priority ASC LIMIT 1`,
-		artifactType,
+		types,
 	)
 
 	var r RegistryConfig
 	err := row.Scan(&r.ID, &r.Name, &r.URL, &r.Type, &r.Enabled, &r.Priority, &r.Private, &r.Proxy, &r.Host,
-		&r.UpstreamAuthType, &r.UpstreamUsername, &r.UpstreamSecret)
+		&r.UpstreamAuthType, &r.UpstreamUsername, &r.UpstreamSecret, &r.Members)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -1135,8 +1146,8 @@ func (db *Database) SaveRegistry(config *RegistryConfig) error {
 	}
 	_, err := db.pool.Exec(
 		context.Background(),
-		`INSERT INTO registries (id, name, url, type, enabled, priority, private, proxy, host, upstream_auth_type, upstream_username, upstream_secret)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''), $10, NULLIF($11, ''), NULLIF($12, ''))
+		`INSERT INTO registries (id, name, url, type, enabled, priority, private, proxy, host, upstream_auth_type, upstream_username, upstream_secret, members)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''), $10, NULLIF($11, ''), NULLIF($12, ''), $13)
 		 ON CONFLICT (id)
 		 DO UPDATE SET
 		   name = EXCLUDED.name,
@@ -1149,9 +1160,10 @@ func (db *Database) SaveRegistry(config *RegistryConfig) error {
 		   host = EXCLUDED.host,
 		   upstream_auth_type = EXCLUDED.upstream_auth_type,
 		   upstream_username = EXCLUDED.upstream_username,
-		   upstream_secret = COALESCE(EXCLUDED.upstream_secret, registries.upstream_secret)`,
+		   upstream_secret = COALESCE(EXCLUDED.upstream_secret, registries.upstream_secret),
+		   members = EXCLUDED.members`,
 		config.ID, config.Name, config.URL, config.Type, config.Enabled, config.Priority, config.Private, config.Proxy, config.Host,
-		config.UpstreamAuthType, config.UpstreamUsername, config.UpstreamSecret,
+		config.UpstreamAuthType, config.UpstreamUsername, config.UpstreamSecret, config.Members,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to save registry: %w", err)

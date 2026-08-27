@@ -36,7 +36,7 @@ func HostOnly(host string) string {
 // matched registry has proxying disabled).
 func ResolveRegistry(db *database.Database, registries []database.RegistryConfig, requestHost, artifactType string) *database.RegistryConfig {
 	if host := HostOnly(requestHost); host != "" {
-		if reg, err := db.GetRegistryByHost(host); err == nil && reg != nil && reg.Type == artifactType {
+		if reg, err := db.GetRegistryByHost(host); err == nil && reg != nil && registryTypeMatches(reg.Type, artifactType) {
 			return reg
 		}
 	}
@@ -75,6 +75,18 @@ func ResolveRegistryWithPathPrefix(db *database.Database, requestHost, path, art
 		return reg, path
 	}
 	return nil, path
+}
+
+// registryTypeMatches reports whether a registry of type regType satisfies
+// a request for artifactType. Equal types always match; "maven-virtual" is
+// additionally treated as satisfying "maven" — it has no upstream URL of
+// its own (see RegistryConfig.Members) but must still be selectable
+// wherever a "maven" registry is expected.
+func registryTypeMatches(regType, artifactType string) bool {
+	if regType == artifactType {
+		return true
+	}
+	return artifactType == "maven" && regType == "maven-virtual"
 }
 
 // matchRegistryByPrefix finds an enabled, proxy-enabled registry of
