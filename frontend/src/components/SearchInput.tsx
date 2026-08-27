@@ -24,6 +24,28 @@ export function SearchInput() {
     navigate(`/search?q=${encodeURIComponent(q.trim())}`)
   }
 
+  // Suggestions are exact artifact names, not free-text queries — if the
+  // name resolves to exactly one artifact, go straight to it instead of
+  // dropping the user on the (often multi-result) search page.
+  const selectSuggestion = (name: string) => {
+    setShowDropdown(false)
+    fetch(`/api/v1/search?q=${encodeURIComponent(name)}&limit=5`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((results: Array<{ RegistryID: string; ArtifactType: string; Namespace: string; ArtifactName: string }> | null) => {
+        const matches = (results || []).filter((a) => a.ArtifactName === name)
+        if (matches.length === 1) {
+          const a = matches[0]
+          const path = a.Namespace
+            ? `/registries/${a.RegistryID}/${a.ArtifactType}/${a.Namespace}/${a.ArtifactName}`
+            : `/registries/${a.RegistryID}/${a.ArtifactType}/${a.ArtifactName}`
+          navigate(path)
+        } else {
+          goToSearch(name)
+        }
+      })
+      .catch(() => goToSearch(name))
+  }
+
   const handleChange = (value: string) => {
     setQuery(value)
     setActiveIndex(-1)
@@ -52,7 +74,7 @@ export function SearchInput() {
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
     if (activeIndex >= 0 && suggestions[activeIndex]) {
-      goToSearch(suggestions[activeIndex])
+      selectSuggestion(suggestions[activeIndex])
     } else {
       goToSearch(query)
     }
@@ -102,7 +124,7 @@ export function SearchInput() {
               <button
                 type="button"
                 onMouseDown={(e) => e.preventDefault()}
-                onClick={() => goToSearch(s)}
+                onClick={() => selectSuggestion(s)}
                 onMouseEnter={() => setActiveIndex(idx)}
                 className={`w-full text-left px-4 py-2 text-sm transition-colors ${
                   idx === activeIndex ? 'bg-gray-700 text-blue-300' : 'text-gray-200 hover:bg-gray-700'
