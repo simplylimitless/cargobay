@@ -209,7 +209,7 @@ export function ArtifactBrowse() {
         <div className="card p-4">
           <div className="text-sm text-gray-400">Total Size</div>
           <div className="text-2xl font-bold text-white mt-1">
-            {formatSize(filteredArtifacts.reduce((sum, a) => sum + a.Size, 0))}
+            {formatSize(filteredArtifacts.reduce((sum, a) => sum + (a.TotalSize || a.Size), 0))}
           </div>
         </div>
         <div className="card p-4">
