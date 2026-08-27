@@ -47,6 +47,7 @@ interface Artifact {
   Size: number
   TotalSize: number
   Created: string
+  Updated: string
   Tags: string[] | null
   Signatures: { type: string; verified: boolean; timestamp?: string }[] | null
   Metadata: Record<string, any> | null
@@ -318,6 +319,12 @@ export function ArtifactVersion() {
               <div className="text-sm text-gray-500">Created</div>
               <div className="font-medium text-white">{formatTimestamp(artifact.Created)}</div>
             </div>
+            {artifact.Updated && (
+              <div>
+                <div className="text-sm text-gray-500">Cached</div>
+                <div className="font-medium text-white">{formatTimestamp(artifact.Updated)}</div>
+              </div>
+            )}
             <div>
               <div className="text-sm text-gray-500">Pulls</div>
               <div className="font-medium text-white">{formatPulls(artifact.Downloads || 0)}</div>

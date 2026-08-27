@@ -16,6 +16,7 @@ interface Artifact {
   Size: number
   TotalSize: number
   Created: string
+  Updated: string
   Tags: string[] | null
   Signatures: { type: string; verified: boolean }[] | null
   Metadata: Record<string, any> | null
@@ -303,6 +304,7 @@ export function ArtifactDetail() {
                     </div>
                     <div className="text-sm text-gray-500">
                       Last pushed {timeAgo(v.Created)} · {formatSize(v.TotalSize || v.Size)} · {formatPulls(v.Downloads || 0)} pulls
+                      {v.Updated && <> · Cached {timeAgo(v.Updated)}</>}
                     </div>
                   </div>
                   {canManage(v.Metadata?.uploadedBy) && (
