@@ -1,6 +1,11 @@
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, NavLink, useNavigate } from 'react-router-dom'
 import { SearchInput } from './SearchInput'
 import { useAuth } from '../context/AuthContext'
+
+const navLinkClass = ({ isActive }: { isActive: boolean }) =>
+  `hidden md:block px-3 py-1.5 text-sm font-medium rounded-lg transition-all ${
+    isActive ? 'text-white bg-gray-800' : 'text-gray-300 hover:text-white hover:bg-gray-800'
+  }`
 
 export function Navbar() {
   const navigate = useNavigate()
@@ -30,51 +35,33 @@ export function Navbar() {
           </div>
 
           <div className="flex items-center gap-3">
-            <Link
-              to="/getting-started"
-              className="hidden md:block px-3 py-1.5 text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-800 rounded-lg transition-all"
-            >
+            <NavLink to="/getting-started" className={navLinkClass}>
               Guide
-            </Link>
+            </NavLink>
             {currentUser && (
               <>
-                <Link
-                  to="/upload"
-                  className="hidden md:block px-3 py-1.5 text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-800 rounded-lg transition-all"
-                >
+                <NavLink to="/upload" className={navLinkClass}>
                   Upload
-                </Link>
-                <Link
-                  to="/browse"
-                  className="hidden md:block px-3 py-1.5 text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-800 rounded-lg transition-all"
-                >
+                </NavLink>
+                <NavLink to="/browse" className={navLinkClass}>
                   Browse
-                </Link>
-                <Link
-                  to="/stats"
-                  className="hidden md:block px-3 py-1.5 text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-800 rounded-lg transition-all"
-                >
+                </NavLink>
+                <NavLink to="/stats" className={navLinkClass}>
                   Stats
-                </Link>
+                </NavLink>
               </>
             )}
             {isAdmin && (
-              <Link
-                to="/vulnerabilities"
-                className="hidden md:block px-3 py-1.5 text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-800 rounded-lg transition-all"
-              >
+              <NavLink to="/vulnerabilities" className={navLinkClass}>
                 Vulnerabilities
-              </Link>
+              </NavLink>
             )}
             {currentUser ? (
               <div className="flex items-center gap-2">
                 {isAdmin && (
-                  <Link
-                    to="/settings"
-                    className="hidden md:block px-3 py-1.5 text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-800 rounded-lg transition-all"
-                  >
+                  <NavLink to="/settings" className={navLinkClass}>
                     Settings
-                  </Link>
+                  </NavLink>
                 )}
                 <Link
                   to="/profile"
