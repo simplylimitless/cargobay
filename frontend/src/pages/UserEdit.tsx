@@ -15,10 +15,11 @@ const AVAILABLE_ROLES = ['admin', 'publisher', 'viewer']
 
 export function UserEdit() {
   const { userId } = useParams<{ userId: string }>()
+  const isCreating = userId === 'new'
   const navigate = useNavigate()
   const { token, isAdmin } = useAuth()
 
-  const [loading, setLoading] = useState(true)
+  const [loading, setLoading] = useState(!isCreating)
   const [loadError, setLoadError] = useState<string | null>(null)
 
   const [username, setUsername] = useState('')
@@ -26,6 +27,7 @@ export function UserEdit() {
   const [isActive, setIsActive] = useState(true)
   const [role, setRole] = useState('viewer')
   const [initialRole, setInitialRole] = useState('viewer')
+  const [password, setPassword] = useState('')
 
   const [profileSaving, setProfileSaving] = useState(false)
   const [profileError, setProfileError] = useState<string | null>(null)
@@ -38,7 +40,7 @@ export function UserEdit() {
   const [passwordSuccess, setPasswordSuccess] = useState<string | null>(null)
 
   useEffect(() => {
-    if (!isAdmin || !token || !userId) return
+    if (!isAdmin || !token || !userId || isCreating) return
     setLoading(true)
     Promise.all([
       fetch(`/api/v1/users/${encodeURIComponent(userId)}`, {
@@ -65,7 +67,7 @@ export function UserEdit() {
       })
       .catch((err) => setLoadError(err.message))
       .finally(() => setLoading(false))
-  }, [isAdmin, token, userId])
+  }, [isAdmin, token, userId, isCreating])
 
   if (!isAdmin) {
     return (
@@ -74,6 +76,37 @@ export function UserEdit() {
         <p className="text-gray-400">You need admin privileges to view this page.</p>
       </div>
     )
+  }
+
+  const createUser = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setProfileError(null)
+    setProfileSuccess(null)
+    if (!username || !email || !password) {
+      setProfileError('username, email, and password are required')
+      return
+    }
+    if (password.length < 8) {
+      setProfileError('password must be at least 8 characters')
+      return
+    }
+    setProfileSaving(true)
+    try {
+      const res = await fetch('/api/v1/users', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ username, email, password, roles: [role] }),
+      })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.error || `Request failed: ${res.status}`)
+      }
+      navigate('/settings?tab=users')
+    } catch (err: any) {
+      setProfileError(err.message)
+    } finally {
+      setProfileSaving(false)
+    }
   }
 
   const saveProfile = async (e: React.FormEvent) => {
@@ -157,7 +190,7 @@ export function UserEdit() {
   return (
     <div className="max-w-5xl mx-auto space-y-8">
       <button
-        onClick={() => navigate('/settings')}
+        onClick={() => navigate('/settings?tab=users')}
         className="flex items-center gap-2 text-gray-400 hover:text-gray-100 transition-colors"
       >
         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -167,8 +200,10 @@ export function UserEdit() {
       </button>
 
       <div>
-        <h1 className="text-3xl font-bold text-white mb-1">Edit User</h1>
-        <p className="text-gray-400">Update account details, role, and password</p>
+        <h1 className="text-3xl font-bold text-white mb-1">{isCreating ? 'New User' : 'Edit User'}</h1>
+        <p className="text-gray-400">
+          {isCreating ? 'Create a new account' : 'Update account details, role, and password'}
+        </p>
       </div>
 
       {loading ? (
@@ -179,6 +214,63 @@ export function UserEdit() {
         <div className="px-4 py-3 bg-red-500/10 border border-red-500/30 rounded-lg text-red-400 text-sm">
           Failed to load user: {loadError}
         </div>
+      ) : isCreating ? (
+        <form onSubmit={createUser} className="card max-w-md space-y-4">
+          <h2 className="text-xl font-semibold text-gray-100">Account Details</h2>
+
+          {profileError && (
+            <div className="px-4 py-3 bg-red-500/10 border border-red-500/30 rounded-lg text-red-400 text-sm">
+              {profileError}
+            </div>
+          )}
+
+          <div>
+            <label className="block text-sm text-gray-400 mb-1">Username</label>
+            <input
+              type="text"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              className="input w-full"
+              placeholder="e.g. jdoe"
+            />
+          </div>
+          <div>
+            <label className="block text-sm text-gray-400 mb-1">Email</label>
+            <input
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              className="input w-full"
+              placeholder="jdoe@example.com"
+            />
+          </div>
+          <div>
+            <label className="block text-sm text-gray-400 mb-1">Password</label>
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              className="input w-full"
+              placeholder="At least 8 characters"
+            />
+          </div>
+          <div>
+            <label className="block text-sm text-gray-400 mb-1">Role</label>
+            <select
+              className="input w-full"
+              value={role}
+              onChange={(e) => setRole(e.target.value)}
+            >
+              {AVAILABLE_ROLES.map((r) => (
+                <option key={r} value={r}>{r}</option>
+              ))}
+            </select>
+          </div>
+
+          <button type="submit" disabled={profileSaving} className="btn btn-primary">
+            {profileSaving ? 'Creating...' : 'Create User'}
+          </button>
+        </form>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-8 items-start">
           <form onSubmit={saveProfile} className="card space-y-4">

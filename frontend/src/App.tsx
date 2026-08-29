@@ -11,6 +11,7 @@ import { SearchResults } from './pages/SearchResults'
 import { Login } from './pages/Login'
 import { Settings } from './pages/Settings'
 import { UserEdit } from './pages/UserEdit'
+import { RegistryEdit } from './pages/RegistryEdit'
 import { GettingStarted } from './pages/GettingStarted'
 import { ArtifactUpload } from './pages/ArtifactUpload'
 import { ArtifactBrowse } from './pages/ArtifactBrowse'
@@ -66,6 +67,7 @@ function App() {
           <Route path="/login" element={<Login />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="/settings/users/:userId" element={<UserEdit />} />
+          <Route path="/settings/registries/:registryId" element={<RegistryEdit />} />
           <Route path="/getting-started" element={<GettingStarted />} />
           <Route path="/upload" element={<ArtifactUpload />} />
           <Route path="/browse" element={<ArtifactBrowse />} />
