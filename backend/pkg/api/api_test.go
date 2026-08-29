@@ -332,8 +332,10 @@ func TestAPIGetUserPermissions(t *testing.T) {
 func TestAPIListAuditLogs(t *testing.T) {
 	db := connectTestDB(t)
 	s := newTestServer(t, db)
+	user := seedUser(t, db, "admin")
 
 	req := httptest.NewRequest(http.MethodGet, "/audit/logs", nil)
+	req = authedRequest(req, user, []string{"admin"}, []string{"user:admin"})
 	w := httptest.NewRecorder()
 	s.router.ServeHTTP(w, req)
 
@@ -342,6 +344,17 @@ func TestAPIListAuditLogs(t *testing.T) {
 	decodeJSON(t, w, &body)
 	_, ok := body["logs"]
 	assert.True(t, ok)
+}
+
+func TestAPIListAuditLogsRequiresAuth(t *testing.T) {
+	db := connectTestDB(t)
+	s := newTestServer(t, db)
+
+	req := httptest.NewRequest(http.MethodGet, "/audit/logs", nil)
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
 // --- Mutating endpoints: auth/permission gating ---

@@ -1106,22 +1106,21 @@ func (db *Database) GetRegistryByHost(host string) (*RegistryConfig, error) {
 // proxy-enabled registry of the given type — the fallback target for
 // protocol-proxy requests that don't match any registry's bound Host.
 func (db *Database) GetDefaultRegistry(artifactType string) (*RegistryConfig, error) {
-	// "maven-virtual" registries have no upstream URL/proxy of their own —
-	// they aggregate other "maven" registries via Members — but they still
-	// need to be selectable as the default registry for "maven" requests.
-	types := []string{artifactType}
-	if artifactType == "maven" {
-		types = append(types, "maven-virtual")
-	}
+	// "<artifactType>-virtual" registries have no upstream URL/proxy of
+	// their own — they aggregate other registries of artifactType via
+	// Members — but they still need to be selectable as the default
+	// registry for artifactType requests.
+	virtualType := artifactType + "-virtual"
+	types := []string{artifactType, virtualType}
 	row := db.pool.QueryRow(
 		context.Background(),
 		`SELECT id, name, url, type, enabled, priority, private, proxy, COALESCE(host, ''),
 		        upstream_auth_type, COALESCE(upstream_username, ''), COALESCE(upstream_secret, ''),
 		        COALESCE(members, '{}')
 		 FROM registries
-		 WHERE type = ANY($1) AND enabled = TRUE AND private = FALSE AND (proxy = TRUE OR type = 'maven-virtual')
+		 WHERE type = ANY($1) AND enabled = TRUE AND private = FALSE AND (proxy = TRUE OR type = $2)
 		 ORDER BY priority ASC LIMIT 1`,
-		types,
+		types, virtualType,
 	)
 
 	var r RegistryConfig
@@ -1265,48 +1264,74 @@ func (db *Database) GenerateAuditLog(userID, action, resourceType, resourceID, d
 	return err
 }
 
-// ListAuditLogs retrieves audit logs with optional filtering
-func (db *Database) ListAuditLogs(opts SearchOptions) ([]AuditLog, error) {
-	query := `SELECT id, user_id, action, resource_type, resource_id, details, created_at
-			  FROM audit_log WHERE 1=1`
+// AuditLogFilter narrows AuditLog results by category (resource_type),
+// exact action, or a free-text search across action/resource_type/
+// resource_id/details/username.
+type AuditLogFilter struct {
+	Category string
+	Action   string
+	Search   string
+	Limit    int
+	Offset   int
+}
+
+// ListAuditLogs retrieves audit logs with optional filtering, joined against
+// users to resolve a display username/email, and the total matching count
+// (ignoring limit/offset) for pagination.
+func (db *Database) ListAuditLogs(filter AuditLogFilter) ([]AuditLog, int, error) {
+	where := ` WHERE 1=1`
 	params := []any{}
 
-	if opts.RegistryID != "" {
-		query += ` AND resource_id = $` + fmt.Sprintf("%d", len(params)+1)
-		params = append(params, opts.RegistryID)
+	if filter.Category != "" && filter.Category != "all" {
+		params = append(params, filter.Category)
+		where += ` AND a.resource_type = $` + fmt.Sprintf("%d", len(params))
+	}
+	if filter.Action != "" && filter.Action != "all" {
+		params = append(params, filter.Action)
+		where += ` AND a.action = $` + fmt.Sprintf("%d", len(params))
+	}
+	if filter.Search != "" {
+		params = append(params, "%"+filter.Search+"%")
+		n := len(params)
+		where += fmt.Sprintf(` AND (a.action ILIKE $%d OR a.resource_type ILIKE $%d OR a.resource_id ILIKE $%d OR a.details ILIKE $%d OR u.username ILIKE $%d)`, n, n, n, n, n)
 	}
 
-	if opts.ArtifactType != "" {
-		query += ` AND action = $` + fmt.Sprintf("%d", len(params)+1)
-		params = append(params, opts.ArtifactType)
+	var total int
+	countQuery := `SELECT COUNT(*) FROM audit_log a LEFT JOIN users u ON u.user_id = a.user_id` + where
+	if err := db.pool.QueryRow(context.Background(), countQuery, params...).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("failed to count audit logs: %w", err)
 	}
 
-	query += ` ORDER BY created_at DESC`
-
-	if opts.Limit <= 0 {
-		opts.Limit = 100
+	if filter.Limit <= 0 {
+		filter.Limit = 100
 	}
-	query += ` LIMIT $` + fmt.Sprintf("%d", len(params)+1)
-	params = append(params, opts.Limit)
+	params = append(params, filter.Limit)
+	limitParam := len(params)
+	params = append(params, filter.Offset)
+	offsetParam := len(params)
+
+	query := fmt.Sprintf(`SELECT a.id, a.user_id, u.username, u.email, a.action, a.resource_type, a.resource_id, a.details, a.created_at
+			  FROM audit_log a LEFT JOIN users u ON u.user_id = a.user_id`+where+
+		` ORDER BY a.created_at DESC LIMIT $%d OFFSET $%d`, limitParam, offsetParam)
 
 	rows, err := db.pool.Query(context.Background(), query, params...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list audit logs: %w", err)
+		return nil, 0, fmt.Errorf("failed to list audit logs: %w", err)
 	}
 	defer rows.Close()
 
 	var logs []AuditLog
 	for rows.Next() {
 		var log AuditLog
-		err := rows.Scan(&log.ID, &log.UserID, &log.Action, &log.ResourceType,
+		err := rows.Scan(&log.ID, &log.UserID, &log.Username, &log.Email, &log.Action, &log.ResourceType,
 			&log.ResourceID, &log.Details, &log.CreatedAt)
 		if err != nil {
-			return nil, fmt.Errorf("failed to scan audit log: %w", err)
+			return nil, 0, fmt.Errorf("failed to scan audit log: %w", err)
 		}
 		logs = append(logs, log)
 	}
 
-	return logs, rows.Err()
+	return logs, total, rows.Err()
 }
 
 // GetUserRoles returns all role IDs for a user

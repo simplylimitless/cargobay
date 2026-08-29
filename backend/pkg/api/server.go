@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/simplylimitless/cargobay/backend/pkg/cache"
 	"github.com/simplylimitless/cargobay/backend/pkg/database"
 	"github.com/simplylimitless/cargobay/backend/pkg/middleware"
+	"github.com/simplylimitless/cargobay/backend/pkg/proxy"
 	"github.com/simplylimitless/cargobay/backend/pkg/proxy/docker"
 	"github.com/simplylimitless/cargobay/backend/pkg/rbac"
 	"github.com/simplylimitless/cargobay/backend/pkg/searchindex"
@@ -121,10 +123,9 @@ func (s *Server) setupRoutes() {
 	api.Get("/permissions", s.handleListPermissions)
 	api.Get("/permissions/{id}", s.handleGetPermission)
 
-	// Replication/audit endpoints (read)
+	// Replication endpoints (read)
 	api.Get("/replication/status", s.handleReplicationStatus)
 	api.Get("/replication/regions", s.handleListRegions)
-	api.Get("/audit/logs", s.handleListAuditLogs)
 
 	// Vulnerability DB settings (read) — permission enforced in-handler via system:read
 	api.Get("/settings/vulnerability-db", s.handleGetVulnDBSettings)
@@ -198,6 +199,9 @@ func (s *Server) setupRoutes() {
 		api.Delete("/users/{id}", s.handleDeactivateUser)
 		api.Post("/users/{id}/roles", s.rbac.RequirePermission("user:admin")(http.HandlerFunc(s.handleAssignUserRole)).ServeHTTP)
 		api.Delete("/users/{id}/roles/{roleId}", s.rbac.RequirePermission("user:admin")(http.HandlerFunc(s.handleRevokeUserRole)).ServeHTTP)
+
+		// Audit logs are admin-only, same gate as user management.
+		api.Get("/audit/logs", s.rbac.RequirePermission("user:admin")(http.HandlerFunc(s.handleListAuditLogs)).ServeHTTP)
 	})
 }
 
@@ -422,6 +426,8 @@ func (s *Server) handleCreateArtifact(w http.ResponseWriter, r *http.Request) {
 		_ = s.cache.InvalidateArtifact(artifact.RegistryID, artifact.Namespace, artifact.ArtifactName, artifact.Version)
 	}
 
+	s.audit(r, "artifact.create", "artifact", artifact.ID, map[string]any{"artifactName": artifact.ArtifactName, "version": artifact.Version, "type": artifact.ArtifactType})
+
 	s.writeJSON(w, http.StatusCreated, artifact)
 }
 
@@ -484,6 +490,8 @@ func (s *Server) handleDeleteArtifact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.audit(r, "artifact.delete", "artifact", id, map[string]any{"artifactName": artifact.ArtifactName, "version": artifact.Version})
+
 	s.writeJSON(w, http.StatusOK, map[string]string{"message": "Artifact deleted successfully"})
 }
 
@@ -528,6 +536,8 @@ func (s *Server) handleScanArtifact(w http.ResponseWriter, r *http.Request) {
 		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to save scan result: %v", err))
 		return
 	}
+
+	s.audit(r, "artifact.scan", "artifact", id, map[string]any{"artifactName": artifact.ArtifactName, "version": artifact.Version})
 
 	s.writeJSON(w, http.StatusOK, result)
 }
@@ -1279,9 +1289,9 @@ func (s *Server) handleCreateRegistry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if registry.Type == "maven-virtual" {
+	if baseType, ok := proxy.BaseTypeOfVirtual(registry.Type); ok {
 		if len(registry.Members) == 0 {
-			s.writeJSONError(w, http.StatusBadRequest, "A virtual Maven repository requires at least one member registry")
+			s.writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("A virtual %s repository requires at least one member registry", baseType))
 			return
 		}
 		for _, memberID := range registry.Members {
@@ -1294,8 +1304,8 @@ func (s *Server) handleCreateRegistry(w http.ResponseWriter, r *http.Request) {
 				s.writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("Member registry %q must be enabled", memberID))
 				return
 			}
-			if member.Type != "maven" {
-				s.writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("Member registry %q must be of type \"maven\" (nested virtual repositories are not supported)", memberID))
+			if member.Type != baseType {
+				s.writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("Member registry %q must be of type %q (nested virtual repositories are not supported)", memberID, baseType))
 				return
 			}
 		}
@@ -1306,6 +1316,8 @@ func (s *Server) handleCreateRegistry(w http.ResponseWriter, r *http.Request) {
 		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to save registry: %v", err))
 		return
 	}
+
+	s.audit(r, "registry.upsert", "registry", registry.ID, map[string]any{"name": registry.Name, "type": registry.Type})
 
 	s.writeJSON(w, http.StatusCreated, registry)
 }
@@ -1359,6 +1371,8 @@ func (s *Server) handleGrantRegistryAccess(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	s.audit(r, "registry.access_grant", "registry", registryID, map[string]any{"userId": body.UserID, "canRead": body.CanRead, "canPublish": body.CanPublish})
+
 	s.writeJSON(w, http.StatusOK, access)
 }
 
@@ -1376,6 +1390,8 @@ func (s *Server) handleRevokeRegistryAccess(w http.ResponseWriter, r *http.Reque
 		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to revoke access: %v", err))
 		return
 	}
+
+	s.audit(r, "registry.access_revoke", "registry", registryID, map[string]any{"userId": userID})
 
 	s.writeJSON(w, http.StatusOK, map[string]string{"status": "revoked"})
 }
@@ -1416,6 +1432,8 @@ func (s *Server) handleDeleteRegistry(w http.ResponseWriter, r *http.Request) {
 		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to delete registry: %v", err))
 		return
 	}
+
+	s.audit(r, "registry.delete", "registry", id, nil)
 
 	s.writeJSON(w, http.StatusOK, map[string]string{"message": "Registry deleted successfully"})
 }
@@ -1593,6 +1611,8 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.audit(r, "user.create", "user", user.UserID, map[string]any{"username": input.Username, "email": input.Email, "roles": input.Roles})
+
 	s.writeJSON(w, http.StatusCreated, map[string]interface{}{
 		"user":    user,
 		"message": "User created successfully",
@@ -1633,6 +1653,8 @@ func (s *Server) handleDeactivateUser(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+
+	s.audit(r, "user.deactivate", "user", id, nil)
 
 	s.writeJSON(w, http.StatusOK, map[string]string{"message": "User deactivated successfully"})
 }
@@ -1718,6 +1740,8 @@ func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to load updated user: %v", err))
 		return
 	}
+
+	s.audit(r, "user.update", "user", id, map[string]any{"username": input.Username, "email": input.Email, "isActive": input.IsActive})
 
 	s.writeJSON(w, http.StatusOK, updated)
 }
@@ -1818,6 +1842,8 @@ func (s *Server) handleAssignUserRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.audit(r, "user.role_grant", "user", userID, map[string]any{"role": roleID})
+
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{
 		"message": "Role assigned successfully",
 		"role":    role,
@@ -1846,6 +1872,8 @@ func (s *Server) handleRevokeUserRole(w http.ResponseWriter, r *http.Request) {
 		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to revoke role: %v", err))
 		return
 	}
+
+	s.audit(r, "user.role_revoke", "user", userID, map[string]any{"role": roleID})
 
 	s.writeJSON(w, http.StatusOK, map[string]string{"message": "Role revoked successfully"})
 }
@@ -2241,12 +2269,15 @@ func (s *Server) handleListRegions(w http.ResponseWriter, r *http.Request) {
 
 // handleListAuditLogs handles listing audit logs
 func (s *Server) handleListAuditLogs(w http.ResponseWriter, r *http.Request) {
-	opts := database.SearchOptions{
-		Limit:  parseIntParam(r.URL.Query().Get("limit"), 100),
-		Offset: parseIntParam(r.URL.Query().Get("offset"), 0),
+	filter := database.AuditLogFilter{
+		Category: queryParamOrDefault(r, "category", ""),
+		Action:   queryParamOrDefault(r, "action", ""),
+		Search:   queryParamOrDefault(r, "search", ""),
+		Limit:    parseIntParam(r.URL.Query().Get("limit"), 20),
+		Offset:   parseIntParam(r.URL.Query().Get("offset"), 0),
 	}
 
-	logs, err := s.db.ListAuditLogs(opts)
+	logs, total, err := s.db.ListAuditLogs(filter)
 	if err != nil {
 		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to list audit logs: %v", err))
 		return
@@ -2254,8 +2285,25 @@ func (s *Server) handleListAuditLogs(w http.ResponseWriter, r *http.Request) {
 
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{
 		"logs":  logs,
-		"total": len(logs),
+		"total": total,
 	})
+}
+
+// audit records an audit log entry for a mutating action, resolving the
+// acting user from the request's auth context. Failures are logged, not
+// returned — an audit-write hiccup must never fail the underlying request.
+func (s *Server) audit(r *http.Request, action, resourceType, resourceID string, details map[string]any) {
+	userID := "anonymous"
+	if user := middleware.GetUser(r); user != nil {
+		userID = user.UserID
+	}
+	detailsJSON, err := json.Marshal(details)
+	if err != nil {
+		detailsJSON = []byte("{}")
+	}
+	if err := s.db.GenerateAuditLog(userID, action, resourceType, resourceID, string(detailsJSON)); err != nil {
+		log.Printf("audit log write failed (action=%s): %v", action, err)
+	}
 }
 
 // handleLogin handles user login with username and password
@@ -2278,6 +2326,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	output, err := auth.Login(s.db, input.Username, input.Password)
 	if err != nil {
+		_ = s.db.GenerateAuditLog(input.Username, "user.login_failed", "user", input.Username, "{}")
 		switch err {
 		case fmt.Errorf("invalid credentials"):
 			s.writeJSONError(w, http.StatusUnauthorized, "Invalid credentials")
@@ -2286,6 +2335,8 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+
+	_ = s.db.GenerateAuditLog(output.UserID, "user.login", "user", output.UserID, "{}")
 
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{
 		"accessToken": output.AccessToken,

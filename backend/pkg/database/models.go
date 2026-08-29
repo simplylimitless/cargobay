@@ -119,13 +119,15 @@ type RegistryAccess struct {
 
 // AuditLog represents an audit log entry
 type AuditLog struct {
-	ID           string    `db:"id"`
-	UserID       string    `db:"user_id"`
-	Action       string    `db:"action"`
-	ResourceType string    `db:"resource_type"`
-	ResourceID   string    `db:"resource_id"`
-	Details      string    `db:"details"`
-	CreatedAt    time.Time `db:"created_at"`
+	ID           string    `db:"id" json:"id"`
+	UserID       string    `db:"user_id" json:"userId"`
+	Username     *string   `db:"username" json:"username,omitempty"`
+	Email        *string   `db:"email" json:"email,omitempty"`
+	Action       string    `db:"action" json:"action"`
+	ResourceType string    `db:"resource_type" json:"resourceType"`
+	ResourceID   string    `db:"resource_id" json:"resourceId"`
+	Details      string    `db:"details" json:"details"`
+	CreatedAt    time.Time `db:"created_at" json:"createdAt"`
 }
 
 // Permission defines a granular permission

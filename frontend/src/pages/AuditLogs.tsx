@@ -5,102 +5,102 @@ import { formatDateTime, formatTime } from '../lib/datetime'
 
 interface AuditLog {
   id: string
-  timestamp: string
+  userId: string
+  username?: string
+  email?: string
   action: string
-  category: 'artifact' | 'user' | 'registry' | 'system' | 'security'
-  user: string
-  email: string
-  ip: string
-  details: Record<string, unknown>
-  result: 'success' | 'failure'
+  resourceType: string
+  resourceId: string
+  details: string
+  createdAt: string
 }
 
+const CATEGORIES = ['all', 'user', 'registry', 'artifact']
+const ACTIONS = [
+  'all',
+  'user.create',
+  'user.update',
+  'user.deactivate',
+  'user.role_grant',
+  'user.role_revoke',
+  'user.login',
+  'user.login_failed',
+  'registry.upsert',
+  'registry.delete',
+  'registry.access_grant',
+  'registry.access_revoke',
+  'artifact.create',
+  'artifact.delete',
+  'artifact.scan',
+]
+
+const ITEMS_PER_PAGE = 20
+
 export function AuditLogs() {
-  const { currentUser, isAdmin } = useAuth()
+  const { currentUser, isAdmin, token } = useAuth()
   const timezone = useTimezone()
   const navigate = useNavigate()
   const [logs, setLogs] = useState<AuditLog[]>([])
+  const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
   const [filterCategory, setFilterCategory] = useState('all')
   const [filterAction, setFilterAction] = useState('all')
-  const [filterResult, setFilterResult] = useState('all')
   const [searchQuery, setSearchQuery] = useState('')
   const [selectedLog, setSelectedLog] = useState<AuditLog | null>(null)
   const [page, setPage] = useState(1)
-  const itemsPerPage = 20
 
   useEffect(() => {
-    const fetchLogs = async () => {
-      try {
-        const mockLogs: AuditLog[] = [
-          { id: '1', timestamp: '2024-02-15T14:30:00Z', action: 'artifact.upload', category: 'artifact', user: 'john.doe', email: 'john@example.com', ip: '192.168.1.100', details: { artifactName: 'nginx', version: '1.25.3', type: 'docker', size: 145000000 }, result: 'success' },
-          { id: '2', timestamp: '2024-02-15T14:25:00Z', action: 'artifact.delete', category: 'artifact', user: 'jane.smith', email: 'jane@example.com', ip: '192.168.1.101', details: { artifactName: 'redis', version: '7.0.0', type: 'docker' }, result: 'success' },
-          { id: '3', timestamp: '2024-02-15T14:20:00Z', action: 'user.create', category: 'user', user: 'admin', email: 'admin@example.com', ip: '10.0.0.1', details: { username: 'new.user', email: 'new@example.com', role: 'developer' }, result: 'success' },
-          { id: '4', timestamp: '2024-02-15T14:15:00Z', action: 'artifact.download', category: 'artifact', user: 'alice.jones', email: 'alice@example.com', ip: '192.168.1.102', details: { artifactName: 'nginx', version: '1.25.3', type: 'docker', size: 145000000 }, result: 'success' },
-          { id: '5', timestamp: '2024-02-15T14:10:00Z', action: 'artifact.download', category: 'artifact', user: 'bob.wilson', email: 'bob@example.com', ip: '192.168.1.102', details: { artifactName: 'express', version: '4.18.2', type: 'npm', size: 50000 }, result: 'success' },
-          { id: '6', timestamp: '2024-02-15T14:05:00Z', action: 'user.login', category: 'security', user: 'alice.jones', email: 'alice@example.com', ip: '203.0.113.50', details: { method: 'password', success: true }, result: 'failure' },
-          { id: '7', timestamp: '2024-02-15T14:00:00Z', action: 'artifact.scan', category: 'artifact', user: 'system', email: 'system@cargobay.io', ip: '127.0.0.1', details: { artifactName: 'lodash', version: '4.17.21', vulnerabilitiesFound: 2 }, result: 'success' },
-          { id: '8', timestamp: '2024-02-15T13:55:00Z', action: 'registry.update', category: 'registry', user: 'admin', email: 'admin@example.com', ip: '10.0.0.1', details: { registryId: 'npm', url: 'https://registry.npmjs.org', enabled: true }, result: 'success' },
-          { id: '9', timestamp: '2024-02-15T13:50:00Z', action: 'user.delete', category: 'user', user: 'admin', email: 'admin@example.com', ip: '10.0.0.1', details: { username: 'former.employee', email: 'former@example.com' }, result: 'success' },
-          { id: '10', timestamp: '2024-02-15T13:45:00Z', action: 'artifact.upload', category: 'artifact', user: 'charlie.brown', email: 'charlie@example.com', ip: '192.168.1.103', details: { artifactName: 'spring-core', version: '6.1.3', type: 'maven', size: 600000 }, result: 'success' },
-          { id: '11', timestamp: '2024-02-15T13:40:00Z', action: 'security.policy.check', category: 'security', user: 'system', email: 'system@cargobay.io', ip: '127.0.0.1', details: { artifactName: 'requests', version: '2.31.0', policyViolations: 0 }, result: 'success' },
-          { id: '12', timestamp: '2024-02-15T13:35:00Z', action: 'artifact.tag', category: 'artifact', user: 'dave.lee', email: 'dave@example.com', ip: '192.168.1.104', details: { artifactName: 'nginx', version: '1.25.3', tag: 'stable', added: true }, result: 'success' },
-          { id: '13', timestamp: '2024-02-15T13:30:00Z', action: 'user.login', category: 'security', user: 'admin', email: 'admin@example.com', ip: '10.0.0.1', details: { method: 'api-key', success: true }, result: 'success' },
-          { id: '14', timestamp: '2024-02-15T13:25:00Z', action: 'artifact.delete', category: 'artifact', user: 'eve.taylor', email: 'eve@example.com', ip: '192.168.1.105', details: { artifactName: 'tmp-artifact', version: '0.0.1', type: 'generic' }, result: 'success' },
-          { id: '15', timestamp: '2024-02-15T13:20:00Z', action: 'system.config.update', category: 'system', user: 'admin', email: 'admin@example.com', ip: '10.0.0.1', details: { setting: 'cache.ttl', oldValue: 3600, newValue: 7200 }, result: 'success' },
-          { id: '16', timestamp: '2024-02-15T13:15:00Z', action: 'artifact.download', category: 'artifact', user: 'frank.miller', email: 'frank@example.com', ip: '192.168.1.106', details: { artifactName: 'nuget-package', version: '1.0.0', type: 'nuget', size: 800000 }, result: 'success' },
-          { id: '17', timestamp: '2024-02-15T13:10:00Z', action: 'user.update', category: 'user', user: 'admin', email: 'admin@example.com', ip: '10.0.0.1', details: { username: 'jane.smith', roleChange: 'viewer', oldValue: 'developer' }, result: 'success' },
-          { id: '18', timestamp: '2024-02-15T13:05:00Z', action: 'artifact.upload', category: 'artifact', user: 'grace.wilson', email: 'grace@example.com', ip: '192.168.1.107', details: { artifactName: 'helm-chart', version: '1.2.0', type: 'helm', size: 25000 }, result: 'success' },
-          { id: '19', timestamp: '2024-02-15T13:00:00Z', action: 'registry.test', category: 'registry', user: 'admin', email: 'admin@example.com', ip: '10.0.0.1', details: { registryId: 'pypi', connection: true, status: 'healthy' }, result: 'success' },
-          { id: '20', timestamp: '2024-02-15T12:55:00Z', action: 'artifact.scan', category: 'artifact', user: 'system', email: 'system@cargobay.io', ip: '127.0.0.1', details: { artifactName: 'nginx', version: '1.25.3', vulnerabilitiesFound: 0 }, result: 'success' },
-        ]
-        setLogs(mockLogs)
-        setLoading(false)
-      } catch (err) {
-        setLoading(false)
-      }
+    if (!isAdmin || !token) {
+      setLoading(false)
+      return
     }
+    setLoading(true)
+    setError(null)
+    const params = new URLSearchParams()
+    if (filterCategory !== 'all') params.set('category', filterCategory)
+    if (filterAction !== 'all') params.set('action', filterAction)
+    if (searchQuery) params.set('search', searchQuery)
+    params.set('limit', String(ITEMS_PER_PAGE))
+    params.set('offset', String((page - 1) * ITEMS_PER_PAGE))
 
-    fetchLogs()
-  }, [])
+    fetch(`/api/v1/audit/logs?${params.toString()}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then(async (res) => {
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}))
+          throw new Error(data.error || `Request failed: ${res.status}`)
+        }
+        return res.json() as Promise<{ logs: AuditLog[]; total: number }>
+      })
+      .then((data) => {
+        setLogs(data.logs || [])
+        setTotal(data.total || 0)
+      })
+      .catch((err) => setError(err.message))
+      .finally(() => setLoading(false))
+  }, [isAdmin, token, filterCategory, filterAction, searchQuery, page])
 
-  const filteredLogs = logs.filter(log => {
-    if (filterCategory !== 'all' && log.category !== filterCategory) return false
-    if (filterAction !== 'all' && log.action !== filterAction) return false
-    if (filterResult !== 'all' && log.result !== filterResult) return false
-    if (searchQuery) {
-      const query = searchQuery.toLowerCase()
-      return (
-        log.user.toLowerCase().includes(query) ||
-        log.email.toLowerCase().includes(query) ||
-        log.action.toLowerCase().includes(query) ||
-        JSON.stringify(log.details).toLowerCase().includes(query)
-      )
-    }
-    return true
-  })
-
-  const paginatedLogs = filteredLogs.slice((page - 1) * itemsPerPage, page * itemsPerPage)
-  const totalPages = Math.ceil(filteredLogs.length / itemsPerPage)
+  useEffect(() => {
+    setPage(1)
+  }, [filterCategory, filterAction, searchQuery])
 
   const getCategoryColor = (category: string): string => {
     switch (category) {
       case 'artifact': return 'bg-blue-500/20 text-blue-400 border-blue-500/30'
       case 'user': return 'bg-green-500/20 text-green-400 border-green-500/30'
       case 'registry': return 'bg-purple-500/20 text-purple-400 border-purple-500/30'
-      case 'system': return 'bg-gray-500/20 text-gray-400 border-gray-500/30'
-      case 'security': return 'bg-orange-500/20 text-orange-400 border-orange-500/30'
       default: return 'bg-gray-500/20 text-gray-400 border-gray-500/30'
     }
   }
 
-  const getResultColor = (result: string): string => {
-    switch (result) {
-      case 'success': return 'bg-green-500/20 text-green-400 border-green-500/30'
-      case 'failure': return 'bg-red-500/20 text-red-400 border-red-500/30'
-      default: return 'bg-gray-500/20 text-gray-400 border-gray-500/30'
-    }
-  }
+  const isFailed = (action: string) => action.endsWith('_failed')
+
+  const getResultColor = (action: string): string =>
+    isFailed(action)
+      ? 'bg-red-500/20 text-red-400 border-red-500/30'
+      : 'bg-green-500/20 text-green-400 border-green-500/30'
 
   const formatRelativeTime = (dateString: string): string => {
     const date = new Date(dateString)
@@ -120,6 +120,15 @@ export function AuditLogs() {
       .split('.')
       .map(part => part.charAt(0).toUpperCase() + part.slice(1))
       .join(' ')
+      .replace(/_/g, ' ')
+  }
+
+  const parseDetails = (details: string): Record<string, unknown> | string => {
+    try {
+      return JSON.parse(details)
+    } catch {
+      return details
+    }
   }
 
   if (!currentUser) {
@@ -134,37 +143,45 @@ export function AuditLogs() {
     )
   }
 
+  if (!isAdmin) {
+    return (
+      <div className="card max-w-md mx-auto text-center py-12">
+        <h1 className="text-xl font-semibold text-white mb-2">Access denied</h1>
+        <p className="text-gray-400">You need admin privileges to view audit logs.</p>
+      </div>
+    )
+  }
+
+  const totalPages = Math.max(1, Math.ceil(total / ITEMS_PER_PAGE))
+  const failedLogins = logs.filter(l => l.action === 'user.login_failed').length
+  const userActions = logs.filter(l => l.resourceType === 'user').length
+  const registryActions = logs.filter(l => l.resourceType === 'registry').length
+
   return (
     <div>
       {/* Stats */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
         <div className="card p-4">
           <div className="text-sm text-gray-400">Total Events</div>
-          <div className="text-2xl font-bold text-white mt-1">{filteredLogs.length}</div>
+          <div className="text-2xl font-bold text-white mt-1">{total}</div>
         </div>
         <div className="card p-4">
-          <div className="text-sm text-gray-400">Success Rate</div>
-          <div className="text-2xl font-bold text-green-400 mt-1">
-            {Math.round((filteredLogs.filter(l => l.result === 'success').length / Math.max(1, filteredLogs.length)) * 100)}%
-          </div>
+          <div className="text-sm text-gray-400">Failed Logins (page)</div>
+          <div className="text-2xl font-bold text-red-400 mt-1">{failedLogins}</div>
         </div>
         <div className="card p-4">
-          <div className="text-sm text-gray-400">Security Events</div>
-          <div className="text-2xl font-bold text-orange-500 mt-1">
-            {filteredLogs.filter(l => l.category === 'security').length}
-          </div>
+          <div className="text-sm text-gray-400">User Actions (page)</div>
+          <div className="text-2xl font-bold text-green-500 mt-1">{userActions}</div>
         </div>
         <div className="card p-4">
-          <div className="text-sm text-gray-400">Artifact Actions</div>
-          <div className="text-2xl font-bold text-blue-500 mt-1">
-            {filteredLogs.filter(l => l.category === 'artifact').length}
-          </div>
+          <div className="text-sm text-gray-400">Registry Actions (page)</div>
+          <div className="text-2xl font-bold text-purple-500 mt-1">{registryActions}</div>
         </div>
       </div>
 
       {/* Filters */}
       <div className="card p-6 mb-6">
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div>
             <label className="block text-sm font-medium text-gray-300 mb-2">Category</label>
             <select
@@ -172,7 +189,7 @@ export function AuditLogs() {
               onChange={(e) => setFilterCategory(e.target.value)}
               className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
             >
-              {['all', 'artifact', 'user', 'registry', 'system', 'security'].map(c => (
+              {CATEGORIES.map(c => (
                 <option key={c} value={c}>{c.charAt(0).toUpperCase() + c.slice(1)}</option>
               ))}
             </select>
@@ -184,20 +201,8 @@ export function AuditLogs() {
               onChange={(e) => setFilterAction(e.target.value)}
               className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
             >
-              {['all', 'artifact.upload', 'artifact.download', 'artifact.delete', 'artifact.scan', 'artifact.tag', 'user.create', 'user.update', 'user.delete', 'user.login', 'registry.update', 'registry.test', 'system.config.update', 'security.policy.check'].map(a => (
+              {ACTIONS.map(a => (
                 <option key={a} value={a}>{a}</option>
-              ))}
-            </select>
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-gray-300 mb-2">Result</label>
-            <select
-              value={filterResult}
-              onChange={(e) => setFilterResult(e.target.value)}
-              className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-            >
-              {['all', 'success', 'failure'].map(r => (
-                <option key={r} value={r}>{r}</option>
               ))}
             </select>
           </div>
@@ -220,7 +225,12 @@ export function AuditLogs() {
           <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto mb-4"></div>
           <p className="text-gray-400">Loading audit logs...</p>
         </div>
-      ) : filteredLogs.length === 0 ? (
+      ) : error ? (
+        <div className="card text-center py-12">
+          <h3 className="text-lg font-medium text-white mb-2">Failed to load audit logs</h3>
+          <p className="text-gray-400">{error}</p>
+        </div>
+      ) : logs.length === 0 ? (
         <div className="card text-center py-12">
           <div className="w-16 h-16 bg-gray-700 text-gray-400 rounded-full flex items-center justify-center mx-auto mb-4">
             <svg className="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -240,39 +250,37 @@ export function AuditLogs() {
                   <th className="text-left px-6 py-3 text-sm font-medium text-gray-300">Action</th>
                   <th className="text-left px-6 py-3 text-sm font-medium text-gray-300">Category</th>
                   <th className="text-left px-6 py-3 text-sm font-medium text-gray-300">User</th>
-                  <th className="text-left px-6 py-3 text-sm font-medium text-gray-300">IP</th>
                   <th className="text-left px-6 py-3 text-sm font-medium text-gray-300">Result</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-700">
-                {paginatedLogs.map(log => (
+                {logs.map(log => (
                   <tr
                     key={log.id}
                     className="hover:bg-gray-800/50 transition-colors cursor-pointer"
                     onClick={() => setSelectedLog(log)}
                   >
                     <td className="px-6 py-4 text-sm text-gray-300">
-                      {formatRelativeTime(log.timestamp)}
+                      {formatRelativeTime(log.createdAt)}
                       <div className="text-xs text-gray-500">
-                        {formatTime(log.timestamp, timezone)}
+                        {formatTime(log.createdAt, timezone)}
                       </div>
                     </td>
                     <td className="px-6 py-4">
                       <div className="text-white font-medium">{getActionLabel(log.action)}</div>
                     </td>
                     <td className="px-6 py-4">
-                      <span className={`px-2 py-1 text-xs rounded-full border ${getCategoryColor(log.category)}`}>
-                        {log.category}
+                      <span className={`px-2 py-1 text-xs rounded-full border ${getCategoryColor(log.resourceType)}`}>
+                        {log.resourceType}
                       </span>
                     </td>
                     <td className="px-6 py-4">
-                      <div className="text-white">{log.user}</div>
-                      <div className="text-xs text-gray-500">{log.email}</div>
+                      <div className="text-white">{log.username || log.userId}</div>
+                      {log.email && <div className="text-xs text-gray-500">{log.email}</div>}
                     </td>
-                    <td className="px-6 py-4 text-sm text-gray-300">{log.ip}</td>
                     <td className="px-6 py-4">
-                      <span className={`px-2 py-1 text-xs rounded-full border ${getResultColor(log.result)}`}>
-                        {log.result}
+                      <span className={`px-2 py-1 text-xs rounded-full border ${getResultColor(log.action)}`}>
+                        {isFailed(log.action) ? 'failure' : 'success'}
                       </span>
                     </td>
                   </tr>
@@ -285,7 +293,7 @@ export function AuditLogs() {
           {totalPages > 1 && (
             <div className="flex items-center justify-between mt-6 px-6">
               <div className="text-gray-400 text-sm">
-                Showing {(page - 1) * itemsPerPage + 1}-{Math.min(page * itemsPerPage, filteredLogs.length)} of {filteredLogs.length} entries
+                Showing {(page - 1) * ITEMS_PER_PAGE + 1}-{Math.min(page * ITEMS_PER_PAGE, total)} of {total} entries
               </div>
               <div className="flex gap-2">
                 <button
@@ -317,11 +325,11 @@ export function AuditLogs() {
                 <div>
                   <h2 className="text-xl font-bold text-white mb-2">{getActionLabel(selectedLog.action)}</h2>
                   <div className="flex items-center gap-3">
-                    <span className={`px-3 py-1 rounded-full text-xs ${getCategoryColor(selectedLog.category)}`}>
-                      {selectedLog.category}
+                    <span className={`px-3 py-1 rounded-full text-xs ${getCategoryColor(selectedLog.resourceType)}`}>
+                      {selectedLog.resourceType}
                     </span>
-                    <span className={`px-3 py-1 rounded-full text-xs ${getResultColor(selectedLog.result)}`}>
-                      {selectedLog.result}
+                    <span className={`px-3 py-1 rounded-full text-xs ${getResultColor(selectedLog.action)}`}>
+                      {isFailed(selectedLog.action) ? 'failure' : 'success'}
                     </span>
                   </div>
                 </div>
@@ -341,7 +349,7 @@ export function AuditLogs() {
                 <div>
                   <h3 className="text-sm font-medium text-gray-300 mb-1">Timestamp</h3>
                   <div className="text-gray-400">
-                    {formatDateTime(selectedLog.timestamp, timezone)}
+                    {formatDateTime(selectedLog.createdAt, timezone)}
                   </div>
                 </div>
                 <div>
@@ -350,19 +358,20 @@ export function AuditLogs() {
                 </div>
                 <div>
                   <h3 className="text-sm font-medium text-gray-300 mb-1">User</h3>
-                  <div className="text-white">{selectedLog.user}</div>
-                  <div className="text-gray-400 text-sm">{selectedLog.email}</div>
+                  <div className="text-white">{selectedLog.username || selectedLog.userId}</div>
+                  {selectedLog.email && <div className="text-gray-400 text-sm">{selectedLog.email}</div>}
                 </div>
                 <div>
-                  <h3 className="text-sm font-medium text-gray-300 mb-1">IP Address</h3>
-                  <div className="text-white">{selectedLog.ip}</div>
+                  <h3 className="text-sm font-medium text-gray-300 mb-1">Resource</h3>
+                  <div className="text-white">{selectedLog.resourceType}</div>
+                  <div className="text-gray-400 text-sm font-mono">{selectedLog.resourceId}</div>
                 </div>
               </div>
 
               <div>
                 <h3 className="text-sm font-medium text-gray-300 mb-2">Details</h3>
                 <pre className="bg-gray-800 p-4 rounded-lg overflow-x-auto text-sm text-gray-300">
-                  {JSON.stringify(selectedLog.details, null, 2)}
+                  {JSON.stringify(parseDetails(selectedLog.details), null, 2)}
                 </pre>
               </div>
             </div>
