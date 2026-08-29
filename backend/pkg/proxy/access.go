@@ -78,15 +78,12 @@ func ResolveRegistryWithPathPrefix(db *database.Database, requestHost, path, art
 }
 
 // registryTypeMatches reports whether a registry of type regType satisfies
-// a request for artifactType. Equal types always match; "maven-virtual" is
-// additionally treated as satisfying "maven" — it has no upstream URL of
-// its own (see RegistryConfig.Members) but must still be selectable
-// wherever a "maven" registry is expected.
+// a request for artifactType. Equal types always match; "<artifactType>-virtual"
+// is additionally treated as satisfying artifactType — it has no upstream
+// URL of its own (see RegistryConfig.Members) but must still be selectable
+// wherever a plain registry of that type is expected.
 func registryTypeMatches(regType, artifactType string) bool {
-	if regType == artifactType {
-		return true
-	}
-	return artifactType == "maven" && regType == "maven-virtual"
+	return regType == artifactType || regType == VirtualTypeFor(artifactType)
 }
 
 // matchRegistryByPrefix finds an enabled, proxy-enabled registry of

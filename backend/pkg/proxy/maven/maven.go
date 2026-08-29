@@ -12,7 +12,6 @@ package maven
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -365,75 +364,17 @@ func (p *MavenProxy) getUpstreamURL(reg *database.RegistryConfig, group, artifac
 }
 
 // resolveUpstreamCandidates returns the ordered registries to try upstream
-// for reg. A plain registry is just itself. A "maven-virtual" registry has
-// no upstream URL of its own -- it resolves each of its Members by ID,
-// skipping any that are missing, disabled, not type "maven" (no nested
-// virtuals), or that the requesting user can't read -- so a public virtual
-// repo can't be used to route around a private member's own access grants.
+// for reg, via the shared virtual-registry resolution logic (see
+// proxypkg.ResolveMemberCandidates for the "<type>-virtual" semantics).
 func (p *MavenProxy) resolveUpstreamCandidates(user *middleware.User, reg *database.RegistryConfig) []*database.RegistryConfig {
-	if reg == nil {
-		return nil
-	}
-	if reg.Type != "maven-virtual" {
-		return []*database.RegistryConfig{reg}
-	}
-
-	candidates := make([]*database.RegistryConfig, 0, len(reg.Members))
-	for _, memberID := range reg.Members {
-		member, err := p.db.GetRegistry(memberID)
-		if err != nil || member == nil || !member.Enabled || member.Type != "maven" {
-			continue
-		}
-		if !p.rbacMgr.CanReadRegistry(user, member) {
-			continue
-		}
-		candidates = append(candidates, member)
-	}
-	return candidates
+	return proxypkg.ResolveMemberCandidates(p.db, p.rbacMgr, user, reg, "maven")
 }
 
 // fetchUpstream tries each candidate in order, building the upstream URL via
-// getUpstreamURL and applying the candidate's own upstream auth, and returns
-// the first successful (HTTP 200) body. Returns an error naming the last
-// failure if every candidate fails or none are eligible.
+// getUpstreamURL, via the shared FetchFirstUpstream helper.
 func (p *MavenProxy) fetchUpstream(candidates []*database.RegistryConfig, group, artifact, version, ext string) ([]byte, error) {
-	if len(candidates) == 0 {
-		return nil, fmt.Errorf("no upstream proxy configured for this registry")
-	}
-
-	var lastErr error
-	for _, cand := range candidates {
-		upstreamURL, err := p.getUpstreamURL(cand, group, artifact, version, ext)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		req, err := http.NewRequest(http.MethodGet, upstreamURL, nil)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		proxypkg.ApplyUpstreamAuth(req, cand)
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
-			lastErr = fmt.Errorf("upstream %s returned status %d", cand.ID, resp.StatusCode)
-			continue
-		}
-		data, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		return data, nil
-	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("no upstream candidate available")
-	}
-	return nil, lastErr
+	data, _, err := proxypkg.FetchFirstUpstream(candidates, func(cand *database.RegistryConfig) (string, error) {
+		return p.getUpstreamURL(cand, group, artifact, version, ext)
+	})
+	return data, err
 }
