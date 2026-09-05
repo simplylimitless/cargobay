@@ -105,20 +105,28 @@ func (p *CondaProxy) handlePackage(w http.ResponseWriter, r *http.Request) {
 
 	t := proxypkg.TargetFromContext(r, "conda")
 
-	if data, err := p.storage.GetArtifact(t.Label, namespace, name, versionKey); err == nil && data != nil {
+	if rc, err := p.storage.GetArtifactStream(t.Label, namespace, name, versionKey); err == nil && rc != nil {
+		defer rc.Close()
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", fileName))
 		if err := p.db.IncrementArtifactDownloads(t.Label, namespace, name, versionKey); err != nil {
 			fmt.Printf("failed to record download for %s: %v\n", fileName, err)
 		}
-		w.Write(data)
+		io.Copy(w, rc)
 		return
 	}
 
 	upstreamPath := fmt.Sprintf("%s/%s/%s", channel, subdir, fileName)
-	data, err := p.fetchFromUpstream(t.Reg, upstreamPath)
+	resp, err := p.fetchStreamFromUpstream(t.Reg, upstreamPath)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to download package: %v", err), http.StatusBadGateway)
+		return
+	}
+	counter := &proxypkg.CountingReader{R: resp.Body}
+	_, err = p.storage.SaveArtifactStream(t.Label, namespace, name, versionKey, counter)
+	resp.Body.Close()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to save package: %v", err), http.StatusInternalServerError)
 		return
 	}
 
@@ -130,27 +138,29 @@ func (p *CondaProxy) handlePackage(w http.ResponseWriter, r *http.Request) {
 		ArtifactName:    name,
 		Version:         versionKey,
 		DigestAlgorithm: "sha256",
-		Size:            int64(len(data)),
+		Size:            counter.N,
 		Metadata:        map[string]interface{}{},
 		Tags:            []string{versionKey},
 	}
 	if err := p.db.SaveArtifact(artifact); err != nil {
 		fmt.Printf("Warning: failed to save package metadata: %v\n", err)
 	}
-	if _, err := p.storage.SaveArtifact(t.Label, namespace, name, versionKey, data); err != nil {
-		http.Error(w, fmt.Sprintf("Failed to save package: %v", err), http.StatusInternalServerError)
+
+	rc, err := p.storage.GetArtifactStream(t.Label, namespace, name, versionKey)
+	if err != nil || rc == nil {
+		http.Error(w, "Failed to serve package", http.StatusInternalServerError)
 		return
 	}
-
+	defer rc.Close()
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", fileName))
 	if err := p.db.IncrementArtifactDownloads(t.Label, namespace, name, versionKey); err != nil {
 		fmt.Printf("failed to record download for %s: %v\n", fileName, err)
 	}
-	w.Write(data)
+	io.Copy(w, rc)
 }
 
-func (p *CondaProxy) fetchFromUpstream(reg *database.RegistryConfig, path string) ([]byte, error) {
+func (p *CondaProxy) fetchStreamFromUpstream(reg *database.RegistryConfig, path string) (*http.Response, error) {
 	if reg == nil || !reg.Proxy || reg.URL == "" {
 		return nil, fmt.Errorf("no upstream proxy configured for this registry")
 	}
@@ -164,11 +174,11 @@ func (p *CondaProxy) fetchFromUpstream(reg *database.RegistryConfig, path string
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
 		return nil, fmt.Errorf("upstream returned status %d", resp.StatusCode)
 	}
-	return io.ReadAll(resp.Body)
+	return resp, nil
 }
 
 // splitCondaFileName splits "name-version-build.tar.bz2" (or ".conda") into

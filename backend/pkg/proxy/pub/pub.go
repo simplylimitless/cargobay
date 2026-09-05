@@ -38,7 +38,10 @@ func NewPubProxy(db *database.Database, storage storage.StorageAdapter, cache *c
 	r.Use(proxypkg.RequireReadAccess(db, rbacMgr, registries, "dart"))
 
 	r.Get("/api/packages/{name}", proxy.handlePackageInfo)
-	r.Get("/api/packages/{name}/versions/{version}.tar.gz", proxy.handleArchive)
+	// chi cannot match a literal suffix glued onto a {param} within the same
+	// path segment (e.g. "{version}.tar.gz"), so the version+".tar.gz" is
+	// captured as a wildcard and the suffix is stripped in handleArchive.
+	r.Get("/api/packages/{name}/versions/*", proxy.handleArchive)
 
 	return r
 }
@@ -124,22 +127,35 @@ func (p *PubProxy) fetchInfoFromUpstream(reg *database.RegistryConfig, name stri
 // handleArchive handles .tar.gz archive downloads.
 func (p *PubProxy) handleArchive(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
-	version := chi.URLParam(r, "version")
+	rest := chi.URLParam(r, "*")
+	version := strings.TrimSuffix(rest, ".tar.gz")
+	if version == rest {
+		http.NotFound(w, r)
+		return
+	}
 	t := proxypkg.TargetFromContext(r, "dart")
 
-	if data, err := p.storage.GetArtifact(t.Label, "", name, version); err == nil && data != nil {
+	if rc, err := p.storage.GetArtifactStream(t.Label, "", name, version); err == nil && rc != nil {
+		defer rc.Close()
 		w.Header().Set("Content-Type", "application/gzip")
 		if err := p.db.IncrementArtifactDownloads(t.Label, "", name, version); err != nil {
 			fmt.Printf("failed to record download for %s@%s: %v\n", name, version, err)
 		}
-		w.Write(data)
+		io.Copy(w, rc)
 		return
 	}
 
 	upstreamPath := fmt.Sprintf("api/packages/%s/versions/%s.tar.gz", name, version)
-	data, err := p.fetchFromUpstream(t.Reg, upstreamPath)
+	resp, err := p.fetchStreamFromUpstream(t.Reg, upstreamPath)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to fetch archive: %v", err), http.StatusBadGateway)
+		return
+	}
+	counter := &proxypkg.CountingReader{R: resp.Body}
+	_, err = p.storage.SaveArtifactStream(t.Label, "", name, version, counter)
+	resp.Body.Close()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to save archive: %v", err), http.StatusInternalServerError)
 		return
 	}
 
@@ -149,23 +165,46 @@ func (p *PubProxy) handleArchive(w http.ResponseWriter, r *http.Request) {
 		ArtifactType: "dart",
 		ArtifactName: name,
 		Version:      version,
-		Size:         int64(len(data)),
+		Size:         counter.N,
 		Metadata:     map[string]interface{}{},
 		Tags:         []string{version},
 	}
 	if err := p.db.SaveArtifact(artifact); err != nil {
 		fmt.Printf("Warning: failed to save package metadata: %v\n", err)
 	}
-	if _, err := p.storage.SaveArtifact(t.Label, "", name, version, data); err != nil {
-		http.Error(w, fmt.Sprintf("Failed to save archive: %v", err), http.StatusInternalServerError)
+
+	rc, err := p.storage.GetArtifactStream(t.Label, "", name, version)
+	if err != nil || rc == nil {
+		http.Error(w, "Failed to serve archive", http.StatusInternalServerError)
 		return
 	}
-
+	defer rc.Close()
 	w.Header().Set("Content-Type", "application/gzip")
 	if err := p.db.IncrementArtifactDownloads(t.Label, "", name, version); err != nil {
 		fmt.Printf("failed to record download for %s@%s: %v\n", name, version, err)
 	}
-	w.Write(data)
+	io.Copy(w, rc)
+}
+
+func (p *PubProxy) fetchStreamFromUpstream(reg *database.RegistryConfig, path string) (*http.Response, error) {
+	if reg == nil || !reg.Proxy || reg.URL == "" {
+		return nil, fmt.Errorf("no upstream proxy configured for this registry")
+	}
+	url := fmt.Sprintf("%s/%s", strings.TrimSuffix(reg.URL, "/"), path)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	proxypkg.ApplyUpstreamAuth(req, reg)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, fmt.Errorf("upstream returned status %d", resp.StatusCode)
+	}
+	return resp, nil
 }
 
 func (p *PubProxy) fetchFromUpstream(reg *database.RegistryConfig, path string) ([]byte, error) {

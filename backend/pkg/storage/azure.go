@@ -126,6 +126,52 @@ func (a *AzureAdapter) SaveArtifact(registryID, namespace, artifactName, version
 	return key, nil
 }
 
+// SaveArtifactStream saves an artifact to Azure Blob Storage by streaming
+// directly from r, without buffering the whole payload in memory first.
+func (a *AzureAdapter) SaveArtifactStream(registryID, namespace, artifactName, version string, r io.Reader) (string, error) {
+	key := a.getStoragePath(registryID, namespace, artifactName, version)
+
+	tier := blob.AccessTierHot
+	switch a.tiering {
+	case "Cool":
+		tier = blob.AccessTierCool
+	case "Archive":
+		tier = blob.AccessTierArchive
+	}
+
+	meta := map[string]*string{
+		"Registry":     &registryID,
+		"Namespace":    &namespace,
+		"ArtifactName": &artifactName,
+		"Version":      &version,
+	}
+
+	_, err := a.client.UploadStream(context.Background(), a.container, key, r, &azblob.UploadStreamOptions{
+		AccessTier: &tier,
+		Metadata:   meta,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to upload to Azure: %w", err)
+	}
+
+	return key, nil
+}
+
+// GetArtifactStream opens an artifact from Azure Blob Storage for
+// streaming. Returns (nil, nil) if it isn't cached.
+func (a *AzureAdapter) GetArtifactStream(registryID, namespace, artifactName, version string) (io.ReadCloser, error) {
+	key := a.getStoragePath(registryID, namespace, artifactName, version)
+
+	resp, err := a.client.DownloadStream(context.Background(), a.container, key, nil)
+	if err != nil {
+		if bloberror.HasCode(err, bloberror.BlobNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return resp.Body, nil
+}
+
 // GetArtifact retrieves an artifact from Azure Blob Storage
 func (a *AzureAdapter) GetArtifact(registryID, namespace, artifactName, version string) ([]byte, error) {
 	key := a.getStoragePath(registryID, namespace, artifactName, version)

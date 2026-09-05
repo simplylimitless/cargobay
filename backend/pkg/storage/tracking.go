@@ -1,5 +1,7 @@
 package storage
 
+import "io"
+
 // TrackingAdapter wraps a StorageAdapter and reports the byte size of every
 // successful GetArtifact call — a cache hit means those bytes were served
 // from local storage instead of being re-fetched from the upstream registry,
@@ -23,4 +25,44 @@ func (t *TrackingAdapter) GetArtifact(registryID, namespace, artifactName, versi
 		t.onCacheHit(registryID, namespace, artifactName, version, int64(len(data)))
 	}
 	return data, err
+}
+
+// GetArtifactStream opens the wrapped adapter's stream and reports the
+// byte count to onCacheHit once the caller finishes reading (on Close),
+// so streamed cache hits are tracked the same as buffered ones.
+func (t *TrackingAdapter) GetArtifactStream(registryID, namespace, artifactName, version string) (io.ReadCloser, error) {
+	rc, err := t.StorageAdapter.GetArtifactStream(registryID, namespace, artifactName, version)
+	if err != nil || rc == nil || t.onCacheHit == nil {
+		return rc, err
+	}
+	return &trackingReadCloser{
+		ReadCloser: rc,
+		onClose: func(n int64) {
+			if n > 0 {
+				t.onCacheHit(registryID, namespace, artifactName, version, n)
+			}
+		},
+	}, nil
+}
+
+// trackingReadCloser counts bytes read and fires onClose with the total
+// once the stream is closed.
+type trackingReadCloser struct {
+	io.ReadCloser
+	n       int64
+	onClose func(n int64)
+}
+
+func (t *trackingReadCloser) Read(p []byte) (int, error) {
+	n, err := t.ReadCloser.Read(p)
+	t.n += int64(n)
+	return n, err
+}
+
+func (t *trackingReadCloser) Close() error {
+	err := t.ReadCloser.Close()
+	if t.onClose != nil {
+		t.onClose(t.n)
+	}
+	return err
 }

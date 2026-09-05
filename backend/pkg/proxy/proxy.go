@@ -7,6 +7,7 @@ package proxy
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -166,16 +167,19 @@ func (pm *ProxyManager) DownloadArtifact(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Get artifact data from storage
-	data, err := pm.storage.GetArtifact(registryID, namespace, artifactName, version)
-	if err != nil || data == nil {
+	// Stream artifact data from storage straight to the client, so large
+	// artifacts (e.g. Docker layers, jars) never sit fully buffered in
+	// process memory.
+	rc, err := pm.storage.GetArtifactStream(registryID, namespace, artifactName, version)
+	if err != nil || rc == nil {
 		http.Error(w, "Artifact data not found", http.StatusNotFound)
 		return
 	}
+	defer rc.Close()
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s-%s", artifactName, version))
 	w.Header().Set("X-Content-Digest", artifact.Digest)
 	w.WriteHeader(http.StatusOK)
-	w.Write(data)
+	io.Copy(w, rc)
 }

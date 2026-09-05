@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -1115,20 +1116,25 @@ func (s *Server) handleDownloadArtifact(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Get artifact data from storage
-	data, err := s.storageAdapter.GetArtifact(artifact.RegistryID, artifact.Namespace, artifact.ArtifactName, artifact.Version)
+	// Stream artifact data from storage straight to the client, so large
+	// artifacts never sit fully buffered in process memory.
+	rc, err := s.storageAdapter.GetArtifactStream(artifact.RegistryID, artifact.Namespace, artifact.ArtifactName, artifact.Version)
 	if err != nil {
 		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to retrieve artifact: %v", err))
 		return
 	}
+	if rc == nil {
+		s.writeJSONError(w, http.StatusNotFound, "Artifact data not found")
+		return
+	}
+	defer rc.Close()
 
 	// Set response headers
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s-%s.tar.gz", artifact.ArtifactName, artifact.Version))
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
 
 	w.WriteHeader(http.StatusOK)
-	w.Write(data)
+	io.Copy(w, rc)
 }
 
 // handleSignArtifact handles signing an artifact

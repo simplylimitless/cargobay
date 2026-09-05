@@ -1,9 +1,11 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -72,6 +74,24 @@ func (m *MockStorageAdapter) GetArtifact(registryID, namespace, artifactName, ve
 // SaveArtifact implements storage.StorageAdapter interface
 func (m *MockStorageAdapter) SaveArtifact(registryID, namespace, artifactName, version string, data []byte) (string, error) {
 	return "", nil
+}
+
+// GetArtifactStream implements storage.StorageAdapter interface
+func (m *MockStorageAdapter) GetArtifactStream(registryID, namespace, artifactName, version string) (io.ReadCloser, error) {
+	data, err := m.GetArtifact(registryID, namespace, artifactName, version)
+	if err != nil || data == nil {
+		return nil, err
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
+}
+
+// SaveArtifactStream implements storage.StorageAdapter interface
+func (m *MockStorageAdapter) SaveArtifactStream(registryID, namespace, artifactName, version string, r io.Reader) (string, error) {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return "", err
+	}
+	return m.SaveArtifact(registryID, namespace, artifactName, version, data)
 }
 
 // DeleteArtifact implements storage.StorageAdapter interface

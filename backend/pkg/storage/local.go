@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 )
@@ -13,6 +14,15 @@ type StorageAdapter interface {
 	GetArtifact(registryID, namespace, artifactName, version string) ([]byte, error)
 	DeleteArtifact(registryID, namespace, artifactName, version string) error
 	ArtifactExists(registryID, namespace, artifactName, version string) (bool, error)
+
+	// Streaming artifact operations. Large payloads (e.g. Docker image
+	// layers) route through these instead of the []byte versions above, so
+	// they never sit fully buffered in process memory. GetArtifactStream
+	// returns (nil, nil) when the artifact isn't cached, mirroring
+	// GetArtifact's not-found convention; callers must Close a non-nil
+	// ReadCloser.
+	SaveArtifactStream(registryID, namespace, artifactName, version string, r io.Reader) (string, error)
+	GetArtifactStream(registryID, namespace, artifactName, version string) (io.ReadCloser, error)
 
 	// File operations
 	Upload(bucket, key string, data []byte, contentType string) error
@@ -106,6 +116,45 @@ func (a *LocalAdapter) GetArtifact(registryID, namespace, artifactName, version 
 		return nil, err
 	}
 	return data, nil
+}
+
+// SaveArtifactStream saves an artifact to local storage by copying directly
+// from r, without buffering the whole payload in memory first.
+func (a *LocalAdapter) SaveArtifactStream(registryID, namespace, artifactName, version string, r io.Reader) (string, error) {
+	path := a.getArtifactPath(registryID, namespace, artifactName, version)
+	if err := os.MkdirAll(path, 0755); err != nil {
+		return "", err
+	}
+
+	filePath := filepath.Join(path, "artifact.bin")
+	f, err := os.Create(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	if _, err := io.Copy(f, r); err != nil {
+		os.Remove(filePath)
+		return "", err
+	}
+
+	return filePath, nil
+}
+
+// GetArtifactStream opens an artifact from local storage for streaming.
+// Returns (nil, nil) if it isn't cached.
+func (a *LocalAdapter) GetArtifactStream(registryID, namespace, artifactName, version string) (io.ReadCloser, error) {
+	path := a.getArtifactPath(registryID, namespace, artifactName, version)
+	filePath := filepath.Join(path, "artifact.bin")
+
+	f, err := os.Open(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return f, nil
 }
 
 // DeleteArtifact removes an artifact from local storage

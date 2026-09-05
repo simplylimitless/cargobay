@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/simplylimitless/cargobay/backend/pkg/cache"
@@ -65,9 +66,11 @@ func NewNPMProxy(db *database.Database, storage storage.StorageAdapter, cache *c
 	r.Get("/{pkgName}", proxy.handlePackage)
 	r.Get("/{pkgName}/{version}", proxy.handlePackageVersion)
 
-	// Download tarballs
-	r.Get("/{pkgName}/-/{tarballName}-{version}.tgz", proxy.handleTarball)
-	r.Get("/@{scope}/{pkgName}/-/{tarballName}-{version}.tgz", proxy.handleScopedTarball)
+	// Download tarballs. chi cannot match a literal suffix glued onto a
+	// {param} within the same path segment (e.g. "{tarballName}-{version}.tgz"),
+	// so the filename is captured as a wildcard and parsed in the handler.
+	r.Get("/{pkgName}/-/*", proxy.handleTarball)
+	r.Get("/@{scope}/{pkgName}/-/*", proxy.handleScopedTarball)
 
 	return r
 }
@@ -230,7 +233,11 @@ func (p *NPMProxy) handlePackageVersion(w http.ResponseWriter, r *http.Request) 
 func (p *NPMProxy) handleTarball(w http.ResponseWriter, r *http.Request) {
 	t := proxypkg.TargetFromContext(r, "npm")
 	pkgName := chi.URLParam(r, "pkgName")
-	version := chi.URLParam(r, "version")
+	version, ok := parseTarballVersion(chi.URLParam(r, "*"), pkgName)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
 
 	// Try to get from local storage first
 	data, err := p.storage.GetArtifact(t.Label, "", pkgName, version)
@@ -273,26 +280,27 @@ func (p *NPMProxy) handleTarball(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("Failed to download tarball: %v", err), http.StatusBadGateway)
 		return
 	}
-	defer resp.Body.Close()
 
-	data = make([]byte, resp.ContentLength)
-	resp.Body.Read(data)
-
-	// Save to storage
-	if _, err := p.storage.SaveArtifact(t.Label, "", pkgName, version, data); err != nil {
+	counter := &proxypkg.CountingReader{R: resp.Body}
+	_, err = p.storage.SaveArtifactStream(t.Label, "", pkgName, version, counter)
+	resp.Body.Close()
+	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to save artifact: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// Save to cache
-	p.cacheSet(fmt.Sprintf("tarball:%s:%s", pkgName, version), data)
-
+	rc, err := p.storage.GetArtifactStream(t.Label, "", pkgName, version)
+	if err != nil || rc == nil {
+		http.Error(w, "Failed to serve artifact", http.StatusInternalServerError)
+		return
+	}
+	defer rc.Close()
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s-%s.tgz", pkgName, version))
 	if err := p.db.IncrementArtifactDownloads(t.Label, "", pkgName, version); err != nil {
 		fmt.Printf("failed to record download for %s@%s: %v\n", pkgName, version, err)
 	}
-	w.Write(data)
+	io.Copy(w, rc)
 }
 
 // handleScopedTarball handles scoped pkgName tarball downloads
@@ -300,17 +308,22 @@ func (p *NPMProxy) handleScopedTarball(w http.ResponseWriter, r *http.Request) {
 	t := proxypkg.TargetFromContext(r, "npm")
 	scope := chi.URLParam(r, "scope")
 	pkgName := chi.URLParam(r, "pkgName")
-	version := chi.URLParam(r, "version")
+	version, ok := parseTarballVersion(chi.URLParam(r, "*"), pkgName)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
 	packageName := fmt.Sprintf("@%s/%s", scope, pkgName)
 
 	// Try cache first
-	if data, err := p.storage.GetArtifact(t.Label, scope, pkgName, version); err == nil && data != nil {
+	if rc, err := p.storage.GetArtifactStream(t.Label, scope, pkgName, version); err == nil && rc != nil {
+		defer rc.Close()
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s-%s.tgz", packageName, version))
 		if err := p.db.IncrementArtifactDownloads(t.Label, scope, pkgName, version); err != nil {
 			fmt.Printf("failed to record download for %s@%s: %v\n", packageName, version, err)
 		}
-		w.Write(data)
+		io.Copy(w, rc)
 		return
 	}
 
@@ -322,23 +335,43 @@ func (p *NPMProxy) handleScopedTarball(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("Failed to download tarball: %v", err), http.StatusBadGateway)
 		return
 	}
-	defer resp.Body.Close()
-
-	data := make([]byte, resp.ContentLength)
-	resp.Body.Read(data)
-
-	// Save to storage
-	if _, err := p.storage.SaveArtifact(t.Label, scope, pkgName, version, data); err != nil {
+	counter := &proxypkg.CountingReader{R: resp.Body}
+	_, err = p.storage.SaveArtifactStream(t.Label, scope, pkgName, version, counter)
+	resp.Body.Close()
+	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to save artifact: %v", err), http.StatusInternalServerError)
 		return
 	}
 
+	rc, err := p.storage.GetArtifactStream(t.Label, scope, pkgName, version)
+	if err != nil || rc == nil {
+		http.Error(w, "Failed to serve artifact", http.StatusInternalServerError)
+		return
+	}
+	defer rc.Close()
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s-%s.tgz", packageName, version))
 	if err := p.db.IncrementArtifactDownloads(t.Label, scope, pkgName, version); err != nil {
 		fmt.Printf("failed to record download for %s@%s: %v\n", packageName, version, err)
 	}
-	w.Write(data)
+	io.Copy(w, rc)
+}
+
+// parseTarballVersion extracts the version from a tarball filename of the
+// form "{pkgName}-{version}.tgz" (the npm convention: the tarball name is
+// always the unscoped package name), since chi can't capture it as a
+// separate path parameter alongside a literal ".tgz" suffix in the same
+// segment (see the tarball routes in NewNPMProxy).
+func parseTarballVersion(filename, pkgName string) (version string, ok bool) {
+	rest := strings.TrimSuffix(filename, ".tgz")
+	if rest == filename {
+		return "", false
+	}
+	version = strings.TrimPrefix(rest, pkgName+"-")
+	if version == rest || version == "" {
+		return "", false
+	}
+	return version, true
 }
 
 // fetchFromUpstream fetches data from the resolved registry's configured

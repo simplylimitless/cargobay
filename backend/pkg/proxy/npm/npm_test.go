@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -480,7 +481,7 @@ func TestTarballDownloadFromStorage(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/"+pkgName+"/-/"+pkgName+"-4.18.0.tgz", nil)
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("pkgName", pkgName)
-	rctx.URLParams.Add("version", "4.18.0")
+	rctx.URLParams.Add("*", pkgName+"-4.18.0.tgz")
 	req = withChiRouteContext(req, rctx)
 	rec := httptest.NewRecorder()
 
@@ -505,7 +506,7 @@ func TestTarballNotFoundReturnsBadGateway(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/"+pkgName+"/-/"+pkgName+"-1.0.0.tgz", nil)
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("pkgName", pkgName)
-	rctx.URLParams.Add("version", "1.0.0")
+	rctx.URLParams.Add("*", pkgName+"-1.0.0.tgz")
 	req = withChiRouteContext(req, rctx)
 	rec := httptest.NewRecorder()
 
@@ -529,7 +530,7 @@ func TestScopedTarballDownloadFromStorage(t *testing.T) {
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("scope", scope)
 	rctx.URLParams.Add("pkgName", pkgName)
-	rctx.URLParams.Add("version", "20.0.0")
+	rctx.URLParams.Add("*", pkgName+"-20.0.0.tgz")
 	req = withChiRouteContext(req, rctx)
 	rec := httptest.NewRecorder()
 
@@ -538,6 +539,81 @@ func TestScopedTarballDownloadFromStorage(t *testing.T) {
 	assert.Equal(t, http.StatusOK, rec.Code)
 	assert.Contains(t, rec.Header().Get("Content-Disposition"), "attachment")
 	assert.Equal(t, tarballData, rec.Body.Bytes())
+}
+
+// TestHandleTarballViaRouterCacheMiss drives handleTarball through the real
+// chi router (verifying the "/{pkgName}/-/*" wildcard route added to work
+// around chi's inability to match a literal ".tgz" suffix glued onto a
+// {param} in the same segment actually dispatches real tarball requests),
+// fetches package version metadata and the tarball itself from a fake
+// upstream on a genuine cache miss, and confirms the tarball is both served
+// and durably cached.
+func TestHandleTarballViaRouterCacheMiss(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+
+	pkgName := uniqueID("tarball-pkg")
+	version := "3.1.4"
+	tarballData := []byte("upstream tarball bytes")
+
+	var upstream *httptest.Server
+	upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case fmt.Sprintf("/%s/%s", pkgName, version):
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"name":    pkgName,
+				"version": version,
+				"dist":    map[string]interface{}{"tarball": upstream.URL + "/" + pkgName + "/-/" + pkgName + "-" + version + ".tgz"},
+			})
+		case fmt.Sprintf("/%s/-/%s-%s.tgz", pkgName, pkgName, version):
+			w.Write(tarballData)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	host := uniqueID("tarball-host") + ".test"
+	reg := &database.RegistryConfig{
+		ID:       uniqueID("tarball-reg"),
+		Name:     "tarball-reg",
+		URL:      upstream.URL,
+		Type:     "npm",
+		Proxy:    true,
+		Enabled:  true,
+		Priority: 100,
+		Private:  false,
+		Host:     host,
+	}
+	require.NoError(t, db.SaveRegistry(reg))
+	t.Cleanup(func() { db.DeleteRegistry(reg.ID) })
+
+	adapter, err := storage.NewLocalAdapter(map[string]string{"path": t.TempDir()})
+	require.NoError(t, err)
+	router := NewNPMProxy(db, adapter, c, rbac.New(db), nil)
+
+	get := func() *http.Response {
+		req := httptest.NewRequest(http.MethodGet, "/"+pkgName+"/-/"+pkgName+"-"+version+".tgz", nil)
+		req.Host = host
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec.Result()
+	}
+
+	resp := get()
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, tarballData, body)
+
+	upstream.Close()
+	resp2 := get()
+	defer resp2.Body.Close()
+	assert.Equal(t, http.StatusOK, resp2.StatusCode)
+	body2, err := io.ReadAll(resp2.Body)
+	require.NoError(t, err)
+	assert.Equal(t, tarballData, body2)
 }
 
 func TestCacheGetAndSet(t *testing.T) {

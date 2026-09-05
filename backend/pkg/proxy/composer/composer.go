@@ -40,7 +40,10 @@ func NewComposerProxy(db *database.Database, storage storage.StorageAdapter, cac
 	r.Use(proxypkg.RequireReadAccess(db, rbacMgr, registries, "composer"))
 
 	r.Get("/packages.json", proxy.handlePackagesJSON)
-	r.Get("/dist/{vendor}/{name}/{version}.zip", proxy.handleDist)
+	// chi cannot match a literal suffix glued onto a {param} within the same
+	// path segment (e.g. "{version}.zip"), so the version+".zip" is captured
+	// as a wildcard and the suffix is stripped in handleDist instead.
+	r.Get("/dist/{vendor}/{name}/*", proxy.handleDist)
 
 	return r
 }
@@ -93,15 +96,21 @@ func (p *ComposerProxy) handlePackagesJSON(w http.ResponseWriter, r *http.Reques
 func (p *ComposerProxy) handleDist(w http.ResponseWriter, r *http.Request) {
 	vendor := chi.URLParam(r, "vendor")
 	name := chi.URLParam(r, "name")
-	version := chi.URLParam(r, "version")
+	rest := chi.URLParam(r, "*")
+	version := strings.TrimSuffix(rest, ".zip")
+	if version == rest {
+		http.NotFound(w, r)
+		return
+	}
 	t := proxypkg.TargetFromContext(r, "composer")
 
-	if data, err := p.storage.GetArtifact(t.Label, vendor, name, version); err == nil && data != nil {
+	if rc, err := p.storage.GetArtifactStream(t.Label, vendor, name, version); err == nil && rc != nil {
+		defer rc.Close()
 		w.Header().Set("Content-Type", "application/zip")
 		if err := p.db.IncrementArtifactDownloads(t.Label, vendor, name, version); err != nil {
 			fmt.Printf("failed to record download for %s/%s@%s: %v\n", vendor, name, version, err)
 		}
-		w.Write(data)
+		io.Copy(w, rc)
 		return
 	}
 
@@ -110,9 +119,16 @@ func (p *ComposerProxy) handleDist(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("Failed to resolve package: %v", err), http.StatusNotFound)
 		return
 	}
-	data, err := fetchBytes(t.Reg, distURL)
+	resp, err := fetchStream(t.Reg, distURL)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to download package: %v", err), http.StatusBadGateway)
+		return
+	}
+	counter := &proxypkg.CountingReader{R: resp.Body}
+	_, err = p.storage.SaveArtifactStream(t.Label, vendor, name, version, counter)
+	resp.Body.Close()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to save package: %v", err), http.StatusInternalServerError)
 		return
 	}
 
@@ -123,23 +139,25 @@ func (p *ComposerProxy) handleDist(w http.ResponseWriter, r *http.Request) {
 		Namespace:    vendor,
 		ArtifactName: name,
 		Version:      version,
-		Size:         int64(len(data)),
+		Size:         counter.N,
 		Metadata:     map[string]interface{}{},
 		Tags:         []string{version},
 	}
 	if err := p.db.SaveArtifact(artifact); err != nil {
 		fmt.Printf("Warning: failed to save package metadata: %v\n", err)
 	}
-	if _, err := p.storage.SaveArtifact(t.Label, vendor, name, version, data); err != nil {
-		http.Error(w, fmt.Sprintf("Failed to save package: %v", err), http.StatusInternalServerError)
+
+	rc, err := p.storage.GetArtifactStream(t.Label, vendor, name, version)
+	if err != nil || rc == nil {
+		http.Error(w, "Failed to serve package", http.StatusInternalServerError)
 		return
 	}
-
+	defer rc.Close()
 	w.Header().Set("Content-Type", "application/zip")
 	if err := p.db.IncrementArtifactDownloads(t.Label, vendor, name, version); err != nil {
 		fmt.Printf("failed to record download for %s/%s@%s: %v\n", vendor, name, version, err)
 	}
-	w.Write(data)
+	io.Copy(w, rc)
 }
 
 func (p *ComposerProxy) resolveUpstreamDistURL(reg *database.RegistryConfig, vendor, name, version string) (string, error) {
@@ -187,6 +205,26 @@ func fetchBytes(reg *database.RegistryConfig, url string) ([]byte, error) {
 		return nil, fmt.Errorf("upstream returned status %d", resp.StatusCode)
 	}
 	return io.ReadAll(resp.Body)
+}
+
+// fetchStream is like fetchBytes but returns the live response so a large
+// dist archive can be streamed straight into storage instead of buffered in
+// memory. Callers must close the returned body.
+func fetchStream(reg *database.RegistryConfig, url string) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	proxypkg.ApplyUpstreamAuth(req, reg)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, fmt.Errorf("upstream returned status %d", resp.StatusCode)
+	}
+	return resp, nil
 }
 
 func baseURL(r *http.Request) string {

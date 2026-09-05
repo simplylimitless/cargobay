@@ -12,6 +12,7 @@ package pypi
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -177,8 +178,8 @@ func (p *PyPIProxy) handlePackageFile(w http.ResponseWriter, r *http.Request) {
 	t := proxypkg.TargetFromContext(r, "pypi")
 
 	// Try to get from storage first
-	data, err := p.storage.GetArtifact(t.Label, "", packageName, version)
-	if err == nil && data != nil {
+	if rc, err := p.storage.GetArtifactStream(t.Label, "", packageName, version); err == nil && rc != nil {
+		defer rc.Close()
 		// Determine content type based on file extension
 		contentType := "application/octet-stream"
 		if strings.HasSuffix(fileName, ".whl") {
@@ -194,25 +195,32 @@ func (p *PyPIProxy) handlePackageFile(w http.ResponseWriter, r *http.Request) {
 		if err := p.db.IncrementArtifactDownloads(t.Label, "", packageName, version); err != nil {
 			fmt.Printf("failed to record download for %s==%s: %v\n", packageName, version, err)
 		}
-		w.Write(data)
+		io.Copy(w, rc)
 		return
 	}
 
 	// Fetch from upstream
-	data, err = p.fetchPackageFileFromUpstream(t.Reg, packageName, version, fileName)
+	resp, err := p.fetchPackageFileStreamFromUpstream(t.Reg, packageName, version, fileName)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to download package: %v", err), http.StatusBadGateway)
 		return
 	}
 
 	// Save to storage
-	if _, err = p.storage.SaveArtifact(t.Label, "", packageName, version, data); err != nil {
+	counter := &proxypkg.CountingReader{R: resp.Body}
+	_, err = p.storage.SaveArtifactStream(t.Label, "", packageName, version, counter)
+	resp.Body.Close()
+	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to save artifact: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// Save to cache
-	p.cacheSet(fmt.Sprintf("file:%s:%s:%s", packageName, version, fileName), data)
+	rc, err := p.storage.GetArtifactStream(t.Label, "", packageName, version)
+	if err != nil || rc == nil {
+		http.Error(w, "Failed to serve artifact", http.StatusInternalServerError)
+		return
+	}
+	defer rc.Close()
 
 	// Determine content type
 	contentType := "application/octet-stream"
@@ -229,7 +237,7 @@ func (p *PyPIProxy) handlePackageFile(w http.ResponseWriter, r *http.Request) {
 	if err := p.db.IncrementArtifactDownloads(t.Label, "", packageName, version); err != nil {
 		fmt.Printf("failed to record download for %s==%s: %v\n", packageName, version, err)
 	}
-	w.Write(data)
+	io.Copy(w, rc)
 }
 
 // handleLegacyPackage handles legacy package routes
@@ -325,8 +333,9 @@ func (p *PyPIProxy) fetchPackageFromUpstream(reg *database.RegistryConfig, regis
 	return artifact, nil
 }
 
-// fetchPackageFileFromUpstream fetches a package file from PyPI
-func (p *PyPIProxy) fetchPackageFileFromUpstream(reg *database.RegistryConfig, packageName, version, fileName string) ([]byte, error) {
+// fetchPackageFileStreamFromUpstream fetches a package file from PyPI,
+// leaving the response body open for streaming into storage.
+func (p *PyPIProxy) fetchPackageFileStreamFromUpstream(reg *database.RegistryConfig, packageName, version, fileName string) (*http.Response, error) {
 	if reg == nil || !reg.Proxy || !strings.HasPrefix(reg.URL, "http") {
 		return nil, fmt.Errorf("no upstream proxy configured for this registry")
 	}
@@ -343,21 +352,11 @@ func (p *PyPIProxy) fetchPackageFileFromUpstream(reg *database.RegistryConfig, p
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-
-	data := make([]byte, 0)
-	buf := make([]byte, 4096)
-	for {
-		n, err := resp.Body.Read(buf)
-		if n > 0 {
-			data = append(data, buf[:n]...)
-		}
-		if err != nil {
-			break
-		}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, fmt.Errorf("upstream returned status %d", resp.StatusCode)
 	}
-
-	return data, nil
+	return resp, nil
 }
 
 // generateSimpleIndex generates the HTML index for the simple root

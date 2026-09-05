@@ -81,7 +81,8 @@ func (p *ConanProxy) handleRecipeDownloadURLs(w http.ResponseWriter, r *http.Req
 
 	urls := map[string]string{}
 	for _, f := range recipeFiles {
-		if data, err := p.storage.GetArtifact("conan", namespace, name, fileVersionKey(version, f)); err == nil && data != nil {
+		if rc, err := p.storage.GetArtifactStream("conan", namespace, name, fileVersionKey(version, f)); err == nil && rc != nil {
+			rc.Close()
 			urls[f] = fmt.Sprintf("%s/%s", base, f)
 		}
 	}
@@ -111,7 +112,8 @@ func (p *ConanProxy) handlePackageDownloadURLs(w http.ResponseWriter, r *http.Re
 
 	urls := map[string]string{}
 	for _, f := range packageFiles {
-		if data, err := p.storage.GetArtifact("conan-pkg", namespace, name, packageVersionKey(version, packageID, f)); err == nil && data != nil {
+		if rc, err := p.storage.GetArtifactStream("conan-pkg", namespace, name, packageVersionKey(version, packageID, f)); err == nil && rc != nil {
+			rc.Close()
 			urls[f] = fmt.Sprintf("%s/%s", base, f)
 		}
 	}
@@ -137,21 +139,24 @@ func (p *ConanProxy) handleRecipeFile(w http.ResponseWriter, r *http.Request) {
 
 	t := proxypkg.TargetFromContext(r, "conan")
 
-	if data, err := p.storage.GetArtifact(t.Label, namespace, name, key); err == nil && data != nil {
-		p.serveBlob(w, name, version, fileName, data, func() error {
+	if rc, err := p.storage.GetArtifactStream(t.Label, namespace, name, key); err == nil && rc != nil {
+		defer rc.Close()
+		p.serveBlobStream(w, name, version, fileName, rc, func() error {
 			return p.db.IncrementArtifactDownloads(t.Label, namespace, name, version)
 		})
 		return
 	}
 
 	upstreamPath := fmt.Sprintf("v1/conans/%s/%s/%s/%s/files/%s", name, version, user, channel, fileName)
-	data, err := p.fetchFromUpstream(t.Reg, upstreamPath)
+	resp, err := p.fetchStreamFromUpstream(t.Reg, upstreamPath)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to download file: %v", err), http.StatusBadGateway)
 		return
 	}
-
-	if _, err := p.storage.SaveArtifact(t.Label, namespace, name, key, data); err != nil {
+	counter := &proxypkg.CountingReader{R: resp.Body}
+	_, err = p.storage.SaveArtifactStream(t.Label, namespace, name, key, counter)
+	resp.Body.Close()
+	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to save file: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -163,7 +168,7 @@ func (p *ConanProxy) handleRecipeFile(w http.ResponseWriter, r *http.Request) {
 			Namespace:    namespace,
 			ArtifactName: name,
 			Version:      version,
-			Size:         int64(len(data)),
+			Size:         counter.N,
 			Metadata:     map[string]interface{}{},
 			Tags:         []string{version},
 		}
@@ -172,7 +177,13 @@ func (p *ConanProxy) handleRecipeFile(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	p.serveBlob(w, name, version, fileName, data, func() error {
+	rc, err := p.storage.GetArtifactStream(t.Label, namespace, name, key)
+	if err != nil || rc == nil {
+		http.Error(w, "Failed to serve file", http.StatusInternalServerError)
+		return
+	}
+	defer rc.Close()
+	p.serveBlobStream(w, name, version, fileName, rc, func() error {
 		return p.db.IncrementArtifactDownloads(t.Label, namespace, name, version)
 	})
 }
@@ -191,31 +202,44 @@ func (p *ConanProxy) handlePackageFile(w http.ResponseWriter, r *http.Request) {
 
 	t := proxypkg.TargetFromContext(r, "conan")
 
-	if data, err := p.storage.GetArtifact(t.Label, namespace, name, key); err == nil && data != nil {
-		p.serveBlob(w, name, version, fileName, data, func() error {
+	if rc, err := p.storage.GetArtifactStream(t.Label, namespace, name, key); err == nil && rc != nil {
+		defer rc.Close()
+		p.serveBlobStream(w, name, version, fileName, rc, func() error {
 			return p.db.IncrementArtifactDownloads(t.Label, namespace, name, version)
 		})
 		return
 	}
 
 	upstreamPath := fmt.Sprintf("v1/conans/%s/%s/%s/%s/packages/%s/files/%s", name, version, user, channel, packageID, fileName)
-	data, err := p.fetchFromUpstream(t.Reg, upstreamPath)
+	resp, err := p.fetchStreamFromUpstream(t.Reg, upstreamPath)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to download file: %v", err), http.StatusBadGateway)
 		return
 	}
-
-	if _, err := p.storage.SaveArtifact(t.Label, namespace, name, key, data); err != nil {
+	counter := &proxypkg.CountingReader{R: resp.Body}
+	_, err = p.storage.SaveArtifactStream(t.Label, namespace, name, key, counter)
+	resp.Body.Close()
+	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to save file: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	p.serveBlob(w, name, version, fileName, data, func() error {
+	rc, err := p.storage.GetArtifactStream(t.Label, namespace, name, key)
+	if err != nil || rc == nil {
+		http.Error(w, "Failed to serve file", http.StatusInternalServerError)
+		return
+	}
+	defer rc.Close()
+	p.serveBlobStream(w, name, version, fileName, rc, func() error {
 		return p.db.IncrementArtifactDownloads(t.Label, namespace, name, version)
 	})
 }
 
-func (p *ConanProxy) serveBlob(w http.ResponseWriter, name, version, fileName string, data []byte, count func() error) {
+// serveBlobStream writes headers and streams a cached file's contents to
+// the client, incrementing the download counter only for the large blob
+// files (matching how other proxies only count the real package blob, not
+// small manifest/info files).
+func (p *ConanProxy) serveBlobStream(w http.ResponseWriter, name, version, fileName string, r io.Reader, count func() error) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", fileName))
 	if largeBlobs[fileName] {
@@ -223,10 +247,14 @@ func (p *ConanProxy) serveBlob(w http.ResponseWriter, name, version, fileName st
 			fmt.Printf("failed to record download for %s/%s (%s): %v\n", name, version, fileName, err)
 		}
 	}
-	w.Write(data)
+	io.Copy(w, r)
 }
 
-func (p *ConanProxy) fetchFromUpstream(reg *database.RegistryConfig, path string) ([]byte, error) {
+// fetchStreamFromUpstream is like a []byte-returning fetch but returns the
+// live response so large recipe/package files can be streamed straight into
+// storage instead of buffered in memory. Callers must close the returned
+// body.
+func (p *ConanProxy) fetchStreamFromUpstream(reg *database.RegistryConfig, path string) (*http.Response, error) {
 	if reg == nil || !reg.Proxy || reg.URL == "" {
 		return nil, fmt.Errorf("no upstream proxy configured for this registry")
 	}
@@ -240,11 +268,11 @@ func (p *ConanProxy) fetchFromUpstream(reg *database.RegistryConfig, path string
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
 		return nil, fmt.Errorf("upstream returned status %d", resp.StatusCode)
 	}
-	return io.ReadAll(resp.Body)
+	return resp, nil
 }
 
 func fileVersionKey(version, fileName string) string {

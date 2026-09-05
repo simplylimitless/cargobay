@@ -148,6 +148,24 @@ func (m *MockStorageAdapter) SaveArtifact(registryID, namespace, artifactName, v
 	return "", nil
 }
 
+// GetArtifactStream implements storage.StorageAdapter interface
+func (m *MockStorageAdapter) GetArtifactStream(registryID, namespace, artifactName, version string) (io.ReadCloser, error) {
+	data, err := m.GetArtifact(registryID, namespace, artifactName, version)
+	if err != nil || data == nil {
+		return nil, err
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
+}
+
+// SaveArtifactStream implements storage.StorageAdapter interface
+func (m *MockStorageAdapter) SaveArtifactStream(registryID, namespace, artifactName, version string, r io.Reader) (string, error) {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return "", err
+	}
+	return m.SaveArtifact(registryID, namespace, artifactName, version, data)
+}
+
 // DeleteArtifact implements storage.StorageAdapter interface
 func (m *MockStorageAdapter) DeleteArtifact(registryID, namespace, artifactName, version string) error {
 	return nil

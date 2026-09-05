@@ -127,19 +127,27 @@ func (p *DebianProxy) handlePool(w http.ResponseWriter, r *http.Request) {
 
 	t := proxypkg.TargetFromContext(r, "debian")
 
-	if data, err := p.storage.GetArtifact(t.Label, arch, name, version); err == nil && data != nil {
+	if rc, err := p.storage.GetArtifactStream(t.Label, arch, name, version); err == nil && rc != nil {
+		defer rc.Close()
 		w.Header().Set("Content-Type", "application/vnd.debian.binary-package")
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", fileName))
 		if err := p.db.IncrementArtifactDownloads(t.Label, arch, name, version); err != nil {
 			fmt.Printf("failed to record download for %s_%s_%s: %v\n", name, version, arch, err)
 		}
-		w.Write(data)
+		io.Copy(w, rc)
 		return
 	}
 
-	data, err := p.fetchFromUpstream(t.Reg, fileName)
+	resp, err := p.fetchStreamFromUpstream(t.Reg, fileName)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to download package: %v", err), http.StatusBadGateway)
+		return
+	}
+	counter := &proxypkg.CountingReader{R: resp.Body}
+	_, err = p.storage.SaveArtifactStream(t.Label, arch, name, version, counter)
+	resp.Body.Close()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to save package: %v", err), http.StatusInternalServerError)
 		return
 	}
 
@@ -151,27 +159,29 @@ func (p *DebianProxy) handlePool(w http.ResponseWriter, r *http.Request) {
 		ArtifactName:    name,
 		Version:         version,
 		DigestAlgorithm: "sha256",
-		Size:            int64(len(data)),
+		Size:            counter.N,
 		Metadata:        map[string]interface{}{},
 		Tags:            []string{version},
 	}
 	if err := p.db.SaveArtifact(artifact); err != nil {
 		fmt.Printf("Warning: failed to save package metadata: %v\n", err)
 	}
-	if _, err := p.storage.SaveArtifact(t.Label, arch, name, version, data); err != nil {
-		http.Error(w, fmt.Sprintf("Failed to save package: %v", err), http.StatusInternalServerError)
+
+	rc, err := p.storage.GetArtifactStream(t.Label, arch, name, version)
+	if err != nil || rc == nil {
+		http.Error(w, "Failed to serve package", http.StatusInternalServerError)
 		return
 	}
-
+	defer rc.Close()
 	w.Header().Set("Content-Type", "application/vnd.debian.binary-package")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", fileName))
 	if err := p.db.IncrementArtifactDownloads(t.Label, arch, name, version); err != nil {
 		fmt.Printf("failed to record download for %s_%s_%s: %v\n", name, version, arch, err)
 	}
-	w.Write(data)
+	io.Copy(w, rc)
 }
 
-func (p *DebianProxy) fetchFromUpstream(reg *database.RegistryConfig, fileName string) ([]byte, error) {
+func (p *DebianProxy) fetchStreamFromUpstream(reg *database.RegistryConfig, fileName string) (*http.Response, error) {
 	if reg == nil || !reg.Proxy || reg.URL == "" {
 		return nil, fmt.Errorf("no upstream proxy configured for this registry")
 	}
@@ -185,11 +195,11 @@ func (p *DebianProxy) fetchFromUpstream(reg *database.RegistryConfig, fileName s
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
 		return nil, fmt.Errorf("upstream returned status %d", resp.StatusCode)
 	}
-	return io.ReadAll(resp.Body)
+	return resp, nil
 }
 
 // splitDebFileName splits "name_version_arch.deb" into its three parts.

@@ -183,6 +183,54 @@ func (a *S3Adapter) determineStorageClass(data []byte) types.StorageClass {
 	return types.StorageClassStandard
 }
 
+// SaveArtifactStream saves an artifact to S3 by streaming directly from r,
+// without buffering the whole payload in memory first. Storage class is
+// fixed at Standard since streamed uploads don't know the final size up
+// front (determineStorageClass needs len(data)); callers proxying very
+// large or very small objects that want tiering should use SaveArtifact.
+func (a *S3Adapter) SaveArtifactStream(registryID, namespace, artifactName, version string, r io.Reader) (string, error) {
+	key := a.getStoragePath(registryID, namespace, artifactName, version)
+
+	_, err := a.client.PutObject(context.Background(), &s3.PutObjectInput{
+		Bucket:      aws.String(a.bucket),
+		Key:         aws.String(key),
+		Body:        r,
+		ContentType: aws.String("application/octet-stream"),
+		Metadata: map[string]string{
+			"Registry":     registryID,
+			"Namespace":    namespace,
+			"ArtifactName": artifactName,
+			"Version":      version,
+			"SavedAt":      time.Now().UTC().Format(time.RFC3339),
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to save artifact to S3: %w", err)
+	}
+
+	return key, nil
+}
+
+// GetArtifactStream opens an artifact from S3 for streaming. Returns (nil,
+// nil) if it isn't cached.
+func (a *S3Adapter) GetArtifactStream(registryID, namespace, artifactName, version string) (io.ReadCloser, error) {
+	key := a.getStoragePath(registryID, namespace, artifactName, version)
+
+	resp, err := a.client.GetObject(context.Background(), &s3.GetObjectInput{
+		Bucket: aws.String(a.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		var notFound *types.NotFound
+		if errors.As(err, &notFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get artifact from S3: %w", err)
+	}
+
+	return resp.Body, nil
+}
+
 // GetArtifact retrieves an artifact from S3
 func (a *S3Adapter) GetArtifact(registryID, namespace, artifactName, version string) ([]byte, error) {
 	key := a.getStoragePath(registryID, namespace, artifactName, version)

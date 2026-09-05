@@ -814,30 +814,24 @@ func (p *DockerProxy) handleGetBlob(w http.ResponseWriter, r *http.Request, t ta
 		return
 	}
 
-	blob, err := p.storage.GetArtifact("docker", repository, "blob", digest)
-	if err == nil && blob != nil {
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Header().Set("Docker-Content-Digest", digest)
-		w.WriteHeader(http.StatusOK)
-		w.Write(blob)
-		return
+	rc, err := p.storage.GetArtifactStream("docker", repository, "blob", digest)
+	if err != nil || rc == nil {
+		if err := p.streamBlobFromUpstream(t.reg, repository, digest); err != nil {
+			http.Error(w, "blob unknown", http.StatusNotFound)
+			return
+		}
+		rc, err = p.storage.GetArtifactStream("docker", repository, "blob", digest)
+		if err != nil || rc == nil {
+			http.Error(w, "blob unknown", http.StatusNotFound)
+			return
+		}
 	}
-
-	blob, err = p.fetchBlobFromUpstream(t.reg, repository, digest)
-	if err != nil {
-		http.Error(w, "blob unknown", http.StatusNotFound)
-		return
-	}
-
-	if _, err := p.storage.SaveArtifact("docker", repository, "blob", digest, blob); err != nil {
-		http.Error(w, fmt.Sprintf("Failed to cache blob: %v", err), http.StatusInternalServerError)
-		return
-	}
+	defer rc.Close()
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Docker-Content-Digest", digest)
 	w.WriteHeader(http.StatusOK)
-	w.Write(blob)
+	io.Copy(w, rc)
 }
 
 // handleHeadBlob checks if a blob exists, pulling it through and caching it
@@ -858,13 +852,8 @@ func (p *DockerProxy) handleHeadBlob(w http.ResponseWriter, r *http.Request, t t
 	}
 
 	if !exists {
-		blob, err := p.fetchBlobFromUpstream(t.reg, repository, digest)
-		if err != nil {
+		if err := p.streamBlobFromUpstream(t.reg, repository, digest); err != nil {
 			http.Error(w, "blob unknown", http.StatusNotFound)
-			return
-		}
-		if _, err := p.storage.SaveArtifact("docker", repository, "blob", digest, blob); err != nil {
-			http.Error(w, fmt.Sprintf("Failed to cache blob: %v", err), http.StatusInternalServerError)
 			return
 		}
 	}
@@ -1118,23 +1107,27 @@ func (p *DockerProxy) fetchUpstreamDigest(reg *database.RegistryConfig, reposito
 	return digest, nil
 }
 
-// fetchBlobFromUpstream pulls a blob (image layer or config) through from
-// the upstream registry for a repository that isn't cached locally yet.
-func (p *DockerProxy) fetchBlobFromUpstream(reg *database.RegistryConfig, repository, digest string) ([]byte, error) {
+// streamBlobFromUpstream pulls a blob through from the upstream registry and
+// writes it straight into storage as it downloads, so a large layer (a
+// multi-hundred-MB Docker image blob is common) never sits fully buffered in
+// process memory. Callers read the cached copy back via
+// storage.GetArtifactStream once this returns.
+func (p *DockerProxy) streamBlobFromUpstream(reg *database.RegistryConfig, repository, digest string) error {
 	base, err := upstreamBase(reg)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	reqURL := fmt.Sprintf("%s/v2/%s/blobs/%s", base, normalizeRepository(repository), digest)
 	resp, err := p.upstreamRequest(reg, http.MethodGet, reqURL, nil)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("upstream returned %d", resp.StatusCode)
+		return fmt.Errorf("upstream returned %d", resp.StatusCode)
 	}
-	return io.ReadAll(resp.Body)
+	_, err = p.storage.SaveArtifactStream("docker", repository, "blob", digest, resp.Body)
+	return err
 }
 
 // handleHealth is the registry v2 ping/discovery endpoint. Anonymous

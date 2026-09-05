@@ -246,39 +246,35 @@ func (h *HelmProxy) handleChartDownload(w http.ResponseWriter, r *http.Request) 
 	t := proxypkg.TargetFromContext(r, "helm")
 
 	// Try to get from storage first
-	data, err := h.storage.GetArtifact(t.Label, "", chartName, version)
-	if err == nil && data != nil {
+	if rc, err := h.storage.GetArtifactStream(t.Label, "", chartName, version); err == nil && rc != nil {
+		defer rc.Close()
 		w.Header().Set("Content-Type", "application/x-gzip")
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", fileName))
 		if err := h.db.IncrementArtifactDownloads(t.Label, "", chartName, version); err != nil {
 			fmt.Printf("failed to record download for %s %s: %v\n", chartName, version, err)
 		}
-		w.Write(data)
+		io.Copy(w, rc)
 		return
 	}
 
 	// Fetch from upstream
-	data, err = h.fetchChartFromUpstream(t.Reg, t.Label, chartName, version, fileName)
-	if err != nil {
+	if err := h.fetchAndSaveChart(t.Reg, t.Label, chartName, version, fileName); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to download chart: %v", err), http.StatusBadGateway)
 		return
 	}
 
-	// Save to storage
-	if _, err = h.storage.SaveArtifact(t.Label, "", chartName, version, data); err != nil {
-		http.Error(w, fmt.Sprintf("Failed to save chart: %v", err), http.StatusInternalServerError)
+	rc, err := h.storage.GetArtifactStream(t.Label, "", chartName, version)
+	if err != nil || rc == nil {
+		http.Error(w, "Failed to serve chart", http.StatusInternalServerError)
 		return
 	}
-
-	// Save to cache
-	h.cacheSet(fmt.Sprintf("chart:%s:%s", chartName, version), data)
-
+	defer rc.Close()
 	w.Header().Set("Content-Type", "application/x-gzip")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", fileName))
 	if err := h.db.IncrementArtifactDownloads(t.Label, "", chartName, version); err != nil {
 		fmt.Printf("failed to record download for %s %s: %v\n", chartName, version, err)
 	}
-	w.Write(data)
+	io.Copy(w, rc)
 }
 
 // handleChartDownloadAlt handles alternative chart download path
@@ -288,35 +284,34 @@ func (h *HelmProxy) handleChartDownloadAlt(w http.ResponseWriter, r *http.Reques
 	t := proxypkg.TargetFromContext(r, "helm")
 
 	// Try to get from storage first
-	data, err := h.storage.GetArtifact(t.Label, "", chartName, version)
-	if err == nil && data != nil {
+	if rc, err := h.storage.GetArtifactStream(t.Label, "", chartName, version); err == nil && rc != nil {
+		defer rc.Close()
 		w.Header().Set("Content-Type", "application/x-gzip")
 		if err := h.db.IncrementArtifactDownloads(t.Label, "", chartName, version); err != nil {
 			fmt.Printf("failed to record download for %s %s: %v\n", chartName, version, err)
 		}
-		w.Write(data)
+		io.Copy(w, rc)
 		return
 	}
 
 	// Fetch from upstream
 	fileName := fmt.Sprintf("%s-%s.tgz", chartName, version)
-	data, err = h.fetchChartFromUpstream(t.Reg, t.Label, chartName, version, fileName)
-	if err != nil {
+	if err := h.fetchAndSaveChart(t.Reg, t.Label, chartName, version, fileName); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to download chart: %v", err), http.StatusBadGateway)
 		return
 	}
 
-	// Save to storage
-	if _, err = h.storage.SaveArtifact(t.Label, "", chartName, version, data); err != nil {
-		http.Error(w, fmt.Sprintf("Failed to save chart: %v", err), http.StatusInternalServerError)
+	rc, err := h.storage.GetArtifactStream(t.Label, "", chartName, version)
+	if err != nil || rc == nil {
+		http.Error(w, "Failed to serve chart", http.StatusInternalServerError)
 		return
 	}
-
+	defer rc.Close()
 	w.Header().Set("Content-Type", "application/x-gzip")
 	if err := h.db.IncrementArtifactDownloads(t.Label, "", chartName, version); err != nil {
 		fmt.Printf("failed to record download for %s %s: %v\n", chartName, version, err)
 	}
-	w.Write(data)
+	io.Copy(w, rc)
 }
 
 // handleChartFile handles chart file access (values.yaml, Chart.yaml, etc.)
@@ -370,18 +365,19 @@ func (h *HelmProxy) handleChartsDir(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// fetchChartFromUpstream fetches a chart from upstream
-func (h *HelmProxy) fetchChartFromUpstream(reg *database.RegistryConfig, registryLabel, chartName, version, fileName string) ([]byte, error) {
+// fetchAndSaveChart fetches a chart from upstream and streams it straight
+// into storage, then saves its (minimal) metadata record. It does not
+// buffer the whole chart in memory: unlike the old fetchChartFromUpstream,
+// it also does not keep a copy in the in-process byte cache — caching a
+// large chart tarball there would reintroduce the same full-blob memory
+// buildup this streaming conversion is meant to eliminate, and the on-disk
+// storage cache (checked by the caller before this is even called) already
+// serves repeat requests.
+func (h *HelmProxy) fetchAndSaveChart(reg *database.RegistryConfig, registryLabel, chartName, version, fileName string) error {
 	if reg == nil || !reg.Proxy || reg.URL == "" {
-		return nil, fmt.Errorf("no upstream proxy configured for this registry")
+		return fmt.Errorf("no upstream proxy configured for this registry")
 	}
 	upstream := reg.URL
-
-	// Try to get from cache
-	cacheKey := fmt.Sprintf("upstream:chart:%s:%s", chartName, version)
-	if data, err := h.cacheGet(cacheKey); err == nil {
-		return data, nil
-	}
 
 	// Construct chart URL
 	// Helm chart repositories typically organize charts like:
@@ -390,46 +386,27 @@ func (h *HelmProxy) fetchChartFromUpstream(reg *database.RegistryConfig, registr
 
 	chartReq, err := http.NewRequest(http.MethodGet, chartURL, nil)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	proxypkg.ApplyUpstreamAuth(chartReq, reg)
 	resp, err := http.DefaultClient.Do(chartReq)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	defer resp.Body.Close()
-
-	data := make([]byte, 0)
-	buf := make([]byte, 4096)
-	for {
-		n, err := resp.Body.Read(buf)
-		if n > 0 {
-			data = append(data, buf[:n]...)
-		}
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return nil, err
-		}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return fmt.Errorf("upstream returned status %d", resp.StatusCode)
 	}
 
-	// Cache the chart
-	h.cacheSet(cacheKey, data)
-
-	// Parse chart metadata and save to database
-	if err := h.saveChartMetadata(registryLabel, chartName, version, data); err != nil {
-		fmt.Printf("Warning: failed to save chart metadata: %v\n", err)
+	counter := &proxypkg.CountingReader{R: resp.Body}
+	if _, err := h.storage.SaveArtifactStream(registryLabel, "", chartName, version, counter); err != nil {
+		resp.Body.Close()
+		return err
 	}
+	resp.Body.Close()
 
-	return data, nil
-}
-
-// saveChartMetadata extracts and saves chart metadata
-func (h *HelmProxy) saveChartMetadata(registryLabel, chartName, version string, chartData []byte) error {
-	// For now, save a minimal record
-	// A full implementation would extract the .tgz, parse Chart.yaml, etc.
-
+	// Save a minimal metadata record. A full implementation would extract
+	// the .tgz and parse Chart.yaml for richer metadata.
 	artifact := &database.ArtifactMetadata{
 		ID:              fmt.Sprintf("helm:%s:%s:%s", registryLabel, chartName, version),
 		RegistryID:      registryLabel,
@@ -438,7 +415,7 @@ func (h *HelmProxy) saveChartMetadata(registryLabel, chartName, version string, 
 		ArtifactName:    chartName,
 		Version:         version,
 		DigestAlgorithm: "sha256",
-		Size:            int64(len(chartData)),
+		Size:            counter.N,
 		Created:         time.Now(),
 		Updated:         time.Now(),
 		Metadata: map[string]interface{}{
@@ -448,8 +425,11 @@ func (h *HelmProxy) saveChartMetadata(registryLabel, chartName, version string, 
 		},
 		Tags: []string{version},
 	}
+	if err := h.db.SaveArtifact(artifact); err != nil {
+		fmt.Printf("Warning: failed to save chart metadata: %v\n", err)
+	}
 
-	return h.db.SaveArtifact(artifact)
+	return nil
 }
 
 // ChartInfo represents chart information for directory listing

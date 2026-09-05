@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 
@@ -15,7 +14,8 @@ import (
 // registry type: a registry of type "<memberType>-virtual" has no upstream
 // URL of its own and instead resolves artifacts by trying its Members (all
 // of type memberType) in order, Artifactory-style. Any protocol proxy can
-// opt into this by using ResolveMemberCandidates/FetchFirstUpstream below.
+// opt into this by using ResolveMemberCandidates/FetchFirstUpstreamStream
+// below.
 const VirtualSuffix = "-virtual"
 
 // VirtualTypeFor returns the virtual registry type for a base protocol type,
@@ -70,13 +70,16 @@ func ResolveMemberCandidates(db *database.Database, rbacMgr *rbac.RBAC, user *mi
 	return candidates
 }
 
-// FetchFirstUpstream tries each candidate in order, building the request URL
-// via buildURL and applying the candidate's own upstream auth, and returns
-// the first successful (HTTP 200) response body along with the candidate
-// that answered (useful for a follow-up request, e.g. npm's tarball fetch,
-// that must reuse the same member's credentials/host). Returns an error
-// naming the last failure if every candidate fails or none are eligible.
-func FetchFirstUpstream(candidates []*database.RegistryConfig, buildURL func(*database.RegistryConfig) (string, error)) ([]byte, *database.RegistryConfig, error) {
+// FetchFirstUpstreamStream tries each candidate in order, building the
+// request URL via buildURL and applying the candidate's own upstream auth,
+// and returns the first successful (HTTP 200) response -- with the body left
+// open, so large artifacts can be streamed straight into storage rather than
+// fully buffered -- along with the candidate that answered (useful for a
+// follow-up request, e.g. npm's tarball fetch, that must reuse the same
+// member's credentials/host). The caller must close the returned response's
+// body. Returns an error naming the last failure if every candidate fails or
+// none are eligible.
+func FetchFirstUpstreamStream(candidates []*database.RegistryConfig, buildURL func(*database.RegistryConfig) (string, error)) (*http.Response, *database.RegistryConfig, error) {
 	if len(candidates) == 0 {
 		return nil, nil, fmt.Errorf("no upstream proxy configured for this registry")
 	}
@@ -104,13 +107,7 @@ func FetchFirstUpstream(candidates []*database.RegistryConfig, buildURL func(*da
 			lastErr = fmt.Errorf("upstream %s returned status %d", cand.ID, resp.StatusCode)
 			continue
 		}
-		data, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		return data, cand, nil
+		return resp, cand, nil
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("no upstream candidate available")

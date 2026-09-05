@@ -118,28 +118,38 @@ func (p *GoModProxy) handleVersioned(w http.ResponseWriter, r *http.Request, pat
 		w.Header().Set("Content-Type", "text/plain")
 		w.Write(data)
 	case ".zip":
-		if data, err := p.storage.GetArtifact(t.Label, "", module, version); err == nil && data != nil {
+		if rc, err := p.storage.GetArtifactStream(t.Label, "", module, version); err == nil && rc != nil {
+			defer rc.Close()
 			w.Header().Set("Content-Type", "application/zip")
 			if err := p.db.IncrementArtifactDownloads(t.Label, "", module, version); err != nil {
 				fmt.Printf("failed to record download for %s@%s: %v\n", module, version, err)
 			}
-			w.Write(data)
+			io.Copy(w, rc)
 			return
 		}
-		data, err := p.fetchZipFromUpstream(t.Reg, t.Label, module, version)
+		resp, err := p.fetchZipStreamFromUpstream(t.Reg, module, version)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Failed to fetch module zip: %v", err), http.StatusBadGateway)
 			return
 		}
-		if _, err := p.storage.SaveArtifact(t.Label, "", module, version, data); err != nil {
+		counter := &proxypkg.CountingReader{R: resp.Body}
+		_, err = p.storage.SaveArtifactStream(t.Label, "", module, version, counter)
+		resp.Body.Close()
+		if err != nil {
 			http.Error(w, fmt.Sprintf("Failed to save module: %v", err), http.StatusInternalServerError)
 			return
 		}
+		rc, err := p.storage.GetArtifactStream(t.Label, "", module, version)
+		if err != nil || rc == nil {
+			http.Error(w, "Failed to serve module", http.StatusInternalServerError)
+			return
+		}
+		defer rc.Close()
 		w.Header().Set("Content-Type", "application/zip")
 		if err := p.db.IncrementArtifactDownloads(t.Label, "", module, version); err != nil {
 			fmt.Printf("failed to record download for %s@%s: %v\n", module, version, err)
 		}
-		w.Write(data)
+		io.Copy(w, rc)
 	default:
 		http.NotFound(w, r)
 	}
@@ -239,13 +249,27 @@ func (p *GoModProxy) fetchModFromUpstream(reg *database.RegistryConfig, module, 
 	return fetchBytes(reg, modURL)
 }
 
-// fetchZipFromUpstream fetches a module's source zip from upstream.
-func (p *GoModProxy) fetchZipFromUpstream(reg *database.RegistryConfig, registryLabel, module, version string) ([]byte, error) {
+// fetchZipStreamFromUpstream fetches a module's source zip from upstream,
+// leaving the response body open for streaming into storage.
+func (p *GoModProxy) fetchZipStreamFromUpstream(reg *database.RegistryConfig, module, version string) (*http.Response, error) {
 	if reg == nil || !reg.Proxy || reg.URL == "" {
 		return nil, fmt.Errorf("no upstream proxy configured for this registry")
 	}
 	zipURL := fmt.Sprintf("%s/%s/@v/%s.zip", strings.TrimSuffix(reg.URL, "/"), escapeModulePath(module), escapeModulePath(version))
-	return fetchBytes(reg, zipURL)
+	req, err := http.NewRequest(http.MethodGet, zipURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	proxypkg.ApplyUpstreamAuth(req, reg)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, fmt.Errorf("upstream returned status %d", resp.StatusCode)
+	}
+	return resp, nil
 }
 
 func fetchBytes(reg *database.RegistryConfig, url string) ([]byte, error) {

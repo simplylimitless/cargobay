@@ -244,33 +244,40 @@ func (n *NuGetProxy) handleDownload(w http.ResponseWriter, r *http.Request) {
 	t := proxypkg.TargetFromContext(r, "nuget")
 
 	// Try to get from storage first
-	data, err := n.storage.GetArtifact(t.Label, "", packageId, version)
-	if err == nil && data != nil {
+	if rc, err := n.storage.GetArtifactStream(t.Label, "", packageId, version); err == nil && rc != nil {
+		defer rc.Close()
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", fileName))
 		w.Header().Set("X-NuGet-Protocol-Version", "3.0.0")
 		if err := n.db.IncrementArtifactDownloads(t.Label, "", packageId, version); err != nil {
 			fmt.Printf("failed to record download for %s %s: %v\n", packageId, version, err)
 		}
-		w.Write(data)
+		io.Copy(w, rc)
 		return
 	}
 
 	// Fetch from upstream
-	data, err = n.fetchPackageFileFromUpstream(t.Reg, packageId, version, fileName)
+	resp, err := n.fetchPackageFileStreamFromUpstream(t.Reg, packageId, version, fileName)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to download package: %v", err), http.StatusBadGateway)
 		return
 	}
 
 	// Save to storage
-	if _, err = n.storage.SaveArtifact(t.Label, "", packageId, version, data); err != nil {
+	counter := &proxypkg.CountingReader{R: resp.Body}
+	_, err = n.storage.SaveArtifactStream(t.Label, "", packageId, version, counter)
+	resp.Body.Close()
+	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to save artifact: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// Save to cache
-	n.cacheSet(fmt.Sprintf("nuget:file:%s:%s", packageId, version), data)
+	rc, err := n.storage.GetArtifactStream(t.Label, "", packageId, version)
+	if err != nil || rc == nil {
+		http.Error(w, "Failed to serve artifact", http.StatusInternalServerError)
+		return
+	}
+	defer rc.Close()
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", fileName))
@@ -278,7 +285,7 @@ func (n *NuGetProxy) handleDownload(w http.ResponseWriter, r *http.Request) {
 	if err := n.db.IncrementArtifactDownloads(t.Label, "", packageId, version); err != nil {
 		fmt.Printf("failed to record download for %s %s: %v\n", packageId, version, err)
 	}
-	w.Write(data)
+	io.Copy(w, rc)
 }
 
 // handleSearchV2 handles the V2 search endpoint
@@ -608,8 +615,9 @@ func (n *NuGetProxy) fetchPackageFromUpstream(reg *database.RegistryConfig, regi
 	return artifact, nil
 }
 
-// fetchPackageFileFromUpstream fetches a .nupkg file from NuGet
-func (n *NuGetProxy) fetchPackageFileFromUpstream(reg *database.RegistryConfig, packageId, version, fileName string) ([]byte, error) {
+// fetchPackageFileStreamFromUpstream fetches a .nupkg file from NuGet,
+// leaving the response body open for streaming into storage.
+func (n *NuGetProxy) fetchPackageFileStreamFromUpstream(reg *database.RegistryConfig, packageId, version, fileName string) (*http.Response, error) {
 	if reg == nil || !reg.Proxy || reg.URL == "" {
 		return nil, fmt.Errorf("no upstream proxy configured for this registry")
 	}
@@ -626,24 +634,11 @@ func (n *NuGetProxy) fetchPackageFileFromUpstream(reg *database.RegistryConfig, 
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-
-	data := make([]byte, 0)
-	buf := make([]byte, 4096)
-	for {
-		n, err := resp.Body.Read(buf)
-		if n > 0 {
-			data = append(data, buf[:n]...)
-		}
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return nil, err
-		}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, fmt.Errorf("upstream returned status %d", resp.StatusCode)
 	}
-
-	return data, nil
+	return resp, nil
 }
 
 // getLatestVersion returns the latest version of a package

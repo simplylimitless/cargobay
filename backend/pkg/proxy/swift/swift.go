@@ -43,9 +43,12 @@ func NewSwiftProxy(db *database.Database, storage storage.StorageAdapter, cache 
 	r.Use(proxypkg.RequireReadAccess(db, rbacMgr, registries, "swift"))
 
 	r.Get("/{scope}/{name}", proxy.handleListReleases)
+	// chi lets this plain-{version} route win over a sibling
+	// "{version}.zip" route (both live in the same path segment), so a
+	// request for the .zip source archive is dispatched here too;
+	// handleReleaseMetadata detects the suffix and delegates.
 	r.Get("/{scope}/{name}/{version}", proxy.handleReleaseMetadata)
 	r.Get("/{scope}/{name}/{version}/Package.swift", proxy.handleManifest)
-	r.Get("/{scope}/{name}/{version}.zip", proxy.handleSourceArchive)
 
 	return r
 }
@@ -84,6 +87,11 @@ func (p *SwiftProxy) handleReleaseMetadata(w http.ResponseWriter, r *http.Reques
 	scope := chi.URLParam(r, "scope")
 	name := chi.URLParam(r, "name")
 	version := chi.URLParam(r, "version")
+
+	if archiveVersion := strings.TrimSuffix(version, ".zip"); archiveVersion != version {
+		p.handleSourceArchive(w, r, scope, name, archiveVersion)
+		return
+	}
 
 	w.Header().Set("Content-Type", registryContentType)
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -125,26 +133,33 @@ func (p *SwiftProxy) handleManifest(w http.ResponseWriter, r *http.Request) {
 	w.Write(data)
 }
 
-// handleSourceArchive handles .zip source-archive downloads.
-func (p *SwiftProxy) handleSourceArchive(w http.ResponseWriter, r *http.Request) {
-	scope := chi.URLParam(r, "scope")
-	name := chi.URLParam(r, "name")
-	version := chi.URLParam(r, "version")
+// handleSourceArchive handles .zip source-archive downloads. It's reached
+// via handleReleaseMetadata, which detects the ".zip" suffix that chi
+// routes to the plain-{version} pattern (see NewSwiftProxy).
+func (p *SwiftProxy) handleSourceArchive(w http.ResponseWriter, r *http.Request, scope, name, version string) {
 	t := proxypkg.TargetFromContext(r, "swift")
 
-	if data, err := p.storage.GetArtifact(t.Label, scope, name, version); err == nil && data != nil {
+	if rc, err := p.storage.GetArtifactStream(t.Label, scope, name, version); err == nil && rc != nil {
+		defer rc.Close()
 		w.Header().Set("Content-Type", "application/zip")
 		if err := p.db.IncrementArtifactDownloads(t.Label, scope, name, version); err != nil {
 			fmt.Printf("failed to record download for %s.%s@%s: %v\n", scope, name, version, err)
 		}
-		w.Write(data)
+		io.Copy(w, rc)
 		return
 	}
 
 	upstreamPath := fmt.Sprintf("%s/%s/%s.zip", scope, name, version)
-	data, err := p.fetchFromUpstream(t.Reg, upstreamPath)
+	resp, err := p.fetchStreamFromUpstream(t.Reg, upstreamPath)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to fetch source archive: %v", err), http.StatusBadGateway)
+		return
+	}
+	counter := &proxypkg.CountingReader{R: resp.Body}
+	_, err = p.storage.SaveArtifactStream(t.Label, scope, name, version, counter)
+	resp.Body.Close()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to save source archive: %v", err), http.StatusInternalServerError)
 		return
 	}
 
@@ -155,23 +170,46 @@ func (p *SwiftProxy) handleSourceArchive(w http.ResponseWriter, r *http.Request)
 		Namespace:    scope,
 		ArtifactName: name,
 		Version:      version,
-		Size:         int64(len(data)),
+		Size:         counter.N,
 		Metadata:     map[string]interface{}{},
 		Tags:         []string{version},
 	}
 	if err := p.db.SaveArtifact(artifact); err != nil {
 		fmt.Printf("Warning: failed to save release metadata: %v\n", err)
 	}
-	if _, err := p.storage.SaveArtifact(t.Label, scope, name, version, data); err != nil {
-		http.Error(w, fmt.Sprintf("Failed to save source archive: %v", err), http.StatusInternalServerError)
+
+	rc, err := p.storage.GetArtifactStream(t.Label, scope, name, version)
+	if err != nil || rc == nil {
+		http.Error(w, "Failed to serve source archive", http.StatusInternalServerError)
 		return
 	}
-
+	defer rc.Close()
 	w.Header().Set("Content-Type", "application/zip")
 	if err := p.db.IncrementArtifactDownloads(t.Label, scope, name, version); err != nil {
 		fmt.Printf("failed to record download for %s.%s@%s: %v\n", scope, name, version, err)
 	}
-	w.Write(data)
+	io.Copy(w, rc)
+}
+
+func (p *SwiftProxy) fetchStreamFromUpstream(reg *database.RegistryConfig, path string) (*http.Response, error) {
+	if reg == nil || !reg.Proxy || reg.URL == "" {
+		return nil, fmt.Errorf("no upstream proxy configured for this registry")
+	}
+	url := fmt.Sprintf("%s/%s", strings.TrimSuffix(reg.URL, "/"), path)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	proxypkg.ApplyUpstreamAuth(req, reg)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, fmt.Errorf("upstream returned status %d", resp.StatusCode)
+	}
+	return resp, nil
 }
 
 func (p *SwiftProxy) fetchFromUpstream(reg *database.RegistryConfig, path string) ([]byte, error) {

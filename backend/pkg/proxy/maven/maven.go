@@ -12,6 +12,7 @@ package maven
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -111,39 +112,44 @@ func (p *MavenProxy) handleJAR(w http.ResponseWriter, r *http.Request) {
 	t := proxypkg.TargetFromContext(r, "maven")
 
 	// Try cache first
-	if data, err := p.storage.GetArtifact("maven", group, artifact, version); err == nil && data != nil {
+	if rc, err := p.storage.GetArtifactStream("maven", group, artifact, version); err == nil && rc != nil {
+		defer rc.Close()
 		w.Header().Set("Content-Type", "application/java-archive")
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s-%s.jar", artifact, version))
 		if err := p.db.IncrementArtifactDownloads(t.Label, group, artifact, version); err != nil {
 			fmt.Printf("failed to record download for %s:%s:%s: %v\n", group, artifact, version, err)
 		}
-		w.Write(data)
+		io.Copy(w, rc)
 		return
 	}
 
 	// Fetch from upstream
 	candidates := p.resolveUpstreamCandidates(middleware.GetUser(r), t.Reg)
-	data, err := p.fetchUpstream(candidates, group, artifact, version, "jar")
+	resp, _, err := p.fetchUpstreamStream(candidates, group, artifact, version, "jar")
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to download JAR: %v", err), http.StatusBadGateway)
 		return
 	}
-
-	// Save to storage
-	if _, err := p.storage.SaveArtifact("maven", group, artifact, version, data); err != nil {
+	counter := &proxypkg.CountingReader{R: resp.Body}
+	_, err = p.storage.SaveArtifactStream("maven", group, artifact, version, counter)
+	resp.Body.Close()
+	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to save artifact: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// Save to cache
-	p.cache.Set(fmt.Sprintf("jar:%s:%s:%s", group, artifact, version), data)
-
+	rc, err := p.storage.GetArtifactStream("maven", group, artifact, version)
+	if err != nil || rc == nil {
+		http.Error(w, "Failed to serve artifact", http.StatusInternalServerError)
+		return
+	}
+	defer rc.Close()
 	w.Header().Set("Content-Type", "application/java-archive")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s-%s.jar", artifact, version))
 	if err := p.db.IncrementArtifactDownloads(t.Label, group, artifact, version); err != nil {
 		fmt.Printf("failed to record download for %s:%s:%s: %v\n", group, artifact, version, err)
 	}
-	w.Write(data)
+	io.Copy(w, rc)
 }
 
 // handlePOM handles POM file downloads
@@ -153,34 +159,39 @@ func (p *MavenProxy) handlePOM(w http.ResponseWriter, r *http.Request) {
 	version := chi.URLParam(r, "version")
 
 	// Try cache first
-	if data, err := p.storage.GetArtifact("maven", group, artifact, version); err == nil && data != nil {
+	if rc, err := p.storage.GetArtifactStream("maven", group, artifact, version); err == nil && rc != nil {
+		defer rc.Close()
 		w.Header().Set("Content-Type", "application/xml")
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s-%s.pom", artifact, version))
-		w.Write(data)
+		io.Copy(w, rc)
 		return
 	}
 
 	// Fetch from upstream
 	t := proxypkg.TargetFromContext(r, "maven")
 	candidates := p.resolveUpstreamCandidates(middleware.GetUser(r), t.Reg)
-	data, err := p.fetchUpstream(candidates, group, artifact, version, "pom")
+	resp, _, err := p.fetchUpstreamStream(candidates, group, artifact, version, "pom")
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to download POM: %v", err), http.StatusBadGateway)
 		return
 	}
-
-	// Save to storage
-	if _, err := p.storage.SaveArtifact("maven", group, artifact, version, data); err != nil {
+	counter := &proxypkg.CountingReader{R: resp.Body}
+	_, err = p.storage.SaveArtifactStream("maven", group, artifact, version, counter)
+	resp.Body.Close()
+	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to save artifact: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// Save to cache
-	p.cache.Set(fmt.Sprintf("pom:%s:%s:%s", group, artifact, version), data)
-
+	rc, err := p.storage.GetArtifactStream("maven", group, artifact, version)
+	if err != nil || rc == nil {
+		http.Error(w, "Failed to serve artifact", http.StatusInternalServerError)
+		return
+	}
+	defer rc.Close()
 	w.Header().Set("Content-Type", "application/xml")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s-%s.pom", artifact, version))
-	w.Write(data)
+	io.Copy(w, rc)
 }
 
 // handleWAR handles WAR file downloads
@@ -205,34 +216,39 @@ func (p *MavenProxy) handleArtifactFile(w http.ResponseWriter, r *http.Request, 
 	version := chi.URLParam(r, "version")
 
 	// Try cache first
-	if data, err := p.storage.GetArtifact("maven", group, artifact, version); err == nil && data != nil {
+	if rc, err := p.storage.GetArtifactStream("maven", group, artifact, version); err == nil && rc != nil {
+		defer rc.Close()
 		w.Header().Set("Content-Type", contentType)
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s-%s.%s", artifact, version, ext))
-		w.Write(data)
+		io.Copy(w, rc)
 		return
 	}
 
 	// Fetch from upstream
 	t := proxypkg.TargetFromContext(r, "maven")
 	candidates := p.resolveUpstreamCandidates(middleware.GetUser(r), t.Reg)
-	data, err := p.fetchUpstream(candidates, group, artifact, version, ext)
+	resp, _, err := p.fetchUpstreamStream(candidates, group, artifact, version, ext)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to download %s: %v", ext, err), http.StatusBadGateway)
 		return
 	}
-
-	// Save to storage
-	if _, err := p.storage.SaveArtifact("maven", group, artifact, version, data); err != nil {
+	counter := &proxypkg.CountingReader{R: resp.Body}
+	_, err = p.storage.SaveArtifactStream("maven", group, artifact, version, counter)
+	resp.Body.Close()
+	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to save artifact: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// Save to cache
-	p.cache.Set(fmt.Sprintf("%s:%s:%s:%s", ext, group, artifact, version), data)
-
+	rc, err := p.storage.GetArtifactStream("maven", group, artifact, version)
+	if err != nil || rc == nil {
+		http.Error(w, "Failed to serve artifact", http.StatusInternalServerError)
+		return
+	}
+	defer rc.Close()
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s-%s.%s", artifact, version, ext))
-	w.Write(data)
+	io.Copy(w, rc)
 }
 
 // handleVersionDir lists artifact files for a version
@@ -370,11 +386,13 @@ func (p *MavenProxy) resolveUpstreamCandidates(user *middleware.User, reg *datab
 	return proxypkg.ResolveMemberCandidates(p.db, p.rbacMgr, user, reg, "maven")
 }
 
-// fetchUpstream tries each candidate in order, building the upstream URL via
-// getUpstreamURL, via the shared FetchFirstUpstream helper.
-func (p *MavenProxy) fetchUpstream(candidates []*database.RegistryConfig, group, artifact, version, ext string) ([]byte, error) {
-	data, _, err := proxypkg.FetchFirstUpstream(candidates, func(cand *database.RegistryConfig) (string, error) {
+// fetchUpstreamStream tries each candidate in order, building the upstream
+// URL via getUpstreamURL, via the shared FetchFirstUpstreamStream helper.
+// Unlike fetchUpstream it leaves the response body open for the caller to
+// stream straight into storage instead of buffering the whole artifact in
+// memory; the caller must close the response body.
+func (p *MavenProxy) fetchUpstreamStream(candidates []*database.RegistryConfig, group, artifact, version, ext string) (*http.Response, *database.RegistryConfig, error) {
+	return proxypkg.FetchFirstUpstreamStream(candidates, func(cand *database.RegistryConfig) (string, error) {
 		return p.getUpstreamURL(cand, group, artifact, version, ext)
 	})
-	return data, err
 }

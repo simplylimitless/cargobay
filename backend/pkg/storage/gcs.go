@@ -109,6 +109,53 @@ func (a *GCSAdapter) SaveArtifact(registryID, namespace, artifactName, version s
 	return key, nil
 }
 
+// SaveArtifactStream saves an artifact to GCS by streaming directly from r,
+// without buffering the whole payload in memory first. Storage class is
+// fixed at Standard since the streamed size isn't known up front.
+func (a *GCSAdapter) SaveArtifactStream(registryID, namespace, artifactName, version string, r io.Reader) (string, error) {
+	key := a.getStoragePath(registryID, namespace, artifactName, version)
+
+	obj := a.client.Bucket(a.bucket).Object(key)
+	w := obj.NewWriter(context.Background())
+	w.ContentType = "application/octet-stream"
+	w.CacheControl = "public, max-age=31536000"
+	w.StorageClass = "STANDARD"
+	w.CustomTime = time.Now()
+	w.Metadata = map[string]string{
+		"Registry":     registryID,
+		"Namespace":    namespace,
+		"ArtifactName": artifactName,
+		"Version":      version,
+		"SavedAt":      time.Now().UTC().Format(time.RFC3339),
+	}
+
+	if _, err := io.Copy(w, r); err != nil {
+		w.Close()
+		return "", fmt.Errorf("failed to write to GCS: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		return "", fmt.Errorf("failed to close GCS writer: %w", err)
+	}
+
+	return key, nil
+}
+
+// GetArtifactStream opens an artifact from GCS for streaming. Returns (nil,
+// nil) if it isn't cached.
+func (a *GCSAdapter) GetArtifactStream(registryID, namespace, artifactName, version string) (io.ReadCloser, error) {
+	key := a.getStoragePath(registryID, namespace, artifactName, version)
+
+	obj := a.client.Bucket(a.bucket).Object(key)
+	r, err := obj.NewReader(context.Background())
+	if err != nil {
+		if storage.ErrObjectNotExist == err {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return r, nil
+}
+
 // GetArtifact retrieves an artifact from GCS
 func (a *GCSAdapter) GetArtifact(registryID, namespace, artifactName, version string) ([]byte, error) {
 	key := a.getStoragePath(registryID, namespace, artifactName, version)

@@ -141,33 +141,41 @@ func (p *CargoProxy) handleDownload(w http.ResponseWriter, r *http.Request) {
 	version := chi.URLParam(r, "version")
 	t := proxypkg.TargetFromContext(r, "cargo")
 
-	if data, err := p.storage.GetArtifact(t.Label, "", name, version); err == nil && data != nil {
+	if rc, err := p.storage.GetArtifactStream(t.Label, "", name, version); err == nil && rc != nil {
+		defer rc.Close()
 		w.Header().Set("Content-Type", "application/gzip")
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s-%s.crate", name, version))
 		if err := p.db.IncrementArtifactDownloads(t.Label, "", name, version); err != nil {
 			fmt.Printf("failed to record download for %s@%s: %v\n", name, version, err)
 		}
-		w.Write(data)
+		io.Copy(w, rc)
 		return
 	}
 
-	data, err := p.fetchCrateFromUpstream(t.Reg, t.Label, name, version)
+	resp, err := p.fetchCrateStreamFromUpstream(t.Reg, name, version)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to download crate: %v", err), http.StatusBadGateway)
 		return
 	}
-
-	if _, err := p.storage.SaveArtifact(t.Label, "", name, version, data); err != nil {
+	counter := &proxypkg.CountingReader{R: resp.Body}
+	_, err = p.storage.SaveArtifactStream(t.Label, "", name, version, counter)
+	resp.Body.Close()
+	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to save crate: %v", err), http.StatusInternalServerError)
 		return
 	}
-
+	rc, err := p.storage.GetArtifactStream(t.Label, "", name, version)
+	if err != nil || rc == nil {
+		http.Error(w, "Failed to serve crate", http.StatusInternalServerError)
+		return
+	}
+	defer rc.Close()
 	w.Header().Set("Content-Type", "application/gzip")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s-%s.crate", name, version))
 	if err := p.db.IncrementArtifactDownloads(t.Label, "", name, version); err != nil {
 		fmt.Printf("failed to record download for %s@%s: %v\n", name, version, err)
 	}
-	w.Write(data)
+	io.Copy(w, rc)
 }
 
 // fetchIndexFromUpstream fetches a crate's sparse index file from upstream
@@ -228,8 +236,10 @@ func (p *CargoProxy) fetchIndexFromUpstream(reg *database.RegistryConfig, regist
 	return data, nil
 }
 
-// fetchCrateFromUpstream downloads a .crate tarball from upstream.
-func (p *CargoProxy) fetchCrateFromUpstream(reg *database.RegistryConfig, registryLabel, name, version string) ([]byte, error) {
+// fetchCrateStreamFromUpstream downloads a .crate tarball from upstream,
+// returning the live response so it can be streamed straight into storage
+// instead of buffered in memory. Callers must close the returned body.
+func (p *CargoProxy) fetchCrateStreamFromUpstream(reg *database.RegistryConfig, name, version string) (*http.Response, error) {
 	if reg == nil || !reg.Proxy || reg.URL == "" {
 		return nil, fmt.Errorf("no upstream proxy configured for this registry")
 	}
@@ -244,12 +254,12 @@ func (p *CargoProxy) fetchCrateFromUpstream(reg *database.RegistryConfig, regist
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
 		return nil, fmt.Errorf("upstream returned status %d", resp.StatusCode)
 	}
 
-	return io.ReadAll(resp.Body)
+	return resp, nil
 }
 
 // sparseIndexPath computes the sharded index path for a crate name,

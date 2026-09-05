@@ -127,19 +127,27 @@ func (p *TerraformProxy) handleProviderFile(w http.ResponseWriter, r *http.Reque
 	fileName := chi.URLParam(r, "fileName")
 	t := proxypkg.TargetFromContext(r, "terraform")
 
-	if data, err := p.storage.GetArtifact(t.Label, namespace, ptype, version); err == nil && data != nil {
+	if rc, err := p.storage.GetArtifactStream(t.Label, namespace, ptype, version); err == nil && rc != nil {
+		defer rc.Close()
 		w.Header().Set("Content-Type", "application/zip")
 		if err := p.db.IncrementArtifactDownloads(t.Label, namespace, ptype, version); err != nil {
 			fmt.Printf("failed to record download for %s/%s@%s: %v\n", namespace, ptype, version, err)
 		}
-		w.Write(data)
+		io.Copy(w, rc)
 		return
 	}
 
 	upstreamPath := fmt.Sprintf("providers/v1/%s/%s/%s/files/%s", namespace, ptype, version, fileName)
-	data, err := p.fetchFromUpstream(t.Reg, upstreamPath)
+	resp, err := p.fetchStreamFromUpstream(t.Reg, upstreamPath)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to download provider: %v", err), http.StatusBadGateway)
+		return
+	}
+	counter := &proxypkg.CountingReader{R: resp.Body}
+	_, err = p.storage.SaveArtifactStream(t.Label, namespace, ptype, version, counter)
+	resp.Body.Close()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to save provider: %v", err), http.StatusInternalServerError)
 		return
 	}
 
@@ -150,23 +158,25 @@ func (p *TerraformProxy) handleProviderFile(w http.ResponseWriter, r *http.Reque
 		Namespace:    namespace,
 		ArtifactName: ptype,
 		Version:      version,
-		Size:         int64(len(data)),
+		Size:         counter.N,
 		Metadata:     map[string]interface{}{},
 		Tags:         []string{version},
 	}
 	if err := p.db.SaveArtifact(artifact); err != nil {
 		fmt.Printf("Warning: failed to save provider metadata: %v\n", err)
 	}
-	if _, err := p.storage.SaveArtifact(t.Label, namespace, ptype, version, data); err != nil {
-		http.Error(w, fmt.Sprintf("Failed to save provider: %v", err), http.StatusInternalServerError)
+
+	rc, err := p.storage.GetArtifactStream(t.Label, namespace, ptype, version)
+	if err != nil || rc == nil {
+		http.Error(w, "Failed to serve provider", http.StatusInternalServerError)
 		return
 	}
-
+	defer rc.Close()
 	w.Header().Set("Content-Type", "application/zip")
 	if err := p.db.IncrementArtifactDownloads(t.Label, namespace, ptype, version); err != nil {
 		fmt.Printf("failed to record download for %s/%s@%s: %v\n", namespace, ptype, version, err)
 	}
-	w.Write(data)
+	io.Copy(w, rc)
 }
 
 // handleModuleVersions serves the known versions for a module.
@@ -222,19 +232,27 @@ func (p *TerraformProxy) handleModuleArchive(w http.ResponseWriter, r *http.Requ
 	moduleNamespace := fmt.Sprintf("%s/%s", namespace, system)
 	t := proxypkg.TargetFromContext(r, "terraform")
 
-	if data, err := p.storage.GetArtifact(t.Label, moduleNamespace, name, version); err == nil && data != nil {
+	if rc, err := p.storage.GetArtifactStream(t.Label, moduleNamespace, name, version); err == nil && rc != nil {
+		defer rc.Close()
 		w.Header().Set("Content-Type", "application/gzip")
 		if err := p.db.IncrementArtifactDownloads(t.Label, moduleNamespace, name, version); err != nil {
 			fmt.Printf("failed to record download for %s/%s@%s: %v\n", moduleNamespace, name, version, err)
 		}
-		w.Write(data)
+		io.Copy(w, rc)
 		return
 	}
 
 	upstreamPath := fmt.Sprintf("modules/v1/%s/%s/%s/%s/archive.tar.gz", namespace, name, system, version)
-	data, err := p.fetchFromUpstream(t.Reg, upstreamPath)
+	resp, err := p.fetchStreamFromUpstream(t.Reg, upstreamPath)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to download module: %v", err), http.StatusBadGateway)
+		return
+	}
+	counter := &proxypkg.CountingReader{R: resp.Body}
+	_, err = p.storage.SaveArtifactStream(t.Label, moduleNamespace, name, version, counter)
+	resp.Body.Close()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to save module: %v", err), http.StatusInternalServerError)
 		return
 	}
 
@@ -245,23 +263,25 @@ func (p *TerraformProxy) handleModuleArchive(w http.ResponseWriter, r *http.Requ
 		Namespace:    moduleNamespace,
 		ArtifactName: name,
 		Version:      version,
-		Size:         int64(len(data)),
+		Size:         counter.N,
 		Metadata:     map[string]interface{}{},
 		Tags:         []string{version},
 	}
 	if err := p.db.SaveArtifact(artifact); err != nil {
 		fmt.Printf("Warning: failed to save module metadata: %v\n", err)
 	}
-	if _, err := p.storage.SaveArtifact(t.Label, moduleNamespace, name, version, data); err != nil {
-		http.Error(w, fmt.Sprintf("Failed to save module: %v", err), http.StatusInternalServerError)
+
+	rc, err := p.storage.GetArtifactStream(t.Label, moduleNamespace, name, version)
+	if err != nil || rc == nil {
+		http.Error(w, "Failed to serve module", http.StatusInternalServerError)
 		return
 	}
-
+	defer rc.Close()
 	w.Header().Set("Content-Type", "application/gzip")
 	if err := p.db.IncrementArtifactDownloads(t.Label, moduleNamespace, name, version); err != nil {
 		fmt.Printf("failed to record download for %s/%s@%s: %v\n", moduleNamespace, name, version, err)
 	}
-	w.Write(data)
+	io.Copy(w, rc)
 }
 
 func (p *TerraformProxy) fetchFromUpstream(reg *database.RegistryConfig, path string) ([]byte, error) {
@@ -283,6 +303,31 @@ func (p *TerraformProxy) fetchFromUpstream(reg *database.RegistryConfig, path st
 		return nil, fmt.Errorf("upstream returned status %d", resp.StatusCode)
 	}
 	return io.ReadAll(resp.Body)
+}
+
+// fetchStreamFromUpstream is like fetchFromUpstream but returns the live
+// response so large artifacts (provider binaries, module archives) can be
+// streamed straight into storage instead of buffered in memory. Callers
+// must close the returned body.
+func (p *TerraformProxy) fetchStreamFromUpstream(reg *database.RegistryConfig, path string) (*http.Response, error) {
+	if reg == nil || !reg.Proxy || reg.URL == "" {
+		return nil, fmt.Errorf("no upstream proxy configured for this registry")
+	}
+	url := fmt.Sprintf("%s/%s", strings.TrimSuffix(reg.URL, "/"), path)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	proxypkg.ApplyUpstreamAuth(req, reg)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, fmt.Errorf("upstream returned status %d", resp.StatusCode)
+	}
+	return resp, nil
 }
 
 func baseURL(r *http.Request) string {
