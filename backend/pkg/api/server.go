@@ -939,6 +939,8 @@ func (s *Server) handleUpdateVulnScanSettings(w http.ResponseWriter, r *http.Req
 	var input struct {
 		AutoScanEnabled   bool `json:"autoScanEnabled"`
 		ScanIntervalHours int  `json:"scanIntervalHours"`
+		OffHoursStartHour *int `json:"offHoursStartHour"`
+		OffHoursEndHour   *int `json:"offHoursEndHour"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 		s.writeJSONError(w, http.StatusBadRequest, "Invalid request body")
@@ -948,8 +950,18 @@ func (s *Server) handleUpdateVulnScanSettings(w http.ResponseWriter, r *http.Req
 		s.writeJSONError(w, http.StatusBadRequest, "scanIntervalHours must be at least 1")
 		return
 	}
+	for _, h := range []*int{input.OffHoursStartHour, input.OffHoursEndHour} {
+		if h != nil && (*h < 0 || *h > 23) {
+			s.writeJSONError(w, http.StatusBadRequest, "offHoursStartHour/offHoursEndHour must be between 0 and 23")
+			return
+		}
+	}
+	if (input.OffHoursStartHour == nil) != (input.OffHoursEndHour == nil) {
+		s.writeJSONError(w, http.StatusBadRequest, "offHoursStartHour and offHoursEndHour must be set together")
+		return
+	}
 
-	if err := s.db.UpdateVulnScanSettings(input.AutoScanEnabled, input.ScanIntervalHours); err != nil {
+	if err := s.db.UpdateVulnScanSettings(input.AutoScanEnabled, input.ScanIntervalHours, input.OffHoursStartHour, input.OffHoursEndHour); err != nil {
 		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to update vulnerability scan settings: %v", err))
 		return
 	}

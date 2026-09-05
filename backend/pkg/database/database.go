@@ -2000,26 +2000,30 @@ func (db *Database) RecordVulnDBUpdateResult(checkedAt time.Time, succeeded bool
 func (db *Database) GetVulnScanSettings() (*VulnScanSettings, error) {
 	row := db.pool.QueryRow(
 		context.Background(),
-		`SELECT auto_scan_enabled, scan_interval_hours, last_checked_at, last_scan_at, last_error
+		`SELECT auto_scan_enabled, scan_interval_hours, last_checked_at, last_scan_at, last_error,
+		        off_hours_start_hour, off_hours_end_hour
 		 FROM vulnerability_scan_settings WHERE id = 1`,
 	)
 
 	var s VulnScanSettings
-	err := row.Scan(&s.AutoScanEnabled, &s.ScanIntervalHours, &s.LastCheckedAt, &s.LastScanAt, &s.LastError)
+	err := row.Scan(&s.AutoScanEnabled, &s.ScanIntervalHours, &s.LastCheckedAt, &s.LastScanAt, &s.LastError,
+		&s.OffHoursStartHour, &s.OffHoursEndHour)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get vulnerability scan settings: %w", err)
 	}
 	return &s, nil
 }
 
-// UpdateVulnScanSettings persists the user-tunable fields (auto-scan toggle
-// and rescan interval). Status fields (last checked/scanned/error) are only
-// ever written by RecordVulnScanResult.
-func (db *Database) UpdateVulnScanSettings(autoScanEnabled bool, intervalHours int) error {
+// UpdateVulnScanSettings persists the user-tunable fields (auto-scan toggle,
+// rescan interval, and optional off-hours window). Status fields (last
+// checked/scanned/error) are only ever written by RecordVulnScanResult.
+func (db *Database) UpdateVulnScanSettings(autoScanEnabled bool, intervalHours int, offHoursStartHour, offHoursEndHour *int) error {
 	_, err := db.pool.Exec(
 		context.Background(),
-		`UPDATE vulnerability_scan_settings SET auto_scan_enabled = $1, scan_interval_hours = $2 WHERE id = 1`,
-		autoScanEnabled, intervalHours,
+		`UPDATE vulnerability_scan_settings
+		 SET auto_scan_enabled = $1, scan_interval_hours = $2, off_hours_start_hour = $3, off_hours_end_hour = $4
+		 WHERE id = 1`,
+		autoScanEnabled, intervalHours, offHoursStartHour, offHoursEndHour,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to update vulnerability scan settings: %w", err)

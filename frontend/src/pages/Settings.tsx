@@ -54,6 +54,8 @@ interface VulnScanSettings {
   lastCheckedAt: string | null
   lastScanAt: string | null
   lastError: string
+  offHoursStartHour: number | null
+  offHoursEndHour: number | null
 }
 
 interface SearchIndexSettings {
@@ -266,7 +268,12 @@ export function Settings() {
   const [vulnScanSaving, setVulnScanSaving] = useState(false)
   const [vulnScanSaved, setVulnScanSaved] = useState(false)
   const [vulnScanScanning, setVulnScanScanning] = useState(false)
-  const [vulnScanForm, setVulnScanForm] = useState({ autoScanEnabled: true, scanIntervalHours: 24 })
+  const [vulnScanForm, setVulnScanForm] = useState<{
+    autoScanEnabled: boolean
+    scanIntervalHours: number
+    offHoursStartHour: number | null
+    offHoursEndHour: number | null
+  }>({ autoScanEnabled: true, scanIntervalHours: 24, offHoursStartHour: null, offHoursEndHour: null })
   // Set right before a server-driven form update, so the autosave effect below
   // can tell "form changed because we just loaded it" apart from a real edit.
   const vulnScanSkipAutosave = useRef(true)
@@ -284,7 +291,12 @@ export function Settings() {
       .then((data: VulnScanSettings) => {
         vulnScanSkipAutosave.current = true
         setVulnScanSettings(data)
-        setVulnScanForm({ autoScanEnabled: data.autoScanEnabled, scanIntervalHours: data.scanIntervalHours })
+        setVulnScanForm({
+          autoScanEnabled: data.autoScanEnabled,
+          scanIntervalHours: data.scanIntervalHours,
+          offHoursStartHour: data.offHoursStartHour,
+          offHoursEndHour: data.offHoursEndHour,
+        })
         setVulnScanError(null)
       })
       .catch((err) => setVulnScanError(err.message))
@@ -964,6 +976,51 @@ export function Settings() {
                       onChange={(e) => setVulnScanForm({ ...vulnScanForm, scanIntervalHours: parseInt(e.target.value, 10) || 1 })}
                     />
                   </label>
+                </div>
+
+                <div className="flex items-center gap-4">
+                  <label className="text-sm text-gray-400">
+                    Off-hours start
+                    <select
+                      className="mt-1 block w-40 bg-gray-900 border border-gray-700 rounded px-3 py-1.5 text-gray-100"
+                      value={vulnScanForm.offHoursStartHour ?? ''}
+                      onChange={(e) => {
+                        const v = e.target.value === '' ? null : parseInt(e.target.value, 10)
+                        setVulnScanForm({
+                          ...vulnScanForm,
+                          offHoursStartHour: v,
+                          offHoursEndHour: v === null ? null : vulnScanForm.offHoursEndHour ?? 0,
+                        })
+                      }}
+                    >
+                      <option value="">No restriction</option>
+                      {Array.from({ length: 24 }, (_, h) => (
+                        <option key={h} value={h}>{`${h.toString().padStart(2, '0')}:00`}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="text-sm text-gray-400">
+                    Off-hours end
+                    <select
+                      className="mt-1 block w-40 bg-gray-900 border border-gray-700 rounded px-3 py-1.5 text-gray-100"
+                      value={vulnScanForm.offHoursEndHour ?? ''}
+                      disabled={vulnScanForm.offHoursStartHour === null}
+                      onChange={(e) => {
+                        const v = e.target.value === '' ? null : parseInt(e.target.value, 10)
+                        setVulnScanForm({ ...vulnScanForm, offHoursEndHour: v })
+                      }}
+                    >
+                      <option value="">No restriction</option>
+                      {Array.from({ length: 24 }, (_, h) => (
+                        <option key={h} value={h}>{`${h.toString().padStart(2, '0')}:00`}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <p className="text-xs text-gray-500 max-w-xs">
+                    Restricts the automatic scheduler to this window (server-local time). Scans are spread out — at
+                    most a few artifacts per minute — and each artifact is rescanned at most once per interval.
+                    "Scan Now" always runs immediately, ignoring this window.
+                  </p>
                 </div>
 
                 <div className="bg-gray-800/30 rounded-lg p-4">

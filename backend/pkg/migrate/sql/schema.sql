@@ -189,7 +189,13 @@ CREATE TABLE IF NOT EXISTS vulnerability_scan_settings (
     scan_interval_hours INTEGER NOT NULL DEFAULT 24,
     last_checked_at     TIMESTAMPTZ,
     last_scan_at        TIMESTAMPTZ,
-    last_error          TEXT NOT NULL DEFAULT ''
+    last_error          TEXT NOT NULL DEFAULT '',
+    -- Optional off-hours window restricting when the automatic rescan
+    -- scheduler may run (see migrations/021_add_vuln_scan_window.sql). Both
+    -- NULL means no restriction. Hours are 0-23, server-local; end may be
+    -- less than start to express a window wrapping past midnight.
+    off_hours_start_hour SMALLINT,
+    off_hours_end_hour   SMALLINT
 );
 INSERT INTO vulnerability_scan_settings (id) VALUES (1) ON CONFLICT DO NOTHING;
 

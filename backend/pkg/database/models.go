@@ -186,6 +186,11 @@ type VulnScanSettings struct {
 	LastCheckedAt     *time.Time `db:"last_checked_at" json:"lastCheckedAt"`
 	LastScanAt        *time.Time `db:"last_scan_at" json:"lastScanAt"`
 	LastError         string     `db:"last_error" json:"lastError"`
+	// OffHoursStartHour/OffHoursEndHour (0-23, server-local) restrict when the
+	// automatic rescan scheduler may run. Both NULL means no restriction. End
+	// may be less than start to express a window wrapping past midnight.
+	OffHoursStartHour *int `db:"off_hours_start_hour" json:"offHoursStartHour"`
+	OffHoursEndHour   *int `db:"off_hours_end_hour" json:"offHoursEndHour"`
 }
 
 // BackupSettings tunes how the backend performs scheduled full database
