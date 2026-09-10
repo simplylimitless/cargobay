@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -29,6 +30,22 @@ import (
 	"github.com/simplylimitless/cargobay/backend/pkg/storage"
 	"github.com/simplylimitless/cargobay/backend/pkg/vulnerability"
 )
+
+// upstreamClient is used for all requests to upstream registries. It bounds
+// how long we'll wait for an upstream to start responding (DNS/connect/TLS/
+// headers) so a stalled or rate-limiting upstream fails fast with a clear
+// error instead of hanging until the pulling client's own timeout trips.
+// There is deliberately no overall request timeout: once headers arrive,
+// a multi-hundred-MB blob body can legitimately take a while to stream.
+var upstreamClient = &http.Client{
+	Transport: &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout: 10 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+	},
+}
 
 // DockerProxy implements the Docker Registry v2 API proxy
 type DockerProxy struct {
@@ -1006,7 +1023,7 @@ func (p *DockerProxy) upstreamRequest(reg *database.RegistryConfig, method, reqU
 			// Skipped once a challenge-issued bearer token is in hand.
 			proxy.ApplyUpstreamAuth(req, reg)
 		}
-		return http.DefaultClient.Do(req)
+		return upstreamClient.Do(req)
 	}
 
 	resp, err := doGet("")
@@ -1031,7 +1048,7 @@ func (p *DockerProxy) upstreamRequest(reg *database.RegistryConfig, method, reqU
 	// Basic-auth against the token realm is how docker login authenticates
 	// to a private registry's token service (Docker Registry v2 auth spec).
 	proxy.ApplyUpstreamAuth(tokenReq, reg)
-	tokenResp, err := http.DefaultClient.Do(tokenReq)
+	tokenResp, err := upstreamClient.Do(tokenReq)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch upstream auth token: %w", err)
 	}
