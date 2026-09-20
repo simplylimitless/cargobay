@@ -1147,15 +1147,22 @@ func (p *DockerProxy) streamBlobFromUpstream(reg *database.RegistryConfig, repos
 	return err
 }
 
-// handleHealth is the registry v2 ping/discovery endpoint. Anonymous
-// requests (no Authorization header) always succeed, so anonymous `docker
-// pull` keeps working unauthenticated for public registries — private ones
-// still 401 once the request reaches a read/write handler and CheckAccess
-// runs. A request that *does* present credentials only succeeds if they
-// resolved to a user — this is what `docker login` probes to validate a
-// username/password.
+// handleHealth is the registry v2 ping/discovery endpoint. This is the very
+// first request any Docker client makes, and its response shape decides
+// whether the client bothers sending credentials on every request after it:
+// a 200 here tells the client "no auth needed," so it never attaches its
+// stored `docker login` credentials to the push requests that follow — even
+// against a private registry — and every write then gets rejected as
+// anonymous by CheckAccess. So a private (Host-bound) registry must 401 an
+// anonymous ping here, the same way it would 401 an anonymous pull, to make
+// the client authenticate up front. Public registries keep succeeding
+// anonymously, so unauthenticated `docker pull` is unaffected. A request
+// that *does* present credentials only succeeds if they resolved to a user
+// — this is also what `docker login` probes to validate a username/password.
 func (p *DockerProxy) handleHealth(w http.ResponseWriter, r *http.Request) {
-	if r.Header.Get("Authorization") != "" && middleware.GetUser(r) == nil {
+	t, _ := p.resolveTarget(r)
+	requiresAuth := t.reg != nil && t.reg.Private
+	if (requiresAuth || r.Header.Get("Authorization") != "") && middleware.GetUser(r) == nil {
 		w.Header().Set("WWW-Authenticate", `Basic realm="cargobay Docker Registry"`)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return

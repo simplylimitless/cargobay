@@ -120,6 +120,76 @@ func TestHandleHealthUnauthorizedWithBadCreds(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, rec.Code)
 }
 
+// TestHandleHealthPrivateRegistryAnonymousDenied guards against the bug
+// behind "docker login && docker push" silently failing: the v2 ping must
+// 401 an anonymous request against a private registry, or the Docker client
+// concludes no auth is needed and never attaches its login credentials to
+// the push requests that follow, which then get rejected as anonymous.
+func TestHandleHealthPrivateRegistryAnonymousDenied(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p := newTestProxy(t, db, c)
+
+	host := uniqueID("private-ping-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("private-ping-reg"), true, false)
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	req := httptest.NewRequest(http.MethodGet, "/v2/", nil)
+	req.Host = host
+	rec := httptest.NewRecorder()
+
+	p.handleHealth(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	assert.NotEmpty(t, rec.Header().Get("WWW-Authenticate"))
+}
+
+// TestHandleHealthPrivateRegistryAuthenticatedSucceeds verifies the ping
+// still succeeds for a private registry once the caller is authenticated,
+// so a correctly-configured `docker push` isn't blocked by the fix above.
+func TestHandleHealthPrivateRegistryAuthenticatedSucceeds(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p := newTestProxy(t, db, c)
+
+	host := uniqueID("private-ping-auth-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("private-ping-auth-reg"), true, false)
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	req := httptest.NewRequest(http.MethodGet, "/v2/", nil)
+	req.Host = host
+	req = authedRequest(req, uniqueID("user"))
+	rec := httptest.NewRecorder()
+
+	p.handleHealth(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
+// TestHandleHealthPublicRegistryAllowsAnonymous verifies the fix is scoped
+// to private registries only — anonymous `docker pull` against a public
+// registry must keep working unauthenticated.
+func TestHandleHealthPublicRegistryAllowsAnonymous(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p := newTestProxy(t, db, c)
+
+	host := uniqueID("public-ping-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("public-ping-reg"), false, false)
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	req := httptest.NewRequest(http.MethodGet, "/v2/", nil)
+	req.Host = host
+	rec := httptest.NewRecorder()
+
+	p.handleHealth(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
 func TestHandleCatalog(t *testing.T) {
 	db := connectTestDB(t)
 	c := connectTestCache(t)
