@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { useTimezone } from '../context/AuthContext'
+import { useAuth, useTimezone } from '../context/AuthContext'
 import { formatDate } from '../lib/datetime'
 
 // Shape returned by GET /api/v1/artifacts — database.ArtifactMetadata has
@@ -30,6 +30,7 @@ interface Registry {
 export function ArtifactBrowse() {
   const { registryId, artifactType, namespace } = useParams()
   const navigate = useNavigate()
+  const { token } = useAuth()
   const timezone = useTimezone()
   const [artifacts, setArtifacts] = useState<Artifact[]>([])
   const [registries, setRegistries] = useState<Registry[]>([])
@@ -46,7 +47,7 @@ export function ArtifactBrowse() {
   useEffect(() => {
     const fetchRegistries = async () => {
       try {
-        const res = await fetch('/api/v1/registries')
+        const res = await fetch('/api/v1/registries', token ? { headers: { Authorization: `Bearer ${token}` } } : undefined)
         if (!res.ok) throw new Error(`Request failed: ${res.status}`)
         const data = await res.json()
         const loaded: Registry[] = data.registries || []
@@ -61,7 +62,7 @@ export function ArtifactBrowse() {
 
     const fetchArtifacts = async () => {
       try {
-        const res = await fetch('/api/v1/artifacts?limit=200')
+        const res = await fetch('/api/v1/artifacts?limit=200', token ? { headers: { Authorization: `Bearer ${token}` } } : undefined)
         if (!res.ok) throw new Error(`Request failed: ${res.status}`)
         const data = await res.json()
         setArtifacts(data.artifacts || [])
@@ -74,7 +75,7 @@ export function ArtifactBrowse() {
 
     fetchRegistries()
     fetchArtifacts()
-  }, [])
+  }, [token])
 
   useEffect(() => {
     let result = artifacts

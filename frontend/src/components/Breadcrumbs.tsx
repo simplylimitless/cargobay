@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Link, matchPath, useLocation } from 'react-router-dom'
 import { isHiddenDockerLibraryNamespace } from '../lib/artifactTypes'
+import { useAuth } from '../context/AuthContext'
 
 interface RegistrySummary {
   id: string
@@ -22,13 +23,14 @@ interface Crumb {
 
 export function Breadcrumbs() {
   const location = useLocation()
+  const { token } = useAuth()
   const [registryNames, setRegistryNames] = useState<Record<string, string>>({})
 
   const matched = REGISTRY_ROUTE_PATTERNS.map((pattern) => matchPath(pattern, location.pathname)).find(Boolean)
 
   useEffect(() => {
     if (!matched) return
-    fetch('/api/v1/registries')
+    fetch('/api/v1/registries', token ? { headers: { Authorization: `Bearer ${token}` } } : undefined)
       .then((res) => (res.ok ? res.json() : { registries: [] }))
       .then((data) => {
         const names: Record<string, string> = {}
@@ -40,7 +42,7 @@ export function Breadcrumbs() {
       .catch(() => {})
     // Only needs to run once per navigation into the registries subtree.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [!!matched])
+  }, [!!matched, token])
 
   if (!matched) return null
 

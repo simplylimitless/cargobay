@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { getArtifactTypeConfig } from '../lib/artifactTypes'
+import { useAuth } from '../context/AuthContext'
 
 interface Artifact {
   ID: string
@@ -25,6 +26,7 @@ interface GroupedArtifact {
 export function ArtifactList() {
   const { registryId, artifactType, namespace } = useParams<{ registryId: string; artifactType: string; namespace?: string }>()
   const navigate = useNavigate()
+  const { token } = useAuth()
   const [searchQuery, setSearchQuery] = useState('')
   const [artifacts, setArtifacts] = useState<Artifact[]>([])
   const [loading, setLoading] = useState(true)
@@ -36,7 +38,7 @@ export function ArtifactList() {
     const params = new URLSearchParams({ registryId: registryId ?? '', artifactType: artifactType ?? '', limit: '200' })
     if (namespace) params.set('namespace', namespace)
 
-    fetch(`/api/v1/artifacts?${params.toString()}`)
+    fetch(`/api/v1/artifacts?${params.toString()}`, token ? { headers: { Authorization: `Bearer ${token}` } } : undefined)
       .then((res) => {
         if (!res.ok) throw new Error(`Request failed: ${res.status}`)
         return res.json()
@@ -44,7 +46,7 @@ export function ArtifactList() {
       .then((data) => setArtifacts(data.artifacts || []))
       .catch((err) => setError(err.message || 'Failed to load artifacts'))
       .finally(() => setLoading(false))
-  }, [registryId, artifactType, namespace])
+  }, [registryId, artifactType, namespace, token])
 
   // Docker official images (namespace "library") are referenced with no
   // namespace prefix at all, e.g. `docker pull nginx` — not `library/nginx`.

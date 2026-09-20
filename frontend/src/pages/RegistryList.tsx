@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { getRegistryLogo, REGISTRY_EMOJI } from '../lib/registryLogos'
+import { useAuth } from '../context/AuthContext'
 
 interface Registry {
   id: string
@@ -41,12 +42,13 @@ function RegistryIcon({ registry }: { registry: Registry }) {
 
 export function RegistryList() {
   const navigate = useNavigate()
+  const { token } = useAuth()
   const [registries, setRegistries] = useState<Registry[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
-    fetch('/api/v1/registries')
+    fetch('/api/v1/registries', token ? { headers: { Authorization: `Bearer ${token}` } } : undefined)
       .then((res) => {
         if (!res.ok) throw new Error(`Request failed: ${res.status}`)
         return res.json()
@@ -54,7 +56,7 @@ export function RegistryList() {
       .then((data) => setRegistries(data.registries || []))
       .catch((err) => setError(err.message))
       .finally(() => setLoading(false))
-  }, [])
+  }, [token])
 
   const handleRegistryClick = (registryId: string) => {
     navigate(`/registries/${registryId}`)

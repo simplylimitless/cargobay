@@ -69,11 +69,11 @@ export function ArtifactDetail() {
 
   useEffect(() => {
     if (!registryId) return
-    fetch(`/api/v1/registries/${encodeURIComponent(registryId)}`)
+    fetch(`/api/v1/registries/${encodeURIComponent(registryId)}`, token ? { headers: { Authorization: `Bearer ${token}` } } : undefined)
       .then((res) => (res.ok ? res.json() : null))
       .then((data) => setRegistryHost(data?.host || null))
       .catch(() => setRegistryHost(null))
-  }, [registryId])
+  }, [registryId, token])
 
   useEffect(() => {
     setLoading(true)
@@ -81,7 +81,7 @@ export function ArtifactDetail() {
     const params = new URLSearchParams({ registryId: registryId ?? '', artifactType: artifactType ?? '', limit: '200' })
     if (namespace) params.set('namespace', namespace)
 
-    fetch(`/api/v1/artifacts?${params.toString()}`)
+    fetch(`/api/v1/artifacts?${params.toString()}`, token ? { headers: { Authorization: `Bearer ${token}` } } : undefined)
       .then((res) => {
         if (!res.ok) throw new Error(`Request failed: ${res.status}`)
         return res.json()
@@ -95,7 +95,7 @@ export function ArtifactDetail() {
       })
       .catch((err) => setError(err.message || 'Failed to load artifact'))
       .finally(() => setLoading(false))
-  }, [registryId, artifactType, namespace, artifactName])
+  }, [registryId, artifactType, namespace, artifactName, token])
 
   useEffect(() => {
     if (!isContainerType(artifactType)) return
@@ -104,11 +104,11 @@ export function ArtifactDetail() {
       return
     }
     const ids = versions.map((v) => v.ID).join(',')
-    fetch(`/api/v1/artifacts/vulnerability-summary?ids=${encodeURIComponent(ids)}`)
+    fetch(`/api/v1/artifacts/vulnerability-summary?ids=${encodeURIComponent(ids)}`, token ? { headers: { Authorization: `Bearer ${token}` } } : undefined)
       .then((res) => (res.ok ? res.json() : null))
       .then((data) => setVulnSummaries(data?.summaries || {}))
       .catch(() => setVulnSummaries({}))
-  }, [versions, artifactType])
+  }, [versions, artifactType, token])
 
   const handleVersionClick = (version: string) => {
     navigate(`/registries/${registryId}/${artifactType}/${encodeURIComponent(namespace ?? '')}/${encodeURIComponent(artifactName ?? '')}/${encodeURIComponent(version)}`)

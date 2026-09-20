@@ -85,11 +85,11 @@ export function ArtifactVersion() {
 
   useEffect(() => {
     if (!registryId) return
-    fetch(`/api/v1/registries/${encodeURIComponent(registryId)}`)
+    fetch(`/api/v1/registries/${encodeURIComponent(registryId)}`, token ? { headers: { Authorization: `Bearer ${token}` } } : undefined)
       .then((res) => (res.ok ? res.json() : null))
       .then((data) => setRegistryHost(data?.host || null))
       .catch(() => setRegistryHost(null))
-  }, [registryId])
+  }, [registryId, token])
 
   useEffect(() => {
     setLoading(true)
@@ -97,7 +97,7 @@ export function ArtifactVersion() {
     const params = new URLSearchParams({ registryId: registryId ?? '', artifactType: artifactType ?? '', limit: '200' })
     if (namespace) params.set('namespace', namespace)
 
-    fetch(`/api/v1/artifacts?${params.toString()}`)
+    fetch(`/api/v1/artifacts?${params.toString()}`, token ? { headers: { Authorization: `Bearer ${token}` } } : undefined)
       .then((res) => {
         if (!res.ok) throw new Error(`Request failed: ${res.status}`)
         return res.json()
@@ -109,15 +109,15 @@ export function ArtifactVersion() {
       })
       .catch((err) => setError(err.message || 'Failed to load artifact version'))
       .finally(() => setLoading(false))
-  }, [registryId, artifactType, namespace, artifactName, version])
+  }, [registryId, artifactType, namespace, artifactName, version, token])
 
   useEffect(() => {
     if (!artifact) return
-    fetch(`/api/v1/vulnerability-scans?artifactId=${encodeURIComponent(artifact.ID)}`)
+    fetch(`/api/v1/vulnerability-scans?artifactId=${encodeURIComponent(artifact.ID)}`, token ? { headers: { Authorization: `Bearer ${token}` } } : undefined)
       .then((res) => (res.ok ? res.json() : null))
       .then((data) => setScanResults(data?.results || []))
       .catch(() => setScanResults([]))
-  }, [artifact])
+  }, [artifact, token])
 
   const formatSize = (bytes: number) => {
     if (bytes < 1024) return `${bytes} B`

@@ -28,7 +28,7 @@ export function RegistryDetail() {
 
   useEffect(() => {
     setLoading(true)
-    fetch(`/api/v1/registries/${encodeURIComponent(registryId!)}`)
+    fetch(`/api/v1/registries/${encodeURIComponent(registryId!)}`, token ? { headers: { Authorization: `Bearer ${token}` } } : undefined)
       .then((res) => {
         if (!res.ok) throw new Error(res.status === 404 ? 'Registry not found' : `Request failed: ${res.status}`)
         return res.json() as Promise<Registry>
@@ -39,7 +39,7 @@ export function RegistryDetail() {
       })
       .catch((err) => setError(err.message))
       .finally(() => setLoading(false))
-  }, [registryId])
+  }, [registryId, token])
 
   const getArtifactTypes = (registryType: string) => {
     switch (registryType) {
