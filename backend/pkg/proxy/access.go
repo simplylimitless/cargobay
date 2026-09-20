@@ -86,8 +86,12 @@ func registryTypeMatches(regType, artifactType string) bool {
 	return regType == artifactType || regType == VirtualTypeFor(artifactType)
 }
 
-// matchRegistryByPrefix finds an enabled, proxy-enabled registry of
-// artifactType whose ID or configured upstream hostname equals prefix.
+// matchRegistryByPrefix finds an enabled registry of artifactType whose ID
+// equals prefix. Non-proxy registries (private, storage-only registries a
+// caller pushes to directly) are matchable by ID this way, since it's the
+// only path-based addressing available to them — they have no bound Host
+// and no meaningful upstream URL. Proxy-enabled registries are additionally
+// matchable by the hostname of their configured upstream URL.
 func matchRegistryByPrefix(db *database.Database, prefix, artifactType string) *database.RegistryConfig {
 	regs, err := db.ListRegistries()
 	if err != nil {
@@ -95,10 +99,13 @@ func matchRegistryByPrefix(db *database.Database, prefix, artifactType string) *
 	}
 	for i := range regs {
 		reg := &regs[i]
-		if reg.Type != artifactType || !reg.Proxy {
+		if reg.Type != artifactType {
 			continue
 		}
-		if reg.ID == prefix || urlHost(reg.URL) == prefix {
+		if reg.ID == prefix {
+			return reg
+		}
+		if reg.Proxy && urlHost(reg.URL) == prefix {
 			return reg
 		}
 	}

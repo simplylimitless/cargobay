@@ -496,6 +496,45 @@ func TestResolveTargetWithoutDkrPrefixIgnoresRegistryLikeSegments(t *testing.T) 
 	assert.Equal(t, "ghcr.io/blakeblackshear/frigate/manifests/stable", path)
 }
 
+func TestResolveTargetPathPrefixMatchesPrivateNonProxyRegistryByID(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p := newTestProxy(t, db, c)
+
+	// A private, non-proxy registry (the owner's own storage-only registry,
+	// pushed to directly) has no upstream URL and no bound Host, but must
+	// still be reachable via dkr/<id>/... by ID.
+	regID := uniqueID("tinkertown-reg")
+	reg := seedRegistry(t, db, regID, true, false)
+
+	req := httptest.NewRequest(http.MethodPut, "/v2/dkr/"+regID+"/myimage/manifests/latest", nil)
+
+	t2, path := p.resolveTarget(req)
+
+	require.NotNil(t, t2.reg)
+	assert.Equal(t, reg.ID, t2.reg.ID)
+	assert.Equal(t, regID, t2.label)
+	assert.Equal(t, "myimage/manifests/latest", path)
+}
+
+func TestResolveTargetPathPrefixDoesNotMatchNonProxyRegistryByURLHost(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p := newTestProxy(t, db, c)
+
+	// seedRegistry sets URL to "https://upstream.example.com" regardless of
+	// Proxy — a non-proxy registry's URL is meaningless, so that hostname
+	// must not resolve it via dkr/ prefix matching.
+	regID := uniqueID("tinkertown-reg")
+	seedRegistry(t, db, regID, true, false)
+
+	req := httptest.NewRequest(http.MethodGet, "/v2/dkr/upstream.example.com/myimage/manifests/latest", nil)
+
+	t2, _ := p.resolveTarget(req)
+
+	assert.Nil(t, t2.reg)
+}
+
 func TestDockerProxyIntegration(t *testing.T) {
 	db := connectTestDB(t)
 	c := connectTestCache(t)
