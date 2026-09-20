@@ -117,6 +117,26 @@ type RegistryAccess struct {
 	GrantedAt  time.Time `db:"granted_at" json:"grantedAt"`
 }
 
+// Group represents a named collection of users used to grant registry
+// access in bulk, in addition to (not instead of) per-user grants.
+type Group struct {
+	ID          string    `db:"id" json:"id"`
+	Name        string    `db:"name" json:"name"`
+	Description string    `db:"description" json:"description"`
+	CreatedAt   time.Time `db:"created_at" json:"createdAt"`
+}
+
+// GroupRegistryAccess grants a group's members read and/or publish rights
+// on a private registry, mirroring RegistryAccess but keyed by group
+// instead of user.
+type GroupRegistryAccess struct {
+	RegistryID string    `db:"registry_id" json:"registryId"`
+	GroupID    string    `db:"group_id" json:"groupId"`
+	CanRead    bool      `db:"can_read" json:"canRead"`
+	CanPublish bool      `db:"can_publish" json:"canPublish"`
+	GrantedAt  time.Time `db:"granted_at" json:"grantedAt"`
+}
+
 // AuditLog represents an audit log entry
 type AuditLog struct {
 	ID           string    `db:"id" json:"id"`

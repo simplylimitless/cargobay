@@ -162,6 +162,9 @@ func (s *Server) setupRoutes() {
 		api.Post("/registries/{id}/access", s.handleGrantRegistryAccess)
 		api.Delete("/registries/{id}/access/{userId}", s.handleRevokeRegistryAccess)
 		api.Get("/registries/{id}/access", s.handleListRegistryAccess)
+		api.Post("/registries/{id}/group-access", s.handleGrantGroupRegistryAccess)
+		api.Delete("/registries/{id}/group-access/{groupId}", s.handleRevokeGroupRegistryAccess)
+		api.Get("/registries/{id}/group-access", s.handleListGroupRegistryAccess)
 		api.Post("/registries/{id}/prefetch", s.handlePrefetchArtifact)
 
 		api.Post("/replication/sync", s.handleReplicationSync)
@@ -203,6 +206,14 @@ func (s *Server) setupRoutes() {
 
 		// Audit logs are admin-only, same gate as user management.
 		api.Get("/audit/logs", s.rbac.RequirePermission("user:admin")(http.HandlerFunc(s.handleListAuditLogs)).ServeHTTP)
+
+		// Groups (admin-only, same gate as user management: user:admin).
+		api.Get("/groups", s.rbac.RequirePermission("user:admin")(http.HandlerFunc(s.handleListGroups)).ServeHTTP)
+		api.Post("/groups", s.rbac.RequirePermission("user:admin")(http.HandlerFunc(s.handleCreateGroup)).ServeHTTP)
+		api.Get("/groups/{id}", s.rbac.RequirePermission("user:admin")(http.HandlerFunc(s.handleGetGroup)).ServeHTTP)
+		api.Delete("/groups/{id}", s.rbac.RequirePermission("user:admin")(http.HandlerFunc(s.handleDeleteGroup)).ServeHTTP)
+		api.Post("/groups/{id}/members", s.rbac.RequirePermission("user:admin")(http.HandlerFunc(s.handleAddGroupMember)).ServeHTTP)
+		api.Delete("/groups/{id}/members/{userId}", s.rbac.RequirePermission("user:admin")(http.HandlerFunc(s.handleRemoveGroupMember)).ServeHTTP)
 	})
 }
 
@@ -1434,6 +1445,83 @@ func (s *Server) handleListRegistryAccess(w http.ResponseWriter, r *http.Request
 	})
 }
 
+// handleGrantGroupRegistryAccess grants (or updates) a group's read/publish
+// rights on a private registry. Only callers with registry:write may manage
+// grants — the same gate as the per-user registry_access endpoints.
+func (s *Server) handleGrantGroupRegistryAccess(w http.ResponseWriter, r *http.Request) {
+	user := middleware.GetUser(r)
+	if user == nil || !s.rbac.HasEffectivePermission(user, "registry:write") {
+		s.writeJSONError(w, http.StatusForbidden, "Permission denied: registry:write required")
+		return
+	}
+
+	registryID := chi.URLParam(r, "id")
+	var body struct {
+		GroupID    string `json:"groupId"`
+		CanRead    bool   `json:"canRead"`
+		CanPublish bool   `json:"canPublish"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.GroupID == "" {
+		s.writeJSONError(w, http.StatusBadRequest, "Invalid request body: groupId is required")
+		return
+	}
+
+	access := &database.GroupRegistryAccess{
+		RegistryID: registryID,
+		GroupID:    body.GroupID,
+		CanRead:    body.CanRead,
+		CanPublish: body.CanPublish,
+	}
+	if err := s.db.GrantGroupRegistryAccess(access); err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to grant access: %v", err))
+		return
+	}
+
+	s.audit(r, "registry.group_access_grant", "registry", registryID, map[string]any{"groupId": body.GroupID, "canRead": body.CanRead, "canPublish": body.CanPublish})
+
+	s.writeJSON(w, http.StatusOK, access)
+}
+
+// handleRevokeGroupRegistryAccess removes a group's grant on a private registry.
+func (s *Server) handleRevokeGroupRegistryAccess(w http.ResponseWriter, r *http.Request) {
+	user := middleware.GetUser(r)
+	if user == nil || !s.rbac.HasEffectivePermission(user, "registry:write") {
+		s.writeJSONError(w, http.StatusForbidden, "Permission denied: registry:write required")
+		return
+	}
+
+	registryID := chi.URLParam(r, "id")
+	groupID := chi.URLParam(r, "groupId")
+	if err := s.db.RevokeGroupRegistryAccess(registryID, groupID); err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to revoke access: %v", err))
+		return
+	}
+
+	s.audit(r, "registry.group_access_revoke", "registry", registryID, map[string]any{"groupId": groupID})
+
+	s.writeJSON(w, http.StatusOK, map[string]string{"status": "revoked"})
+}
+
+// handleListGroupRegistryAccess lists all group grants on a private registry.
+func (s *Server) handleListGroupRegistryAccess(w http.ResponseWriter, r *http.Request) {
+	user := middleware.GetUser(r)
+	if user == nil || !s.rbac.HasEffectivePermission(user, "registry:write") {
+		s.writeJSONError(w, http.StatusForbidden, "Permission denied: registry:write required")
+		return
+	}
+
+	registryID := chi.URLParam(r, "id")
+	grants, err := s.db.ListGroupRegistryAccessForRegistry(registryID)
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to list access: %v", err))
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"grants": grants,
+	})
+}
+
 // handleDeleteRegistry handles deleting a registry
 func (s *Server) handleDeleteRegistry(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
@@ -1635,6 +1723,123 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		"user":    user,
 		"message": "User created successfully",
 	})
+}
+
+// handleListGroups lists all groups.
+func (s *Server) handleListGroups(w http.ResponseWriter, r *http.Request) {
+	groups, err := s.db.ListGroups()
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to list groups: %v", err))
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"groups": groups,
+	})
+}
+
+// handleCreateGroup creates a new group.
+func (s *Server) handleCreateGroup(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Name        string `json:"name"`
+		Description string `json:"description"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		s.writeJSONError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	if input.Name == "" {
+		s.writeJSONError(w, http.StatusBadRequest, "name is required")
+		return
+	}
+
+	group, err := s.db.CreateGroup(input.Name, input.Description)
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to create group: %v", err))
+		return
+	}
+
+	s.audit(r, "group.create", "group", group.ID, map[string]any{"name": input.Name})
+
+	s.writeJSON(w, http.StatusCreated, group)
+}
+
+// handleGetGroup retrieves a single group along with its members.
+func (s *Server) handleGetGroup(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	group, err := s.db.GetGroup(id)
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get group: %v", err))
+		return
+	}
+	if group == nil {
+		s.writeJSONError(w, http.StatusNotFound, "Group not found")
+		return
+	}
+
+	members, err := s.db.ListGroupMembers(id)
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to list group members: %v", err))
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"group":   group,
+		"members": members,
+	})
+}
+
+// handleDeleteGroup deletes a group. Cascades to memberships and registry
+// group-access grants via foreign keys.
+func (s *Server) handleDeleteGroup(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	if err := s.db.DeleteGroup(id); err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to delete group: %v", err))
+		return
+	}
+
+	s.audit(r, "group.delete", "group", id, nil)
+
+	s.writeJSON(w, http.StatusOK, map[string]string{"message": "Group deleted successfully"})
+}
+
+// handleAddGroupMember adds a user to a group.
+func (s *Server) handleAddGroupMember(w http.ResponseWriter, r *http.Request) {
+	groupID := chi.URLParam(r, "id")
+	var body struct {
+		UserID string `json:"userId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.UserID == "" {
+		s.writeJSONError(w, http.StatusBadRequest, "Invalid request body: userId is required")
+		return
+	}
+
+	if err := s.db.AddGroupMember(groupID, body.UserID); err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to add group member: %v", err))
+		return
+	}
+
+	s.audit(r, "group.member_add", "group", groupID, map[string]any{"userId": body.UserID})
+
+	s.writeJSON(w, http.StatusOK, map[string]string{"status": "added"})
+}
+
+// handleRemoveGroupMember removes a user from a group.
+func (s *Server) handleRemoveGroupMember(w http.ResponseWriter, r *http.Request) {
+	groupID := chi.URLParam(r, "id")
+	userID := chi.URLParam(r, "userId")
+
+	if err := s.db.RemoveGroupMember(groupID, userID); err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to remove group member: %v", err))
+		return
+	}
+
+	s.audit(r, "group.member_remove", "group", groupID, map[string]any{"userId": userID})
+
+	s.writeJSON(w, http.StatusOK, map[string]string{"status": "removed"})
 }
 
 // handleDeactivateUser handles soft-deleting a user

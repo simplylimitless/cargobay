@@ -1253,6 +1253,239 @@ func (db *Database) ListRegistryAccessForRegistry(registryID string) ([]Registry
 	return grants, rows.Err()
 }
 
+// CreateGroup creates a new group.
+func (db *Database) CreateGroup(name, description string) (*Group, error) {
+	groupID := generateUUID()
+	createdAt := time.Now()
+
+	row := db.pool.QueryRow(
+		context.Background(),
+		`INSERT INTO groups (id, name, description, created_at)
+		 VALUES ($1, $2, $3, $4)
+		 RETURNING id, name, description, created_at`,
+		groupID, name, description, createdAt,
+	)
+
+	var g Group
+	err := row.Scan(&g.ID, &g.Name, &g.Description, &g.CreatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create group: %w", err)
+	}
+	return &g, nil
+}
+
+// ListGroups returns all groups.
+func (db *Database) ListGroups() ([]Group, error) {
+	rows, err := db.pool.Query(
+		context.Background(),
+		`SELECT id, name, description, created_at FROM groups ORDER BY created_at DESC`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list groups: %w", err)
+	}
+	defer rows.Close()
+
+	var groups []Group
+	for rows.Next() {
+		var g Group
+		if err := rows.Scan(&g.ID, &g.Name, &g.Description, &g.CreatedAt); err != nil {
+			return nil, fmt.Errorf("failed to scan group: %w", err)
+		}
+		groups = append(groups, g)
+	}
+	return groups, rows.Err()
+}
+
+// GetGroup retrieves a single group by ID.
+func (db *Database) GetGroup(id string) (*Group, error) {
+	row := db.pool.QueryRow(
+		context.Background(),
+		`SELECT id, name, description, created_at FROM groups WHERE id = $1`,
+		id,
+	)
+
+	var g Group
+	err := row.Scan(&g.ID, &g.Name, &g.Description, &g.CreatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get group: %w", err)
+	}
+	return &g, nil
+}
+
+// DeleteGroup deletes a group. Cascades to group_members and
+// registry_group_access via foreign keys.
+func (db *Database) DeleteGroup(id string) error {
+	_, err := db.pool.Exec(context.Background(), `DELETE FROM groups WHERE id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("failed to delete group: %w", err)
+	}
+	return nil
+}
+
+// AddGroupMember adds a user to a group.
+func (db *Database) AddGroupMember(groupID, userID string) error {
+	_, err := db.pool.Exec(
+		context.Background(),
+		`INSERT INTO group_members (group_id, user_id)
+		 VALUES ($1, $2)
+		 ON CONFLICT (group_id, user_id) DO NOTHING`,
+		groupID, userID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to add group member: %w", err)
+	}
+	return nil
+}
+
+// RemoveGroupMember removes a user from a group.
+func (db *Database) RemoveGroupMember(groupID, userID string) error {
+	_, err := db.pool.Exec(
+		context.Background(),
+		`DELETE FROM group_members WHERE group_id = $1 AND user_id = $2`,
+		groupID, userID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to remove group member: %w", err)
+	}
+	return nil
+}
+
+// ListGroupMembers lists all users belonging to a group.
+func (db *Database) ListGroupMembers(groupID string) ([]UserRepository, error) {
+	rows, err := db.pool.Query(
+		context.Background(),
+		`SELECT u.user_id, u.username, u.email, u.password_hash, u.created_at, u.last_login, u.is_active, u.timezone,
+			 COALESCE(json_agg(ur.role_id) FILTER (WHERE ur.role_id IS NOT NULL), '[]'::json) as roles
+		 FROM group_members gm
+		 JOIN users u ON u.user_id = gm.user_id
+		 LEFT JOIN user_roles ur ON u.user_id = ur.user_id
+		 WHERE gm.group_id = $1
+		 GROUP BY u.user_id
+		 ORDER BY gm.added_at ASC`,
+		groupID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list group members: %w", err)
+	}
+	defer rows.Close()
+
+	var users []UserRepository
+	for rows.Next() {
+		var u UserRepository
+		err := rows.Scan(&u.UserID, &u.Username, &u.Email, &u.PasswordHash,
+			&u.CreatedAt, &u.LastLogin, &u.IsActive, &u.Timezone, &u.Roles)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan group member: %w", err)
+		}
+		users = append(users, u)
+	}
+	return users, rows.Err()
+}
+
+// ListGroupsForUser lists all groups a user belongs to.
+func (db *Database) ListGroupsForUser(userID string) ([]Group, error) {
+	rows, err := db.pool.Query(
+		context.Background(),
+		`SELECT g.id, g.name, g.description, g.created_at
+		 FROM group_members gm
+		 JOIN groups g ON g.id = gm.group_id
+		 WHERE gm.user_id = $1
+		 ORDER BY g.created_at ASC`,
+		userID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list groups for user: %w", err)
+	}
+	defer rows.Close()
+
+	var groups []Group
+	for rows.Next() {
+		var g Group
+		if err := rows.Scan(&g.ID, &g.Name, &g.Description, &g.CreatedAt); err != nil {
+			return nil, fmt.Errorf("failed to scan group: %w", err)
+		}
+		groups = append(groups, g)
+	}
+	return groups, rows.Err()
+}
+
+// GrantGroupRegistryAccess creates or updates a group's read/publish grant
+// on a private registry.
+func (db *Database) GrantGroupRegistryAccess(access *GroupRegistryAccess) error {
+	_, err := db.pool.Exec(
+		context.Background(),
+		`INSERT INTO registry_group_access (registry_id, group_id, can_read, can_publish)
+		 VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (registry_id, group_id)
+		 DO UPDATE SET
+		   can_read = EXCLUDED.can_read,
+		   can_publish = EXCLUDED.can_publish`,
+		access.RegistryID, access.GroupID, access.CanRead, access.CanPublish,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to grant group registry access: %w", err)
+	}
+	return nil
+}
+
+// RevokeGroupRegistryAccess removes a group's grant on a registry.
+func (db *Database) RevokeGroupRegistryAccess(registryID, groupID string) error {
+	_, err := db.pool.Exec(
+		context.Background(),
+		`DELETE FROM registry_group_access WHERE registry_id = $1 AND group_id = $2`,
+		registryID, groupID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to revoke group registry access: %w", err)
+	}
+	return nil
+}
+
+// ListGroupRegistryAccessForRegistry lists all group grants on a registry.
+func (db *Database) ListGroupRegistryAccessForRegistry(registryID string) ([]GroupRegistryAccess, error) {
+	rows, err := db.pool.Query(
+		context.Background(),
+		`SELECT registry_id, group_id, can_read, can_publish, granted_at FROM registry_group_access WHERE registry_id = $1 ORDER BY granted_at ASC`,
+		registryID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list group registry access: %w", err)
+	}
+	defer rows.Close()
+
+	var grants []GroupRegistryAccess
+	for rows.Next() {
+		var a GroupRegistryAccess
+		if err := rows.Scan(&a.RegistryID, &a.GroupID, &a.CanRead, &a.CanPublish, &a.GrantedAt); err != nil {
+			return nil, fmt.Errorf("failed to scan group registry access: %w", err)
+		}
+		grants = append(grants, a)
+	}
+	return grants, rows.Err()
+}
+
+// GetGroupRegistryAccess retrieves a single group's grant on a registry, if any.
+func (db *Database) GetGroupRegistryAccess(registryID, groupID string) (*GroupRegistryAccess, error) {
+	row := db.pool.QueryRow(
+		context.Background(),
+		`SELECT registry_id, group_id, can_read, can_publish, granted_at FROM registry_group_access WHERE registry_id = $1 AND group_id = $2`,
+		registryID, groupID,
+	)
+
+	var a GroupRegistryAccess
+	err := row.Scan(&a.RegistryID, &a.GroupID, &a.CanRead, &a.CanPublish, &a.GrantedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get group registry access: %w", err)
+	}
+	return &a, nil
+}
+
 // GenerateAuditLog creates an audit log entry
 func (db *Database) GenerateAuditLog(userID, action, resourceType, resourceID, details string) error {
 	_, err := db.pool.Exec(

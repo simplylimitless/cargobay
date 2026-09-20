@@ -327,7 +327,19 @@ func (r *RBAC) CanReadRegistry(user *middleware.User, reg *database.RegistryConf
 		return true
 	}
 	access, err := r.db.GetRegistryAccess(reg.ID, user.UserID)
-	return err == nil && access != nil && access.CanRead
+	if err == nil && access != nil && access.CanRead {
+		return true
+	}
+	groups, err := r.db.ListGroupsForUser(user.UserID)
+	if err != nil {
+		return false
+	}
+	for _, g := range groups {
+		if ga, err := r.db.GetGroupRegistryAccess(reg.ID, g.ID); err == nil && ga != nil && ga.CanRead {
+			return true
+		}
+	}
+	return false
 }
 
 // CanPublishRegistry reports whether user may push to reg. Publishing to a
@@ -343,7 +355,19 @@ func (r *RBAC) CanPublishRegistry(user *middleware.User, reg *database.RegistryC
 		return true
 	}
 	access, err := r.db.GetRegistryAccess(reg.ID, user.UserID)
-	return err == nil && access != nil && access.CanPublish
+	if err == nil && access != nil && access.CanPublish {
+		return true
+	}
+	groups, err := r.db.ListGroupsForUser(user.UserID)
+	if err != nil {
+		return false
+	}
+	for _, g := range groups {
+		if ga, err := r.db.GetGroupRegistryAccess(reg.ID, g.ID); err == nil && ga != nil && ga.CanPublish {
+			return true
+		}
+	}
+	return false
 }
 
 // hasPermissionInRole checks if a role has a specific permission

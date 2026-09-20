@@ -349,3 +349,44 @@ func TestCanPublishRegistryNilCasesDenied(t *testing.T) {
 	assert.False(t, rbac.CanPublishRegistry(nil, reg))
 	assert.False(t, rbac.CanPublishRegistry(user, nil))
 }
+
+// connectTestDB returns a live, connected database.Database, skipping the
+// test if Postgres isn't reachable in this environment. A real pool is
+// required here (unlike newTestRBAC's unconnected instance) because
+// GetUserRoles/GetRegistryAccess/ListGroupsForUser all execute a live query
+// against db.pool, which panics if the pool is nil rather than erroring.
+func connectTestDB(t *testing.T) *database.Database {
+	t.Helper()
+	db := database.New("postgres://cargobay:password@localhost:5432/cargobay")
+	if err := db.Connect(); err != nil {
+		t.Skipf("skipping: postgres not reachable: %v", err)
+	}
+	t.Cleanup(func() { db.Disconnect() })
+	return db
+}
+
+// TestCanReadRegistryGroupLookupErrorDenied tests that CanReadRegistry fails
+// closed when neither a per-user grant nor a group grant exists: a
+// non-privileged, unrecognized user on a private registry must be denied,
+// not silently allowed through, exercising the fallback path added for
+// group-based access alongside the existing per-user grant check.
+func TestCanReadRegistryGroupLookupErrorDenied(t *testing.T) {
+	db := connectTestDB(t)
+	rbac := New(db)
+	reg := &database.RegistryConfig{ID: "reg-nogrant-1", Private: true}
+	user := &middleware.User{UserID: "user-nogrant-1"}
+
+	assert.False(t, rbac.CanReadRegistry(user, reg))
+}
+
+// TestCanPublishRegistryGroupLookupErrorDenied is the publish-side analogue
+// of TestCanReadRegistryGroupLookupErrorDenied: no registry:write, no
+// per-user publish grant, and no group grant must all fail closed.
+func TestCanPublishRegistryGroupLookupErrorDenied(t *testing.T) {
+	db := connectTestDB(t)
+	rbac := New(db)
+	reg := &database.RegistryConfig{ID: "reg-nogrant-2", Private: true}
+	user := &middleware.User{UserID: "user-nogrant-2", Scope: "full"}
+
+	assert.False(t, rbac.CanPublishRegistry(user, reg))
+}

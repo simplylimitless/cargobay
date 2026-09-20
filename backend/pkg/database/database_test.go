@@ -106,6 +106,34 @@ func TestRegistryConfig(t *testing.T) {
 	assert.True(t, registry.Enabled)
 }
 
+// TestGroup tests group struct fields
+func TestGroup(t *testing.T) {
+	group := Group{
+		ID:          "group-1",
+		Name:        "backend-team",
+		Description: "Backend engineers",
+	}
+
+	assert.Equal(t, "group-1", group.ID)
+	assert.Equal(t, "backend-team", group.Name)
+	assert.Equal(t, "Backend engineers", group.Description)
+}
+
+// TestGroupRegistryAccess tests group registry access grant struct fields
+func TestGroupRegistryAccess(t *testing.T) {
+	access := GroupRegistryAccess{
+		RegistryID: "npm-registry",
+		GroupID:    "group-1",
+		CanRead:    true,
+		CanPublish: false,
+	}
+
+	assert.Equal(t, "npm-registry", access.RegistryID)
+	assert.Equal(t, "group-1", access.GroupID)
+	assert.True(t, access.CanRead)
+	assert.False(t, access.CanPublish)
+}
+
 // TestListOptions tests list options
 func TestListOptions(t *testing.T) {
 	opts := ListOptions{

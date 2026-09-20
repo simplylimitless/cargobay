@@ -45,6 +45,19 @@ interface UserSummary {
   username: string
 }
 
+interface GroupRegistryAccessGrant {
+  registryId: string
+  groupId: string
+  canRead: boolean
+  canPublish: boolean
+  grantedAt: string
+}
+
+interface GroupSummary {
+  id: string
+  name: string
+}
+
 const EMPTY_REGISTRY_FORM = {
   id: '',
   name: '',
@@ -83,6 +96,13 @@ export function RegistryEdit() {
   const [grantCanRead, setGrantCanRead] = useState(true)
   const [grantCanPublish, setGrantCanPublish] = useState(false)
 
+  const [groups, setGroups] = useState<GroupSummary[]>([])
+  const [groupAccessGrants, setGroupAccessGrants] = useState<GroupRegistryAccessGrant[]>([])
+  const [groupAccessError, setGroupAccessError] = useState<string | null>(null)
+  const [grantGroupId, setGrantGroupId] = useState('')
+  const [grantGroupCanRead, setGrantGroupCanRead] = useState(true)
+  const [grantGroupCanPublish, setGrantGroupCanPublish] = useState(false)
+
   const loadAccessGrants = (id: string) => {
     if (!token) return
     fetch(`/api/v1/registries/${encodeURIComponent(id)}/access`, {
@@ -97,6 +117,22 @@ export function RegistryEdit() {
         setAccessError(null)
       })
       .catch((err) => setAccessError(err.message))
+  }
+
+  const loadGroupAccessGrants = (id: string) => {
+    if (!token) return
+    fetch(`/api/v1/registries/${encodeURIComponent(id)}/group-access`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((res) => {
+        if (!res.ok) throw new Error(`Request failed: ${res.status}`)
+        return res.json()
+      })
+      .then((data) => {
+        setGroupAccessGrants(data.grants || [])
+        setGroupAccessError(null)
+      })
+      .catch((err) => setGroupAccessError(err.message))
   }
 
   useEffect(() => {
@@ -116,6 +152,12 @@ export function RegistryEdit() {
         if (!res.ok) throw new Error(`Request failed: ${res.status}`)
         return res.json()
       }),
+      fetch('/api/v1/groups', {
+        headers: { Authorization: `Bearer ${token}` },
+      }).then((res) => {
+        if (!res.ok) throw new Error(`Request failed: ${res.status}`)
+        return res.json()
+      }),
     ]
     if (!isCreating) {
       requests.push(
@@ -129,15 +171,19 @@ export function RegistryEdit() {
     }
 
     Promise.all(requests)
-      .then(([registriesData, usersData, registry]) => {
+      .then(([registriesData, usersData, groupsData, registry]) => {
         setRegistries(registriesData.registries || [])
         setUsers(usersData.users || [])
+        setGroups(groupsData.groups || [])
         if (registry) {
           // upstreamSecret is never returned by the API (write-only) -
           // leaving it blank here means "keep whatever's already stored"
           // on save.
           setRegistryForm({ ...registry, upstreamSecret: '', members: registry.members || [] })
-          if (registry.private) loadAccessGrants(registry.id)
+          if (registry.private) {
+            loadAccessGrants(registry.id)
+            loadGroupAccessGrants(registry.id)
+          }
         } else {
           setRegistryForm(EMPTY_REGISTRY_FORM)
         }
@@ -243,6 +289,47 @@ export function RegistryEdit() {
       loadAccessGrants(registryForm.id)
     } catch (err: any) {
       setAccessError(err.message)
+    }
+  }
+
+  const grantGroupAccess = async () => {
+    if (!token || isCreating || !grantGroupId) return
+    try {
+      const res = await fetch(`/api/v1/registries/${encodeURIComponent(registryForm.id)}/group-access`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ groupId: grantGroupId, canRead: grantGroupCanRead, canPublish: grantGroupCanPublish }),
+      })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.error || `Request failed: ${res.status}`)
+      }
+      setGrantGroupId('')
+      setGrantGroupCanRead(true)
+      setGrantGroupCanPublish(false)
+      loadGroupAccessGrants(registryForm.id)
+    } catch (err: any) {
+      setGroupAccessError(err.message)
+    }
+  }
+
+  const revokeGroupAccess = async (groupId: string) => {
+    if (!token || isCreating) return
+    try {
+      const res = await fetch(
+        `/api/v1/registries/${encodeURIComponent(registryForm.id)}/group-access/${encodeURIComponent(groupId)}`,
+        { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } },
+      )
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.error || `Request failed: ${res.status}`)
+      }
+      loadGroupAccessGrants(registryForm.id)
+    } catch (err: any) {
+      setGroupAccessError(err.message)
     }
   }
 
@@ -572,6 +659,72 @@ export function RegistryEdit() {
                   Publish
                 </label>
                 <button onClick={grantAccess} disabled={!grantUserId} className="btn btn-primary btn-sm">
+                  Grant
+                </button>
+              </div>
+
+              <h4 className="text-sm font-medium text-gray-300 pt-3">Group access grants</h4>
+              {groupAccessError && (
+                <div className="px-3 py-2 bg-red-500/10 border border-red-500/30 rounded text-red-400 text-sm">
+                  {groupAccessError}
+                </div>
+              )}
+              <table className="w-full text-left text-sm">
+                <thead className="text-gray-500">
+                  <tr>
+                    <th className="pr-4 py-1 font-medium">Group</th>
+                    <th className="pr-4 py-1 font-medium">Read</th>
+                    <th className="pr-4 py-1 font-medium">Publish</th>
+                    <th className="py-1 font-medium text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {groupAccessGrants.map((g) => (
+                    <tr key={g.groupId} className="border-t border-gray-800">
+                      <td className="pr-4 py-1 text-gray-300">
+                        {groups.find((grp) => grp.id === g.groupId)?.name || g.groupId}
+                      </td>
+                      <td className="pr-4 py-1 text-gray-400">{g.canRead ? 'yes' : 'no'}</td>
+                      <td className="pr-4 py-1 text-gray-400">{g.canPublish ? 'yes' : 'no'}</td>
+                      <td className="py-1 text-right">
+                        <button onClick={() => revokeGroupAccess(g.groupId)} className="text-red-400 hover:text-red-300 text-sm">
+                          Revoke
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                  {groupAccessGrants.length === 0 && (
+                    <tr>
+                      <td colSpan={4} className="py-2 text-center text-gray-500">
+                        No groups granted access yet.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+              <div className="flex items-end gap-3">
+                <label className="text-sm text-gray-400 flex-1">
+                  Grant to group
+                  <select
+                    className="mt-1 w-full bg-gray-900 border border-gray-700 rounded px-3 py-1.5 text-gray-100"
+                    value={grantGroupId}
+                    onChange={(e) => setGrantGroupId(e.target.value)}
+                  >
+                    <option value="">Select a group...</option>
+                    {groups.map((g) => (
+                      <option key={g.id} value={g.id}>{g.name}</option>
+                    ))}
+                  </select>
+                </label>
+                <label className="flex items-center gap-2 text-sm text-gray-400">
+                  <input type="checkbox" checked={grantGroupCanRead} onChange={(e) => setGrantGroupCanRead(e.target.checked)} />
+                  Read
+                </label>
+                <label className="flex items-center gap-2 text-sm text-gray-400">
+                  <input type="checkbox" checked={grantGroupCanPublish} onChange={(e) => setGrantGroupCanPublish(e.target.checked)} />
+                  Publish
+                </label>
+                <button onClick={grantGroupAccess} disabled={!grantGroupId} className="btn btn-primary btn-sm">
                   Grant
                 </button>
               </div>

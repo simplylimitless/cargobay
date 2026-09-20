@@ -85,9 +85,16 @@ interface BackupInfo {
   createdAt: string
 }
 
-type SettingsTab = 'general' | 'registries' | 'users' | 'audit' | 'vulndb' | 'searchindex' | 'backup'
+type SettingsTab = 'general' | 'registries' | 'users' | 'groups' | 'audit' | 'vulndb' | 'searchindex' | 'backup'
 
-const SETTINGS_TABS: SettingsTab[] = ['general', 'registries', 'users', 'vulndb', 'searchindex', 'backup', 'audit']
+const SETTINGS_TABS: SettingsTab[] = ['general', 'registries', 'users', 'groups', 'vulndb', 'searchindex', 'backup', 'audit']
+
+interface Group {
+  id: string
+  name: string
+  description: string
+  createdAt: string
+}
 
 export function Settings() {
   const { currentUser, token, isAdmin, updateProfile } = useAuth()
@@ -98,6 +105,9 @@ export function Settings() {
   const [configError, setConfigError] = useState<string | null>(null)
   const [users, setUsers] = useState<User[]>([])
   const [usersError, setUsersError] = useState<string | null>(null)
+  const [groups, setGroups] = useState<Group[]>([])
+  const [groupsError, setGroupsError] = useState<string | null>(null)
+  const [groupMemberCounts, setGroupMemberCounts] = useState<Record<string, number>>({})
   const [loading, setLoading] = useState(true)
   const [searchParams, setSearchParams] = useSearchParams()
   const tabParam = searchParams.get('tab') as SettingsTab | null
@@ -699,6 +709,30 @@ export function Settings() {
       })
       .catch((err) => setUsersError(err.message))
       .finally(() => setLoading(false))
+
+    // Fetch groups
+    fetch('/api/v1/groups', {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((res) => {
+        if (!res.ok) throw new Error(`Request failed: ${res.status}`)
+        return res.json()
+      })
+      .then((data) => {
+        const groupList: Group[] = data.groups || []
+        setGroups(groupList)
+        setGroupsError(null)
+        Promise.all(
+          groupList.map((g) =>
+            fetch(`/api/v1/groups/${encodeURIComponent(g.id)}`, {
+              headers: { Authorization: `Bearer ${token}` },
+            })
+              .then((res) => (res.ok ? res.json() : { members: [] }))
+              .then((detail) => [g.id, (detail.members || []).length] as const)
+          )
+        ).then((counts) => setGroupMemberCounts(Object.fromEntries(counts)))
+      })
+      .catch((err) => setGroupsError(err.message))
   }, [isAdmin, currentUser, token])
 
   if (!isAdmin) {
@@ -714,6 +748,7 @@ export function Settings() {
     { id: 'general', label: 'General' },
     { id: 'registries', label: 'Registries' },
     { id: 'users', label: 'Users' },
+    { id: 'groups', label: 'Groups' },
     { id: 'vulndb', label: 'Vulnerability Scanner' },
     { id: 'searchindex', label: 'Search Index' },
     { id: 'backup', label: 'Backup & Restore' },
@@ -725,7 +760,7 @@ export function Settings() {
       {ConfirmDialog}
       <div>
         <h1 className="text-3xl font-bold text-white mb-2">Settings</h1>
-        <p className="text-gray-400">Manage system configuration, registries, users, and audit logs</p>
+        <p className="text-gray-400">Manage system configuration, registries, users, groups, and audit logs</p>
       </div>
 
       <div className="flex gap-2 border-b border-gray-800">
@@ -1607,6 +1642,60 @@ export function Settings() {
                     </td>
                   </tr>
                 ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {activeTab === 'groups' && (
+        <div className="card">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-xl font-semibold text-gray-100">Groups</h2>
+            <button onClick={() => navigate('/settings/groups/new')} className="btn btn-primary btn-sm">
+              + Add Group
+            </button>
+          </div>
+
+          {groupsError && (
+            <div className="px-4 py-3 bg-red-500/10 border border-red-500/30 rounded-lg text-red-400 text-sm mb-4">
+              Failed to load groups: {groupsError}
+            </div>
+          )}
+
+          <div className="overflow-x-auto">
+            <table className="w-full text-left">
+              <thead className="bg-gray-800/50 text-gray-400 text-sm">
+                <tr>
+                  <th className="px-4 py-3 rounded-l-lg font-medium">Name</th>
+                  <th className="px-4 py-3 font-medium">Description</th>
+                  <th className="px-4 py-3 font-medium">Members</th>
+                  <th className="px-4 py-3 rounded-r-lg font-medium text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="text-sm">
+                {groups.map((group) => (
+                  <tr key={group.id} className="border-b border-gray-800">
+                    <td className="px-4 py-3 font-medium text-gray-100">{group.name}</td>
+                    <td className="px-4 py-3 text-gray-400">{group.description || '—'}</td>
+                    <td className="px-4 py-3 text-gray-400">{groupMemberCounts[group.id] ?? '—'}</td>
+                    <td className="px-4 py-3 text-right">
+                      <button
+                        onClick={() => navigate(`/settings/groups/${group.id}`)}
+                        className="text-blue-400 hover:text-blue-300 text-sm"
+                      >
+                        Edit
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+                {groups.length === 0 && (
+                  <tr>
+                    <td colSpan={4} className="px-4 py-6 text-center text-gray-500">
+                      No groups yet
+                    </td>
+                  </tr>
+                )}
               </tbody>
             </table>
           </div>
