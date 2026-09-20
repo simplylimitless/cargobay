@@ -249,13 +249,13 @@ docker tag myimage cargobay.example.com/dkr/tinkertown/myimage:latest
 docker push cargobay.example.com/dkr/tinkertown/myimage:latest
 ```
 
-## npm, Maven, and PyPI Registries
+## npm, Maven, PyPI, Cargo, and NuGet Registries
 
-Like Docker, the npm, Maven, and PyPI proxies (Maven's implementation is
-shared by Gradle and SBT, since all three consume standard Maven-layout
-repositories) support publishing to a private registry, not just pulling
-from one. There is no `dkr/`-style path-prefix addressing for these
-registries — a private registry must be bound to a `Host` (see
+Like Docker, the npm, Maven, PyPI, Cargo, and NuGet proxies (Maven's
+implementation is shared by Gradle and SBT, since all three consume standard
+Maven-layout repositories) support publishing to a private registry, not
+just pulling from one. There is no `dkr/`-style path-prefix addressing for
+these registries — a private registry must be bound to a `Host` (see
 [Private Docker registries](#privatemultiple-docker-registries) for the
 general mechanism; it applies the same way regardless of registry `type`),
 and clients publish to it via that hostname, same as pulls. The publishing
@@ -338,6 +338,55 @@ PyPI's legacy upload API is a single `POST` of a `multipart/form-data` body
 carrying the package name, version, and file as form fields — twine's
 `repository`/`repository-url` setting can point at either the registry root
 or its `/legacy/` alias, both work identically.
+
+### Publishing to Cargo
+
+```toml
+# .cargo/config.toml
+[registries.cargobay]
+index = "sparse+https://cargo.cargobay.example.com/"
+
+[registry]
+default = "cargobay"
+```
+
+```
+cargo login --registry cargobay <personal-access-token>
+cargo publish --registry cargobay
+```
+
+Cargo's publish API is a single `PUT /api/v1/crates/new`, whose body is not
+JSON or multipart but a raw binary layout: a 4-byte little-endian length
+followed by that many bytes of JSON metadata, then another 4-byte
+little-endian length followed by the `.crate` tarball itself — `cargo
+publish` builds this automatically, nothing to configure beyond the registry
+and token above.
+
+### Publishing to NuGet
+
+```xml
+<!-- nuget.config -->
+<configuration>
+  <packageSources>
+    <add key="cargobay" value="https://nuget.cargobay.example.com/v3/index.json" />
+  </packageSources>
+</configuration>
+```
+
+```
+dotnet nuget push package.nupkg --source cargobay --api-key <personal-access-token>
+```
+
+`dotnet nuget push`/`nuget push` send their credential via the
+`X-NuGet-ApiKey` header rather than `Authorization` — cargobay's auth
+middleware accepts this header as an alternative to `Authorization:
+Bearer`/`Basic`, looking it up as a personal access token the same way, so
+no extra configuration is needed beyond pointing `--api-key` at a valid PAT.
+The push itself is a single `PUT /api/v2/package` of the `.nupkg` file
+(NuGet clients send it as the first part of a `multipart/form-data` body; a
+raw, non-multipart PUT of the `.nupkg` bytes is also accepted), and the
+package id/version are read from the `.nuspec` packed inside it rather than
+from the URL or any form field.
 
 ## Storage Backend Configuration
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/simplylimitless/cargobay/backend/pkg/cache"
 	"github.com/simplylimitless/cargobay/backend/pkg/database"
+	"github.com/simplylimitless/cargobay/backend/pkg/middleware"
 	"github.com/simplylimitless/cargobay/backend/pkg/rbac"
 	"github.com/simplylimitless/cargobay/backend/pkg/storage"
 )
@@ -85,6 +87,55 @@ func seedRegistryWithHost(t *testing.T, db *database.Database, host string, prox
 
 func withChiRouteContext(r *http.Request, rctx *chi.Context) *http.Request {
 	return r.WithContext(context.WithValue(r.Context(), chi.RouteCtxKey, rctx))
+}
+
+// seedRegistry saves a plain (host-unbound) registry, used for tests that
+// don't need Host-based resolution.
+func seedRegistry(t *testing.T, db *database.Database, id string, private, proxy bool) *database.RegistryConfig {
+	t.Helper()
+	reg := &database.RegistryConfig{
+		ID:       id,
+		Name:     id,
+		URL:      "https://upstream.example.com",
+		Type:     "cargo",
+		Proxy:    proxy,
+		Enabled:  true,
+		Priority: 10,
+		Private:  private,
+	}
+	require.NoError(t, db.SaveRegistry(reg))
+	t.Cleanup(func() { db.DeleteRegistry(id) })
+	return reg
+}
+
+// authedRequest injects an authenticated user into req's context, mirroring
+// what middleware.NewAuthMiddleware would have done in production (that
+// middleware is wired only in cmd/server/main.go, outside the router these
+// tests exercise directly).
+func authedRequest(req *http.Request, userID string) *http.Request {
+	user := &middleware.User{UserID: userID, Username: userID}
+	ctx := context.WithValue(req.Context(), middleware.AuthUserKey, user)
+	return req.WithContext(ctx)
+}
+
+// buildPublishBody constructs a valid cargo-publish wire body: a
+// length-prefixed JSON metadata object followed by a length-prefixed .crate
+// tarball, per
+// https://doc.rust-lang.org/cargo/reference/registry-web-api.html#publish.
+func buildPublishBody(name, version string, crate []byte) []byte {
+	meta := fmt.Sprintf(`{"name":%q,"vers":%q,"deps":[]}`, name, version)
+	var buf bytes.Buffer
+	var lenBuf [4]byte
+
+	binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(meta)))
+	buf.Write(lenBuf[:])
+	buf.WriteString(meta)
+
+	binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(crate)))
+	buf.Write(lenBuf[:])
+	buf.Write(crate)
+
+	return buf.Bytes()
 }
 
 func TestNewCargoProxy(t *testing.T) {
@@ -532,4 +583,216 @@ func TestCargoProxyRoutesPublicConfig(t *testing.T) {
 	router.ServeHTTP(rec, req)
 
 	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
+func TestHandlePublishNoAuthDenied(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+
+	host := uniqueID("publish-noauth-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("publish-noauth-reg"), true, false)
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	router := NewCargoProxy(db, nil, c, rbac.New(db), nil)
+
+	body := buildPublishBody(uniqueID("crate"), "1.0.0", []byte("crate bytes"))
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/crates/new", bytes.NewReader(body))
+	req.Host = host
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+}
+
+func TestHandlePublishReadScopeDenied(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+
+	host := uniqueID("publish-readscope-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("publish-readscope-reg"), true, false)
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	userID := uniqueID("user")
+	require.NoError(t, db.GrantRegistryAccess(&database.RegistryAccess{
+		RegistryID: reg.ID,
+		UserID:     userID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+	t.Cleanup(func() { db.RevokeRegistryAccess(reg.ID, userID) })
+
+	router := NewCargoProxy(db, nil, c, rbac.New(db), nil)
+
+	body := buildPublishBody(uniqueID("crate"), "1.0.0", []byte("crate bytes"))
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/crates/new", bytes.NewReader(body))
+	req.Host = host
+	ctx := context.WithValue(req.Context(), middleware.AuthUserKey, &middleware.User{UserID: userID, Username: userID, Scope: "read"})
+	req = req.WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+}
+
+func TestHandlePublishNonPrivateRegistryDenied(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+
+	host := uniqueID("publish-public-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("publish-public-reg"), false, false) // private=false
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	userID := uniqueID("user")
+	require.NoError(t, db.GrantRegistryAccess(&database.RegistryAccess{
+		RegistryID: reg.ID,
+		UserID:     userID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+	t.Cleanup(func() { db.RevokeRegistryAccess(reg.ID, userID) })
+
+	router := NewCargoProxy(db, nil, c, rbac.New(db), nil)
+
+	body := buildPublishBody(uniqueID("crate"), "1.0.0", []byte("crate bytes"))
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/crates/new", bytes.NewReader(body))
+	req.Host = host
+	req = authedRequest(req, userID)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+}
+
+func TestHandlePublishSuccess(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+
+	host := uniqueID("publish-ok-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("publish-ok-reg"), true, false)
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	userID := uniqueID("user")
+	require.NoError(t, db.GrantRegistryAccess(&database.RegistryAccess{
+		RegistryID: reg.ID,
+		UserID:     userID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+	t.Cleanup(func() { db.RevokeRegistryAccess(reg.ID, userID) })
+
+	adapter, err := storage.NewLocalAdapter(map[string]string{"path": t.TempDir()})
+	require.NoError(t, err)
+	router := NewCargoProxy(db, adapter, c, rbac.New(db), nil)
+
+	crateName := uniqueID("crate")
+	version := "1.0.0"
+	crateBytes := []byte("crate tarball bytes")
+	body := buildPublishBody(crateName, version, crateBytes)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/crates/new", bytes.NewReader(body))
+	req.Host = host
+	req = authedRequest(req, userID)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	t.Cleanup(func() { db.DeleteArtifact(reg.ID, "", crateName, version) })
+
+	rc, err := adapter.GetArtifactStream(reg.ID, "", crateName, version)
+	require.NoError(t, err)
+	defer rc.Close()
+	stored, err := io.ReadAll(rc)
+	require.NoError(t, err)
+	assert.Equal(t, crateBytes, stored)
+
+	artifacts, err := db.ListArtifacts(reg.ID, database.ListOptions{ArtifactType: "cargo"})
+	require.NoError(t, err)
+	require.Len(t, artifacts, 1)
+	assert.Equal(t, crateName, artifacts[0].ArtifactName)
+	assert.Equal(t, version, artifacts[0].Version)
+}
+
+func TestHandlePublishMalformedBody(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+
+	host := uniqueID("publish-malformed-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("publish-malformed-reg"), true, false)
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	userID := uniqueID("user")
+	require.NoError(t, db.GrantRegistryAccess(&database.RegistryAccess{
+		RegistryID: reg.ID,
+		UserID:     userID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+	t.Cleanup(func() { db.RevokeRegistryAccess(reg.ID, userID) })
+
+	router := NewCargoProxy(db, nil, c, rbac.New(db), nil)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/crates/new", bytes.NewReader([]byte("not a valid publish body")))
+	req.Host = host
+	req = authedRequest(req, userID)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestHandlePublishGroupGrantSucceeds(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+
+	host := uniqueID("publish-group-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("publish-group-reg"), true, false)
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	grp, err := db.CreateGroup(uniqueID("publishers"), "publishers group")
+	require.NoError(t, err)
+	t.Cleanup(func() { db.DeleteGroup(grp.ID) })
+
+	userID := uniqueID("user")
+	require.NoError(t, db.AddGroupMember(grp.ID, userID))
+	require.NoError(t, db.GrantGroupRegistryAccess(&database.GroupRegistryAccess{
+		RegistryID: reg.ID,
+		GroupID:    grp.ID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+
+	adapter, err := storage.NewLocalAdapter(map[string]string{"path": t.TempDir()})
+	require.NoError(t, err)
+	router := NewCargoProxy(db, adapter, c, rbac.New(db), nil)
+
+	crateName := uniqueID("crate")
+	version := "1.0.0"
+	crateBytes := []byte("group-granted crate bytes")
+	body := buildPublishBody(crateName, version, crateBytes)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/crates/new", bytes.NewReader(body))
+	req.Host = host
+	req = authedRequest(req, userID)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	t.Cleanup(func() { db.DeleteArtifact(reg.ID, "", crateName, version) })
+
+	artifacts, err := db.ListArtifacts(reg.ID, database.ListOptions{ArtifactType: "cargo"})
+	require.NoError(t, err)
+	require.Len(t, artifacts, 1)
+	assert.Equal(t, crateName, artifacts[0].ArtifactName)
 }

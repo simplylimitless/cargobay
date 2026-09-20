@@ -10,7 +10,12 @@
 package nuget
 
 import (
+	"archive/zip"
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,6 +24,7 @@ import (
 
 	"github.com/simplylimitless/cargobay/backend/pkg/cache"
 	"github.com/simplylimitless/cargobay/backend/pkg/database"
+	"github.com/simplylimitless/cargobay/backend/pkg/middleware"
 	proxypkg "github.com/simplylimitless/cargobay/backend/pkg/proxy"
 	"github.com/simplylimitless/cargobay/backend/pkg/rbac"
 	"github.com/simplylimitless/cargobay/backend/pkg/storage"
@@ -30,6 +36,7 @@ type NuGetProxy struct {
 	db         *database.Database
 	storage    storage.StorageAdapter
 	cache      *cache.Cache
+	rbacMgr    *rbac.RBAC
 	registries []database.RegistryConfig
 	registry   string
 }
@@ -42,43 +49,199 @@ func NewNuGetProxy(db *database.Database, storage storage.StorageAdapter, cache 
 		db:         db,
 		storage:    storage,
 		cache:      cache,
+		rbacMgr:    rbacMgr,
 		registries: registries,
 		registry:   "nuget",
 	}
 
-	r.Use(proxypkg.RequireReadAccess(db, rbacMgr, registries, "nuget"))
+	r.Group(func(r chi.Router) {
+		r.Use(proxypkg.RequireReadAccess(db, rbacMgr, registries, "nuget"))
 
-	// V3 service index — the discovery document standard clients (dotnet,
-	// nuget.exe) fetch first to locate the routes below. Without this,
-	// pointing a client at this proxy fails before it ever reaches /query
-	// or /package/, even though those V3 routes are fully implemented.
-	r.Get("/v3/index.json", proxy.handleServiceIndex)
+		// V3 service index — the discovery document standard clients (dotnet,
+		// nuget.exe) fetch first to locate the routes below. Without this,
+		// pointing a client at this proxy fails before it ever reaches /query
+		// or /package/, even though those V3 routes are fully implemented.
+		r.Get("/v3/index.json", proxy.handleServiceIndex)
 
-	// NuGet V3 API routes (recommended)
-	// Search: /query?q={query}&skip={skip}&take={take}
-	r.Get("/query", proxy.handleQuery)
+		// NuGet V3 API routes (recommended)
+		// Search: /query?q={query}&skip={skip}&take={take}
+		r.Get("/query", proxy.handleQuery)
 
-	// Package metadata: /package/{id}/{version}
-	r.Get("/package/{packageId}/{version}", proxy.handlePackageMetadata)
+		// Package metadata: /package/{id}/{version}
+		r.Get("/package/{packageId}/{version}", proxy.handlePackageMetadata)
 
-	// Download: /package/{id}/{version}.nupkg
-	r.Get("/package/{packageId}/{version}.nupkg", proxy.handleDownload)
+		// Download: /package/{id}/{version}.nupkg
+		r.Get("/package/{packageId}/{version}.nupkg", proxy.handleDownload)
 
-	// V2 API routes (for backwards compatibility)
-	// Search: /Search()?$filter=IsLatestVersion&searchTerm={query}
-	r.Get("/Search()", proxy.handleSearchV2)
+		// V2 API routes (for backwards compatibility)
+		// Search: /Search()?$filter=IsLatestVersion&searchTerm={query}
+		r.Get("/Search()", proxy.handleSearchV2)
 
-	// Package: /Package/{id}/{version}
-	r.Get("/Package/{packageId}/{version}", proxy.handlePackageV2)
+		// Package: /Package/{id}/{version}
+		r.Get("/Package/{packageId}/{version}", proxy.handlePackageV2)
 
-	// ListPackages: /Package()?$filter=IsLatestVersion
-	r.Get("/Package()", proxy.handleListPackages)
+		// ListPackages: /Package()?$filter=IsLatestVersion
+		r.Get("/Package()", proxy.handleListPackages)
 
-	// V3 Registration (JSON-based)
-	r.Get("/registration/{packageId}/index.json", proxy.handleRegistrationIndex)
-	r.Get("/registration/{packageId}/{version}.json", proxy.handleRegistrationVersion)
+		// V3 Registration (JSON-based)
+		r.Get("/registration/{packageId}/index.json", proxy.handleRegistrationIndex)
+		r.Get("/registration/{packageId}/{version}.json", proxy.handleRegistrationVersion)
+	})
+
+	// Push ("nuget push" / "dotnet nuget push"): a PUT of a .nupkg, either as
+	// the entire raw request body or as the first part of a
+	// multipart/form-data body. See
+	// https://learn.microsoft.com/en-us/nuget/api/package-publish-resource.
+	r.Group(func(r chi.Router) {
+		r.Use(middleware.RequireAuth)
+		r.Put("/api/v2/package", proxy.handlePush)
+	})
 
 	return r
+}
+
+// checkPublishAccess resolves the registry addressed by r's Host header and
+// enforces publish access on it, writing a 401/403 and returning ok=false if
+// denied.
+func (n *NuGetProxy) checkPublishAccess(w http.ResponseWriter, r *http.Request) (proxypkg.Target, bool) {
+	reg := proxypkg.ResolveRegistry(n.db, n.registries, r.Host, "nuget")
+	label := "nuget"
+	if reg != nil {
+		label = reg.ID
+	}
+	t := proxypkg.Target{Reg: reg, Label: label}
+	return t, proxypkg.CheckAccess(w, n.rbacMgr, middleware.GetUser(r), reg, true)
+}
+
+// nuspecMetadata is the subset of a .nuspec's <metadata> needed to store and
+// index the package.
+type nuspecMetadata struct {
+	XMLName xml.Name `xml:"package"`
+	Meta    struct {
+		ID          string `xml:"id"`
+		Version     string `xml:"version"`
+		Description string `xml:"description"`
+		Authors     string `xml:"authors"`
+		ProjectURL  string `xml:"projectUrl"`
+		LicenseURL  string `xml:"licenseUrl"`
+		IconURL     string `xml:"iconUrl"`
+		Tags        string `xml:"tags"`
+		Title       string `xml:"title"`
+		Summary     string `xml:"summary"`
+	} `xml:"metadata"`
+}
+
+// extractNuspec reads a .nupkg (a zip archive) and parses the single
+// top-level .nuspec entry it's required to contain.
+func extractNuspec(nupkg []byte) (*nuspecMetadata, error) {
+	zr, err := zip.NewReader(bytes.NewReader(nupkg), int64(len(nupkg)))
+	if err != nil {
+		return nil, fmt.Errorf("not a valid .nupkg (zip) file: %w", err)
+	}
+
+	for _, f := range zr.File {
+		if !strings.HasSuffix(strings.ToLower(f.Name), ".nuspec") {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return nil, fmt.Errorf("failed to open .nuspec: %w", err)
+		}
+		defer rc.Close()
+
+		var meta nuspecMetadata
+		if err := xml.NewDecoder(rc).Decode(&meta); err != nil {
+			return nil, fmt.Errorf("failed to parse .nuspec: %w", err)
+		}
+		return &meta, nil
+	}
+
+	return nil, fmt.Errorf(".nupkg does not contain a .nuspec file")
+}
+
+// handlePush handles "nuget push"/"dotnet nuget push": a PUT of a .nupkg,
+// either as the raw body or as the first part of a multipart/form-data body.
+func (n *NuGetProxy) handlePush(w http.ResponseWriter, r *http.Request) {
+	t, ok := n.checkPublishAccess(w, r)
+	if !ok {
+		return
+	}
+
+	nupkg, err := readNupkgBody(r)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Malformed push request: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	meta, err := extractNuspec(nupkg)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Malformed .nupkg: %v", err), http.StatusBadRequest)
+		return
+	}
+	if meta.Meta.ID == "" || meta.Meta.Version == "" {
+		http.Error(w, "Missing required field: nuspec id and version are required", http.StatusBadRequest)
+		return
+	}
+
+	if _, err := n.storage.SaveArtifactStream(t.Label, "", meta.Meta.ID, meta.Meta.Version, bytes.NewReader(nupkg)); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to save package: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	digest := sha256.Sum256(nupkg)
+	artifact := &database.ArtifactMetadata{
+		ID:              fmt.Sprintf("nuget:%s:%s:%s", t.Label, meta.Meta.ID, meta.Meta.Version),
+		RegistryID:      t.Label,
+		ArtifactType:    "nuget",
+		ArtifactName:    meta.Meta.ID,
+		Version:         meta.Meta.Version,
+		Digest:          "sha256:" + hex.EncodeToString(digest[:]),
+		DigestAlgorithm: "sha256",
+		Size:            int64(len(nupkg)),
+		Created:         time.Now(),
+		Updated:         time.Now(),
+		Metadata: map[string]interface{}{
+			"metadata": map[string]interface{}{
+				"description": meta.Meta.Description,
+				"authors":     meta.Meta.Authors,
+				"projectUrl":  meta.Meta.ProjectURL,
+				"licenseUrl":  meta.Meta.LicenseURL,
+				"iconUrl":     meta.Meta.IconURL,
+				"tags":        meta.Meta.Tags,
+				"title":       meta.Meta.Title,
+				"summary":     meta.Meta.Summary,
+			},
+		},
+		Tags: []string{meta.Meta.Version},
+	}
+	if err := n.db.SaveArtifact(artifact); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to save package metadata: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusCreated)
+}
+
+// readNupkgBody extracts the .nupkg bytes from a push request: either the
+// first part of a multipart/form-data body (what nuget.exe/dotnet nuget push
+// send by default), or the entire raw body for clients that PUT the .nupkg
+// directly.
+func readNupkgBody(r *http.Request) ([]byte, error) {
+	contentType := r.Header.Get("Content-Type")
+	if strings.HasPrefix(contentType, "multipart/form-data") {
+		mr, err := r.MultipartReader()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read multipart body: %w", err)
+		}
+		part, err := mr.NextPart()
+		if err != nil {
+			return nil, fmt.Errorf("missing package part: %w", err)
+		}
+		defer part.Close()
+		return io.ReadAll(part)
+	}
+
+	return io.ReadAll(r.Body)
 }
 
 // handleServiceIndex handles the V3 service index (discovery) document.

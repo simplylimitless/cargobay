@@ -1,9 +1,12 @@
 package nuget
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -15,6 +18,7 @@ import (
 
 	"github.com/simplylimitless/cargobay/backend/pkg/cache"
 	"github.com/simplylimitless/cargobay/backend/pkg/database"
+	"github.com/simplylimitless/cargobay/backend/pkg/middleware"
 	"github.com/simplylimitless/cargobay/backend/pkg/rbac"
 	"github.com/simplylimitless/cargobay/backend/pkg/storage"
 )
@@ -141,6 +145,55 @@ func withChiParams(req *http.Request, params map[string]string) *http.Request {
 		rctx.URLParams.Add(k, v)
 	}
 	return req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+}
+
+// authedRequest injects an authenticated user into req's context, mirroring
+// what middleware.NewAuthMiddleware would have done in production.
+func authedRequest(req *http.Request, userID string) *http.Request {
+	user := &middleware.User{UserID: userID, Username: userID}
+	ctx := context.WithValue(req.Context(), middleware.AuthUserKey, user)
+	return req.WithContext(ctx)
+}
+
+// seedRegistry saves a plain (host-unbound) registry, used together with an
+// explicit Host assignment in publish tests that need a private/public
+// toggle bindHostRegistry doesn't expose.
+func seedRegistry(t *testing.T, db *database.Database, id string, private, proxy bool) *database.RegistryConfig {
+	t.Helper()
+	reg := &database.RegistryConfig{
+		ID:       id,
+		Name:     id,
+		URL:      "https://upstream.example.com",
+		Type:     "nuget",
+		Proxy:    proxy,
+		Enabled:  true,
+		Priority: 10,
+		Private:  private,
+	}
+	require.NoError(t, db.SaveRegistry(reg))
+	t.Cleanup(func() { db.DeleteRegistry(id) })
+	return reg
+}
+
+// buildNupkg constructs a minimal valid .nupkg (a zip containing a single
+// .nuspec entry) for the given package id/version.
+func buildNupkg(id, version string) []byte {
+	nuspec := fmt.Sprintf(`<?xml version="1.0"?>
+<package>
+  <metadata>
+    <id>%s</id>
+    <version>%s</version>
+    <description>test package</description>
+    <authors>tester</authors>
+  </metadata>
+</package>`, id, version)
+
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	f, _ := zw.Create(id + ".nuspec")
+	f.Write([]byte(nuspec))
+	zw.Close()
+	return buf.Bytes()
 }
 
 func TestNewNuGetProxy(t *testing.T) {
@@ -561,4 +614,259 @@ func TestNuGetProxyRoutes(t *testing.T) {
 		resp.Body.Close()
 		assert.NotEqual(t, http.StatusNotFound, resp.StatusCode, "route %s should exist", route)
 	}
+}
+
+func TestHandlePushNoAuthDenied(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+
+	host := uniqueID("push-noauth-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("push-noauth-reg"), true, false)
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	router := NewNuGetProxy(db, nil, c, rbac.New(db), nil)
+
+	body := buildNupkg(uniqueID("pkg"), "1.0.0")
+	req := httptest.NewRequest(http.MethodPut, "/api/v2/package", bytes.NewReader(body))
+	req.Host = host
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+}
+
+func TestHandlePushReadScopeDenied(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+
+	host := uniqueID("push-readscope-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("push-readscope-reg"), true, false)
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	userID := uniqueID("user")
+	require.NoError(t, db.GrantRegistryAccess(&database.RegistryAccess{
+		RegistryID: reg.ID,
+		UserID:     userID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+	t.Cleanup(func() { db.RevokeRegistryAccess(reg.ID, userID) })
+
+	router := NewNuGetProxy(db, nil, c, rbac.New(db), nil)
+
+	body := buildNupkg(uniqueID("pkg"), "1.0.0")
+	req := httptest.NewRequest(http.MethodPut, "/api/v2/package", bytes.NewReader(body))
+	req.Host = host
+	ctx := context.WithValue(req.Context(), middleware.AuthUserKey, &middleware.User{UserID: userID, Username: userID, Scope: "read"})
+	req = req.WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+}
+
+func TestHandlePushNonPrivateRegistryDenied(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+
+	host := uniqueID("push-public-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("push-public-reg"), false, false) // private=false
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	userID := uniqueID("user")
+	require.NoError(t, db.GrantRegistryAccess(&database.RegistryAccess{
+		RegistryID: reg.ID,
+		UserID:     userID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+	t.Cleanup(func() { db.RevokeRegistryAccess(reg.ID, userID) })
+
+	router := NewNuGetProxy(db, nil, c, rbac.New(db), nil)
+
+	body := buildNupkg(uniqueID("pkg"), "1.0.0")
+	req := httptest.NewRequest(http.MethodPut, "/api/v2/package", bytes.NewReader(body))
+	req.Host = host
+	req = authedRequest(req, userID)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+}
+
+func TestHandlePushSuccess(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+
+	host := uniqueID("push-ok-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("push-ok-reg"), true, false)
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	userID := uniqueID("user")
+	require.NoError(t, db.GrantRegistryAccess(&database.RegistryAccess{
+		RegistryID: reg.ID,
+		UserID:     userID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+	t.Cleanup(func() { db.RevokeRegistryAccess(reg.ID, userID) })
+
+	adapter, err := storage.NewLocalAdapter(map[string]string{"path": t.TempDir()})
+	require.NoError(t, err)
+	router := NewNuGetProxy(db, adapter, c, rbac.New(db), nil)
+
+	pkgID := uniqueID("pkg")
+	version := "1.0.0"
+	nupkg := buildNupkg(pkgID, version)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v2/package", bytes.NewReader(nupkg))
+	req.Host = host
+	req = authedRequest(req, userID)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusCreated, rec.Code)
+	t.Cleanup(func() { db.DeleteArtifact(reg.ID, "", pkgID, version) })
+
+	rc, err := adapter.GetArtifactStream(reg.ID, "", pkgID, version)
+	require.NoError(t, err)
+	defer rc.Close()
+	stored, err := io.ReadAll(rc)
+	require.NoError(t, err)
+	assert.Equal(t, nupkg, stored)
+
+	artifacts, err := db.ListArtifacts(reg.ID, database.ListOptions{ArtifactType: "nuget"})
+	require.NoError(t, err)
+	require.Len(t, artifacts, 1)
+	assert.Equal(t, pkgID, artifacts[0].ArtifactName)
+	assert.Equal(t, version, artifacts[0].Version)
+}
+
+func TestHandlePushMalformedNupkg(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+
+	host := uniqueID("push-malformed-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("push-malformed-reg"), true, false)
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	userID := uniqueID("user")
+	require.NoError(t, db.GrantRegistryAccess(&database.RegistryAccess{
+		RegistryID: reg.ID,
+		UserID:     userID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+	t.Cleanup(func() { db.RevokeRegistryAccess(reg.ID, userID) })
+
+	router := NewNuGetProxy(db, nil, c, rbac.New(db), nil)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v2/package", bytes.NewReader([]byte("not a zip file")))
+	req.Host = host
+	req = authedRequest(req, userID)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestHandlePushGroupGrantSucceeds(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+
+	host := uniqueID("push-group-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("push-group-reg"), true, false)
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	grp, err := db.CreateGroup(uniqueID("publishers"), "publishers group")
+	require.NoError(t, err)
+	t.Cleanup(func() { db.DeleteGroup(grp.ID) })
+
+	userID := uniqueID("user")
+	require.NoError(t, db.AddGroupMember(grp.ID, userID))
+	require.NoError(t, db.GrantGroupRegistryAccess(&database.GroupRegistryAccess{
+		RegistryID: reg.ID,
+		GroupID:    grp.ID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+
+	adapter, err := storage.NewLocalAdapter(map[string]string{"path": t.TempDir()})
+	require.NoError(t, err)
+	router := NewNuGetProxy(db, adapter, c, rbac.New(db), nil)
+
+	pkgID := uniqueID("pkg")
+	version := "1.0.0"
+	nupkg := buildNupkg(pkgID, version)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v2/package", bytes.NewReader(nupkg))
+	req.Host = host
+	req = authedRequest(req, userID)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusCreated, rec.Code)
+	t.Cleanup(func() { db.DeleteArtifact(reg.ID, "", pkgID, version) })
+
+	artifacts, err := db.ListArtifacts(reg.ID, database.ListOptions{ArtifactType: "nuget"})
+	require.NoError(t, err)
+	require.Len(t, artifacts, 1)
+	assert.Equal(t, pkgID, artifacts[0].ArtifactName)
+}
+
+func TestHandlePushXNuGetAPIKeyAuthenticates(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+
+	host := uniqueID("push-apikey-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("push-apikey-reg"), true, false)
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	userID := uniqueID("user")
+	require.NoError(t, db.GrantRegistryAccess(&database.RegistryAccess{
+		RegistryID: reg.ID,
+		UserID:     userID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+	t.Cleanup(func() { db.RevokeRegistryAccess(reg.ID, userID) })
+
+	token, err := db.CreateAccessKey(userID, uniqueID("nuget-key"), []string{"read", "write"}, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { db.InvalidateAccessKey(token.ID) })
+
+	adapter, err := storage.NewLocalAdapter(map[string]string{"path": t.TempDir()})
+	require.NoError(t, err)
+
+	pkgID := uniqueID("pkg")
+	version := "1.0.0"
+	nupkg := buildNupkg(pkgID, version)
+
+	authMiddleware := middleware.NewAuthMiddleware(db, rbac.New(db))
+	router := chi.NewRouter()
+	router.Use(authMiddleware)
+	router.Mount("/", NewNuGetProxy(db, adapter, c, rbac.New(db), nil))
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v2/package", bytes.NewReader(nupkg))
+	req.Host = host
+	req.Header.Set("X-NuGet-ApiKey", token.KeyHash)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusCreated, rec.Code)
+	t.Cleanup(func() { db.DeleteArtifact(reg.ID, "", pkgID, version) })
 }

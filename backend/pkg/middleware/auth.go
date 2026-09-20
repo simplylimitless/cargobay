@@ -70,10 +70,41 @@ func NewAuthMiddleware(db authStore, roles RoleAndPermissionLookup) func(http.Ha
 		}
 	}
 
+	resolveToken := func(w http.ResponseWriter, r *http.Request, next http.Handler, token string) {
+		key, err := db.ValidateAccessKey(auth.HashToken(token))
+		if err != nil || key == nil {
+			// Fall back to the legacy unhashed lookup for login-session
+			// tokens, which are still stored as their raw value.
+			key, err = db.ValidateAccessKey(token)
+			if err != nil || key == nil {
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+
+		dbUser, err := db.GetUserByID(key.UserID)
+		if err != nil || dbUser == nil || !dbUser.IsActive {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		ctx := context.WithValue(r.Context(), AuthUserKey, loadUser(dbUser, accessKeyScope(key)))
+		next.ServeHTTP(w, r.WithContext(ctx))
+	}
+
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			authHeader := r.Header.Get("Authorization")
 			if authHeader == "" {
+				// NuGet's native client (nuget push / dotnet nuget push)
+				// sends its API key via X-NuGet-ApiKey rather than
+				// Authorization — accept it as a bearer-equivalent personal
+				// access token so those clients can publish without needing
+				// non-standard configuration.
+				if apiKey := r.Header.Get("X-NuGet-ApiKey"); apiKey != "" {
+					resolveToken(w, r, next, apiKey)
+					return
+				}
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -121,25 +152,7 @@ func NewAuthMiddleware(db authStore, roles RoleAndPermissionLookup) func(http.Ha
 				return
 			}
 
-			key, err := db.ValidateAccessKey(auth.HashToken(token))
-			if err != nil || key == nil {
-				// Fall back to the legacy unhashed lookup for login-session
-				// tokens, which are still stored as their raw value.
-				key, err = db.ValidateAccessKey(token)
-				if err != nil || key == nil {
-					next.ServeHTTP(w, r)
-					return
-				}
-			}
-
-			dbUser, err := db.GetUserByID(key.UserID)
-			if err != nil || dbUser == nil || !dbUser.IsActive {
-				next.ServeHTTP(w, r)
-				return
-			}
-
-			ctx := context.WithValue(r.Context(), AuthUserKey, loadUser(dbUser, accessKeyScope(key)))
-			next.ServeHTTP(w, r.WithContext(ctx))
+			resolveToken(w, r, next, token)
 		})
 	}
 }

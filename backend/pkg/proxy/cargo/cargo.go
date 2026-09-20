@@ -11,52 +11,180 @@
 package cargo
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/simplylimitless/cargobay/backend/pkg/cache"
 	"github.com/simplylimitless/cargobay/backend/pkg/database"
+	"github.com/simplylimitless/cargobay/backend/pkg/middleware"
 	proxypkg "github.com/simplylimitless/cargobay/backend/pkg/proxy"
 	"github.com/simplylimitless/cargobay/backend/pkg/rbac"
 	"github.com/simplylimitless/cargobay/backend/pkg/storage"
-	"github.com/go-chi/chi/v5"
 )
 
 // CargoProxy implements the Cargo sparse registry protocol proxy.
 type CargoProxy struct {
-	db      *database.Database
-	storage storage.StorageAdapter
-	cache   *cache.Cache
+	db         *database.Database
+	storage    storage.StorageAdapter
+	cache      *cache.Cache
+	rbacMgr    *rbac.RBAC
+	registries []database.RegistryConfig
 }
 
 // NewCargoProxy creates a new Cargo proxy instance.
 func NewCargoProxy(db *database.Database, storage storage.StorageAdapter, cache *cache.Cache, rbacMgr *rbac.RBAC, registries []database.RegistryConfig) chi.Router {
 	r := chi.NewRouter()
 
-	proxy := &CargoProxy{db: db, storage: storage, cache: cache}
+	proxy := &CargoProxy{db: db, storage: storage, cache: cache, rbacMgr: rbacMgr, registries: registries}
 
-	r.Use(proxypkg.RequireReadAccess(db, rbacMgr, registries, "cargo"))
+	r.Group(func(r chi.Router) {
+		r.Use(proxypkg.RequireReadAccess(db, rbacMgr, registries, "cargo"))
 
-	// Registry configuration, required by every sparse registry.
-	r.Get("/config.json", proxy.handleConfig)
+		// Registry configuration, required by every sparse registry.
+		r.Get("/config.json", proxy.handleConfig)
 
-	// Sparse index, sharded the same way crates.io shards its own index:
-	//   1-char name:  /1/{name}
-	//   2-char name:  /2/{name}
-	//   3-char name:  /3/{name[0]}/{name}
-	//   4+-char name: /{name[0:2]}/{name[2:4]}/{name}
-	r.Get("/1/{name}", proxy.handleIndex)
-	r.Get("/2/{name}", proxy.handleIndex)
-	r.Get("/3/{prefix}/{name}", proxy.handleIndex)
-	r.Get("/{p1}/{p2}/{name}", proxy.handleIndex)
+		// Sparse index, sharded the same way crates.io shards its own index:
+		//   1-char name:  /1/{name}
+		//   2-char name:  /2/{name}
+		//   3-char name:  /3/{name[0]}/{name}
+		//   4+-char name: /{name[0:2]}/{name[2:4]}/{name}
+		r.Get("/1/{name}", proxy.handleIndex)
+		r.Get("/2/{name}", proxy.handleIndex)
+		r.Get("/3/{prefix}/{name}", proxy.handleIndex)
+		r.Get("/{p1}/{p2}/{name}", proxy.handleIndex)
 
-	// Crate tarball download.
-	r.Get("/api/v1/crates/{name}/{version}/download", proxy.handleDownload)
+		// Crate tarball download.
+		r.Get("/api/v1/crates/{name}/{version}/download", proxy.handleDownload)
+	})
+
+	// Publish ("cargo publish"): a PUT of the length-prefixed JSON+crate
+	// binary body described at
+	// https://doc.rust-lang.org/cargo/reference/registry-web-api.html#publish.
+	r.Group(func(r chi.Router) {
+		r.Use(middleware.RequireAuth)
+		r.Put("/api/v1/crates/new", proxy.handlePublish)
+	})
 
 	return r
+}
+
+// checkPublishAccess resolves the registry addressed by r's Host header and
+// enforces publish access on it, writing a 401/403 and returning ok=false if
+// denied.
+func (p *CargoProxy) checkPublishAccess(w http.ResponseWriter, r *http.Request) (proxypkg.Target, bool) {
+	reg := proxypkg.ResolveRegistry(p.db, p.registries, r.Host, "cargo")
+	label := "cargo"
+	if reg != nil {
+		label = reg.ID
+	}
+	t := proxypkg.Target{Reg: reg, Label: label}
+	return t, proxypkg.CheckAccess(w, p.rbacMgr, middleware.GetUser(r), reg, true)
+}
+
+// cargoPublishMetadata is the subset of the publish JSON body needed to
+// store and index the crate. See
+// https://doc.rust-lang.org/cargo/reference/registry-web-api.html#publish
+// for the full schema.
+type cargoPublishMetadata struct {
+	Name string        `json:"name"`
+	Vers string        `json:"vers"`
+	Deps []interface{} `json:"deps"`
+}
+
+// readU32LE reads a 32-bit little-endian length prefix, as used throughout
+// the publish wire format.
+func readU32LE(r io.Reader) (uint32, error) {
+	var buf [4]byte
+	if _, err := io.ReadFull(r, buf[:]); err != nil {
+		return 0, err
+	}
+	return binary.LittleEndian.Uint32(buf[:]), nil
+}
+
+// handlePublish handles "cargo publish": a PUT body consisting of a
+// length-prefixed JSON metadata object followed by a length-prefixed .crate
+// tarball.
+func (p *CargoProxy) handlePublish(w http.ResponseWriter, r *http.Request) {
+	t, ok := p.checkPublishAccess(w, r)
+	if !ok {
+		return
+	}
+
+	jsonLen, err := readU32LE(r.Body)
+	if err != nil {
+		http.Error(w, "Malformed publish request: missing metadata length", http.StatusBadRequest)
+		return
+	}
+	jsonBytes := make([]byte, jsonLen)
+	if _, err := io.ReadFull(r.Body, jsonBytes); err != nil {
+		http.Error(w, "Malformed publish request: truncated metadata", http.StatusBadRequest)
+		return
+	}
+	var meta cargoPublishMetadata
+	if err := json.Unmarshal(jsonBytes, &meta); err != nil {
+		http.Error(w, fmt.Sprintf("Malformed publish metadata: %v", err), http.StatusBadRequest)
+		return
+	}
+	if meta.Name == "" || meta.Vers == "" {
+		http.Error(w, "Missing required field: name and vers are required", http.StatusBadRequest)
+		return
+	}
+
+	crateLen, err := readU32LE(r.Body)
+	if err != nil {
+		http.Error(w, "Malformed publish request: missing crate length", http.StatusBadRequest)
+		return
+	}
+
+	hasher := sha256.New()
+	limited := io.LimitReader(r.Body, int64(crateLen))
+	if _, err := p.storage.SaveArtifactStream(t.Label, "", meta.Name, meta.Vers, io.TeeReader(limited, hasher)); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to save crate: %v", err), http.StatusInternalServerError)
+		return
+	}
+	digest := hex.EncodeToString(hasher.Sum(nil))
+
+	if meta.Deps == nil {
+		meta.Deps = []interface{}{}
+	}
+	indexEntry := map[string]interface{}{
+		"name":     meta.Name,
+		"vers":     meta.Vers,
+		"deps":     meta.Deps,
+		"cksum":    digest,
+		"features": map[string]interface{}{},
+		"yanked":   false,
+	}
+	indexLine, _ := json.Marshal(indexEntry)
+
+	artifact := &database.ArtifactMetadata{
+		ID:              fmt.Sprintf("cargo:%s:%s:%s", t.Label, meta.Name, meta.Vers),
+		RegistryID:      t.Label,
+		ArtifactType:    "cargo",
+		ArtifactName:    meta.Name,
+		Version:         meta.Vers,
+		Digest:          "sha256:" + digest,
+		DigestAlgorithm: "sha256",
+		Size:            int64(crateLen),
+		Metadata:        map[string]interface{}{"indexLine": string(indexLine)},
+		Tags:            []string{meta.Vers},
+	}
+	if err := p.db.SaveArtifact(artifact); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to save crate metadata: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	p.cache.Delete(fmt.Sprintf("cargo:index:%s", meta.Name))
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{}`))
 }
 
 // handleConfig serves the registry's config.json.
