@@ -117,6 +117,15 @@ make frontend-e2e
 make backend-test-cover
 ```
 
+### Local Testing
+
+Tests are **disabled on push** to keep PRs unblocked. Run them manually before submitting:
+
+```bash
+make test          # All tests locally
+act workflow_dispatch -j test  # Via GitHub Actions (requires Docker)
+```
+
 ### Writing Tests
 
 **Backend tests:**

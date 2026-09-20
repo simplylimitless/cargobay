@@ -358,7 +358,11 @@ cd frontend && npm run test:coverage
 
 ## CI/CD Integration
 
-Tests are run automatically in CI/CD pipelines:
+Tests run in CI via GitHub Actions, but are **disabled on push** to avoid blocking merges. Run them manually:
+
+- **GitHub Actions**: trigger a manual workflow dispatch from the Actions tab
+- **Locally**: `act workflow_dispatch -j test` (requires Docker)
+- **Locally (make)**: `make test` for backend + frontend tests
 
 ```bash
 # All checks

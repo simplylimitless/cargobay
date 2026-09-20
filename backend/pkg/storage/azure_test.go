@@ -8,6 +8,17 @@ import (
 )
 
 // TestAzureAdapterNew tests Azure adapter creation with container name
+func azureIntegrationTest(t *testing.T) {
+	t.Helper()
+	config := map[string]string{"container": "test-container"}
+	a, err := NewAzureAdapter(config)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = a.Disconnect() })
+	if err := a.Connect(); err != nil {
+		t.Skipf("Azure integration test skipped: %v", err)
+	}
+}
+
 func TestAzureAdapterNew(t *testing.T) {
 	config := map[string]string{
 		"container": "test-container",
@@ -129,8 +140,9 @@ func TestAzureAdapterGetStoragePathWithPrefix(t *testing.T) {
 	assert.Equal(t, "my/prefix/registry1/namespace1/artifact1/1.0.0/artifact.bin", path)
 }
 
-// TestAzureAdapterConnect tests connect method (doesn't actually connect)
+// TestAzureAdapterConnect tests connect method
 func TestAzureAdapterConnect(t *testing.T) {
+	azureIntegrationTest(t)
 	config := map[string]string{
 		"container": "test-container",
 	}
@@ -143,6 +155,7 @@ func TestAzureAdapterConnect(t *testing.T) {
 
 // TestAzureAdapterDisconnect tests disconnect method
 func TestAzureAdapterDisconnect(t *testing.T) {
+	azureIntegrationTest(t)
 	config := map[string]string{
 		"container": "test-container",
 	}
@@ -152,8 +165,9 @@ func TestAzureAdapterDisconnect(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-// TestAzureAdapterUpload tests upload method (doesn't actually upload)
+// TestAzureAdapterUpload tests upload method
 func TestAzureAdapterUpload(t *testing.T) {
+	azureIntegrationTest(t)
 	config := map[string]string{
 		"container": "test-container",
 	}
@@ -165,8 +179,9 @@ func TestAzureAdapterUpload(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-// TestAzureAdapterDownload tests download method (doesn't actually download)
+// TestAzureAdapterDownload tests download method
 func TestAzureAdapterDownload(t *testing.T) {
+	azureIntegrationTest(t)
 	config := map[string]string{
 		"container": "test-container",
 	}
@@ -180,18 +195,19 @@ func TestAzureAdapterDownload(t *testing.T) {
 
 // TestAzureAdapterDeleteFile tests delete file method
 func TestAzureAdapterDeleteFile(t *testing.T) {
+	azureIntegrationTest(t)
 	config := map[string]string{
 		"container": "test-container",
 	}
 	adapter, _ := NewAzureAdapter(config)
 
 	err := adapter.DeleteFile("test-container", "test-key")
-	// We don't assert error because it depends on Azure connectivity
 	assert.NoError(t, err)
 }
 
-// TestAzureAdapterListFiles tests list files method (doesn't actually list)
+// TestAzureAdapterListFiles tests list files method
 func TestAzureAdapterListFiles(t *testing.T) {
+	azureIntegrationTest(t)
 	config := map[string]string{
 		"container": "test-container",
 	}
@@ -205,6 +221,7 @@ func TestAzureAdapterListFiles(t *testing.T) {
 
 // TestAzureAdapterArtifactExists tests artifact exists method
 func TestAzureAdapterArtifactExists(t *testing.T) {
+	azureIntegrationTest(t)
 	config := map[string]string{
 		"container": "test-container",
 	}
@@ -217,6 +234,7 @@ func TestAzureAdapterArtifactExists(t *testing.T) {
 
 // TestAzureAdapterGetArtifact tests get artifact method
 func TestAzureAdapterGetArtifact(t *testing.T) {
+	azureIntegrationTest(t)
 	config := map[string]string{
 		"container": "test-container",
 	}
@@ -230,6 +248,7 @@ func TestAzureAdapterGetArtifact(t *testing.T) {
 
 // TestAzureAdapterSaveArtifact tests save artifact method
 func TestAzureAdapterSaveArtifact(t *testing.T) {
+	azureIntegrationTest(t)
 	config := map[string]string{
 		"container": "test-container",
 	}
@@ -237,25 +256,25 @@ func TestAzureAdapterSaveArtifact(t *testing.T) {
 
 	data := []byte("test data")
 	key, err := adapter.SaveArtifact("registry1", "namespace1", "artifact1", "1.0.0", data)
-	// We don't assert error because it depends on Azure connectivity
 	assert.NoError(t, err)
 	assert.NotEmpty(t, key)
 }
 
 // TestAzureAdapterDeleteArtifact tests delete artifact method
 func TestAzureAdapterDeleteArtifact(t *testing.T) {
+	azureIntegrationTest(t)
 	config := map[string]string{
 		"container": "test-container",
 	}
 	adapter, _ := NewAzureAdapter(config)
 
 	err := adapter.DeleteArtifact("registry1", "namespace1", "artifact1", "1.0.0")
-	// We don't assert error because it depends on Azure connectivity
 	assert.NoError(t, err)
 }
 
 // TestAzureAdapterUploadWithBucketOverride tests upload with bucket override
 func TestAzureAdapterUploadWithBucketOverride(t *testing.T) {
+	azureIntegrationTest(t)
 	config := map[string]string{
 		"container": "default-container",
 	}
@@ -263,32 +282,31 @@ func TestAzureAdapterUploadWithBucketOverride(t *testing.T) {
 
 	data := []byte("test data")
 	err := adapter.Upload("override-container", "test-key", data, "text/plain")
-	// We don't assert error because it depends on Azure connectivity
 	assert.NoError(t, err)
 }
 
 // TestAzureAdapterDownloadWithBucketOverride tests download with bucket override
 func TestAzureAdapterDownloadWithBucketOverride(t *testing.T) {
+	azureIntegrationTest(t)
 	config := map[string]string{
 		"container": "default-container",
 	}
 	adapter, _ := NewAzureAdapter(config)
 
 	data, err := adapter.Download("override-container", "test-key")
-	// We don't assert error because it depends on Azure connectivity
 	assert.NoError(t, err)
 	assert.Nil(t, data)
 }
 
 // TestAzureAdapterDeleteFileWithBucketOverride tests delete file with bucket override
 func TestAzureAdapterDeleteFileWithBucketOverride(t *testing.T) {
+	azureIntegrationTest(t)
 	config := map[string]string{
 		"container": "default-container",
 	}
 	adapter, _ := NewAzureAdapter(config)
 
 	err := adapter.DeleteFile("override-container", "test-key")
-	// We don't assert error because it depends on Azure connectivity
 	assert.NoError(t, err)
 }
 
@@ -316,6 +334,7 @@ func TestAzureAdapterStoragePathEmptyFields(t *testing.T) {
 
 // TestAzureAdapterConnectDisconnectIdempotent tests connect/disconnect are idempotent
 func TestAzureAdapterConnectDisconnectIdempotent(t *testing.T) {
+	azureIntegrationTest(t)
 	config := map[string]string{
 		"container": "test-container",
 	}
@@ -401,6 +420,7 @@ func TestAzureAdapterCoolTier(t *testing.T) {
 
 // TestAzureAdapterListFilesWithPrefix tests list files with prefix
 func TestAzureAdapterListFilesWithPrefix(t *testing.T) {
+	azureIntegrationTest(t)
 	config := map[string]string{
 		"container": "test-container",
 	}
@@ -413,6 +433,7 @@ func TestAzureAdapterListFilesWithPrefix(t *testing.T) {
 
 // TestAzureAdapterArtifactExistsWithPrefix tests artifact exists with prefix
 func TestAzureAdapterArtifactExistsWithPrefix(t *testing.T) {
+	azureIntegrationTest(t)
 	config := map[string]string{
 		"container": "test-container",
 		"prefix":    "my/prefix",
@@ -426,6 +447,7 @@ func TestAzureAdapterArtifactExistsWithPrefix(t *testing.T) {
 
 // TestAzureAdapterSaveArtifactWithMetadata tests save artifact with metadata
 func TestAzureAdapterSaveArtifactWithMetadata(t *testing.T) {
+	azureIntegrationTest(t)
 	config := map[string]string{
 		"container": "test-container",
 	}

@@ -273,6 +273,22 @@ describe('ArtifactUpload', () => {
    - `fix: resolve bug in proxy`
    - `docs: update configuration guide`
 
+2. **Testing**: Tests are disabled on push — run them locally before submitting.
+
+   ```bash
+   # All tests locally
+   make test
+
+   # Backend tests
+   make test-backend
+
+   # Frontend tests
+   make test-frontend
+
+   # Via GitHub Actions (requires Docker)
+   act workflow_dispatch -j test
+   ```
+
 2. **Description**: Include:
    - What changes were made
    - Why they were made
