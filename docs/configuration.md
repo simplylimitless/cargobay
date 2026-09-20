@@ -187,9 +187,9 @@ that upstream and never touches cargobay, no matter what's in
 DNS/hostname and TLS cert per upstream.
 
 As an alternative, the Docker proxy also recognizes a `dkr/` marker as the
-first path segment of a request, addressing any configured, proxy-enabled
-docker registry by path instead of by hostname — no extra DNS needed, just
-one cargobay hostname for everything:
+first path segment of a request, addressing any configured docker registry
+by path instead of by hostname — no extra DNS needed, just one cargobay
+hostname for everything:
 
 ```
 docker pull cargobay.example.com/dkr/<registry-selector>/<repo>:<tag>
@@ -233,6 +233,87 @@ so if you drop `registry-mirrors` entirely and rely only on `dkr/`
 addressing, remember to prefix every pull explicitly, including Docker Hub
 ones: `docker pull cargobay.example.com/dkr/registry-1.docker.io/library/nginx:latest`
 (note official images need the `library/` namespace).
+
+Matching by `id` (but not by upstream hostname) also works for a **private,
+non-proxy** registry — one you push your own images to rather than mirror
+from somewhere else (`proxy: false`; see
+[Private/multiple docker registries](#privatemultiple-docker-registries)
+above). This is the only path-based way to reach that kind of registry,
+since it has no upstream URL to match a hostname against. For example, with
+a private registry configured as `id: tinkertown`, `proxy: false`, a user
+granted publish access can push without needing a dedicated hostname:
+
+```
+docker login cargobay.example.com
+docker tag myimage cargobay.example.com/dkr/tinkertown/myimage:latest
+docker push cargobay.example.com/dkr/tinkertown/myimage:latest
+```
+
+## npm and Maven Registries
+
+Like Docker, the npm and Maven proxies (Maven's implementation is shared by
+Gradle and SBT, since all three consume standard Maven-layout repositories)
+support publishing to a private registry, not just pulling from one. There
+is no `dkr/`-style path-prefix addressing for npm/Maven — a private registry
+must be bound to a `Host` (see [Private Docker registries](#privatemultiple-docker-registries)
+for the general mechanism; it applies the same way regardless of registry
+`type`), and clients publish to it via that hostname, same as pulls. The
+publishing user needs a `CanPublish` grant on the registry — per-user via
+the registry access API/UI, or via a [group](api.md#groups) — same
+requirement as `docker push`.
+
+### Publishing to npm
+
+```ini
+# .npmrc
+registry=https://npm.cargobay.example.com/npm/
+//npm.cargobay.example.com/npm/:_authToken=<personal-access-token>
+```
+
+```
+npm publish
+```
+
+Scoped packages (`@myscope/mypackage`) work the same way — no extra
+configuration beyond the registry/token above.
+
+### Publishing to Maven (and Gradle/SBT)
+
+```xml
+<!-- settings.xml -->
+<servers>
+  <server>
+    <id>cargobay</id>
+    <username>your-username</username>
+    <password>your-personal-access-token</password>
+  </server>
+</servers>
+```
+
+```xml
+<!-- pom.xml -->
+<distributionManagement>
+  <repository>
+    <id>cargobay</id>
+    <url>https://maven.cargobay.example.com/maven/</url>
+  </repository>
+</distributionManagement>
+```
+
+```
+mvn deploy
+```
+
+or, without editing `pom.xml`:
+
+```
+mvn deploy -DaltDeploymentRepository=cargobay::default::https://maven.cargobay.example.com/maven/<group>/<artifact>/<version>/
+```
+
+Gradle and SBT publish to the same repository layout — point their
+publish-repository configuration at `https://gradle.cargobay.example.com/gradle/`
+or `https://sbt.cargobay.example.com/sbt/` respectively, using the same
+credentials.
 
 ## Storage Backend Configuration
 

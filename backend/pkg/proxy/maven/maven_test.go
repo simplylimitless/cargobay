@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 
 	"github.com/simplylimitless/cargobay/backend/pkg/cache"
 	"github.com/simplylimitless/cargobay/backend/pkg/database"
+	"github.com/simplylimitless/cargobay/backend/pkg/middleware"
 	"github.com/simplylimitless/cargobay/backend/pkg/rbac"
 	"github.com/simplylimitless/cargobay/backend/pkg/storage"
 )
@@ -573,6 +575,437 @@ func TestNamespaceHandling(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, results, 1)
 	assert.Equal(t, group, results[0].Namespace)
+}
+
+// authedRequest injects an authenticated user into req's context, mirroring
+// what middleware.NewAuthMiddleware would have done in production (that
+// middleware is wired only in cmd/server/main.go, outside the router these
+// tests exercise directly).
+func authedRequest(req *http.Request, userID string) *http.Request {
+	user := &middleware.User{UserID: userID, Username: userID}
+	ctx := context.WithValue(req.Context(), middleware.AuthUserKey, user)
+	return req.WithContext(ctx)
+}
+
+func TestHandlePutArtifactRequiresAuth(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	router, _ := newTestRouter(t, db, c)
+
+	regID := uniqueID("put-noauth-reg")
+	host := uniqueID("put-noauth-host") + ".test"
+	seedRegistry(t, db, regID, host, true, false)
+
+	path := "/com.example/my-app/1.0.0/my-app-1.0.0.jar"
+	req := httptest.NewRequest(http.MethodPut, path, strings.NewReader("jar bytes"))
+	req.Host = host
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+}
+
+func TestHandlePutArtifactRequiresPublishGrant(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	router, _ := newTestRouter(t, db, c)
+
+	regID := uniqueID("put-noperm-reg")
+	host := uniqueID("put-noperm-host") + ".test"
+	seedRegistry(t, db, regID, host, true, false)
+
+	path := "/com.example/my-app/1.0.0/my-app-1.0.0.jar"
+	req := httptest.NewRequest(http.MethodPut, path, strings.NewReader("jar bytes"))
+	req.Host = host
+	req = authedRequest(req, uniqueID("user"))
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+}
+
+func TestHandlePutArtifactSucceedsWithPublishGrant(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	router, _ := newTestRouter(t, db, c)
+
+	regID := uniqueID("put-ok-reg")
+	host := uniqueID("put-ok-host") + ".test"
+	seedRegistry(t, db, regID, host, true, false)
+
+	userID := uniqueID("user")
+	require.NoError(t, db.GrantRegistryAccess(&database.RegistryAccess{
+		RegistryID: regID,
+		UserID:     userID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+	t.Cleanup(func() { db.RevokeRegistryAccess(regID, userID) })
+
+	group := uniqueID("grp")
+	artifact := "my-app"
+	version := "1.0.0"
+	jarData := []byte("real jar bytes")
+
+	putPath := fmt.Sprintf("/%s/%s/%s/%s-%s.jar", group, artifact, version, artifact, version)
+	putReq := httptest.NewRequest(http.MethodPut, putPath, strings.NewReader(string(jarData)))
+	putReq.Host = host
+	putReq = authedRequest(putReq, userID)
+	putRec := httptest.NewRecorder()
+
+	router.ServeHTTP(putRec, putReq)
+	require.Equal(t, http.StatusCreated, putRec.Code)
+	t.Cleanup(func() { db.DeleteArtifact(regID, group, artifact, version) })
+
+	getReq := httptest.NewRequest(http.MethodGet, putPath, nil)
+	getReq.Host = host
+	getRec := httptest.NewRecorder()
+
+	router.ServeHTTP(getRec, getReq)
+
+	assert.Equal(t, http.StatusOK, getRec.Code)
+	assert.Equal(t, jarData, getRec.Body.Bytes())
+}
+
+// TestHandlePutArtifactStorageKeyIsolation is a regression test for the
+// pre-existing bug where handleJAR/handlePOM/handleArtifactFile hardcoded
+// the literal registry label "maven" instead of the resolved target's
+// label. Without the fix, a JAR pushed to a non-default private registry
+// would be saved under its own label but read back from (and visible
+// under) the literal "maven" bucket — silently missing on pull via its own
+// registry, and visible cross-registry via any other "maven"-labeled
+// registry.
+func TestHandlePutArtifactStorageKeyIsolation(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	router, _ := newTestRouter(t, db, c)
+
+	privID := uniqueID("isolation-priv-reg")
+	privHost := uniqueID("isolation-priv-host") + ".test"
+	seedRegistry(t, db, privID, privHost, true, false)
+
+	defaultID := uniqueID("isolation-default-reg")
+	defaultHost := uniqueID("isolation-default-host") + ".test"
+	seedRegistry(t, db, defaultID, defaultHost, false, false)
+
+	userID := uniqueID("user")
+	require.NoError(t, db.GrantRegistryAccess(&database.RegistryAccess{
+		RegistryID: privID,
+		UserID:     userID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+	t.Cleanup(func() { db.RevokeRegistryAccess(privID, userID) })
+
+	group := uniqueID("grp")
+	artifact := "isolated-app"
+	version := "1.0.0"
+	jarData := []byte("isolated jar bytes")
+
+	putPath := fmt.Sprintf("/%s/%s/%s/%s-%s.jar", group, artifact, version, artifact, version)
+	putReq := httptest.NewRequest(http.MethodPut, putPath, strings.NewReader(string(jarData)))
+	putReq.Host = privHost
+	putReq = authedRequest(putReq, userID)
+	putRec := httptest.NewRecorder()
+
+	router.ServeHTTP(putRec, putReq)
+	require.Equal(t, http.StatusCreated, putRec.Code)
+	t.Cleanup(func() { db.DeleteArtifact(privID, group, artifact, version) })
+
+	// Retrievable via the registry it was pushed to.
+	privGetReq := httptest.NewRequest(http.MethodGet, putPath, nil)
+	privGetReq.Host = privHost
+	privGetRec := httptest.NewRecorder()
+	router.ServeHTTP(privGetRec, privGetReq)
+	assert.Equal(t, http.StatusOK, privGetRec.Code)
+	assert.Equal(t, jarData, privGetRec.Body.Bytes())
+
+	// Not visible via a different registry that also resolves to the
+	// artifactType "maven" default label.
+	defaultGetReq := httptest.NewRequest(http.MethodGet, putPath, nil)
+	defaultGetReq.Host = defaultHost
+	defaultGetRec := httptest.NewRecorder()
+	router.ServeHTTP(defaultGetRec, defaultGetReq)
+	assert.Equal(t, http.StatusBadGateway, defaultGetRec.Code)
+}
+
+// TestHandlePutArtifactPOMVariant proves handlePutArtifact's ext/contentType
+// parameterization works for a non-JAR extension, not just the JAR case
+// exercised above.
+func TestHandlePutArtifactPOMVariant(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	router, _ := newTestRouter(t, db, c)
+
+	regID := uniqueID("put-pom-reg")
+	host := uniqueID("put-pom-host") + ".test"
+	seedRegistry(t, db, regID, host, true, false)
+
+	userID := uniqueID("user")
+	require.NoError(t, db.GrantRegistryAccess(&database.RegistryAccess{
+		RegistryID: regID,
+		UserID:     userID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+	t.Cleanup(func() { db.RevokeRegistryAccess(regID, userID) })
+
+	group := uniqueID("grp")
+	artifact := "my-app"
+	version := "1.0.0"
+	pomData := []byte(`<?xml version="1.0"?><project></project>`)
+
+	putPath := fmt.Sprintf("/%s/%s/%s/%s-%s.pom", group, artifact, version, artifact, version)
+	putReq := httptest.NewRequest(http.MethodPut, putPath, strings.NewReader(string(pomData)))
+	putReq.Host = host
+	putReq = authedRequest(putReq, userID)
+	putRec := httptest.NewRecorder()
+
+	router.ServeHTTP(putRec, putReq)
+	require.Equal(t, http.StatusCreated, putRec.Code)
+	t.Cleanup(func() { db.DeleteArtifact(regID, group, artifact, version) })
+
+	getReq := httptest.NewRequest(http.MethodGet, putPath, nil)
+	getReq.Host = host
+	getRec := httptest.NewRecorder()
+
+	router.ServeHTTP(getRec, getReq)
+
+	assert.Equal(t, http.StatusOK, getRec.Code)
+	assert.Equal(t, "application/xml", getRec.Header().Get("Content-Type"))
+	assert.Equal(t, pomData, getRec.Body.Bytes())
+}
+
+// TestHandlePutMetadataNoop covers the maven-metadata.xml PUT route: mvn
+// deploy always uploads this file alongside the artifact, and it must be
+// accepted (201) even though nothing is persisted for it, or the deploy
+// fails client-side. Auth/publish-grant enforcement mirrors the artifact
+// PUT routes since both sit behind the same route-group middleware and the
+// same checkPublishAccess call.
+func TestHandlePutMetadataNoop(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	router, _ := newTestRouter(t, db, c)
+
+	regID := uniqueID("put-meta-reg")
+	host := uniqueID("put-meta-host") + ".test"
+	seedRegistry(t, db, regID, host, true, false)
+
+	group := uniqueID("grp")
+	artifact := "my-app"
+	version := "1.0.0"
+	metaPath := fmt.Sprintf("/%s/%s/%s/maven-metadata.xml", group, artifact, version)
+
+	// No auth -> 401.
+	noAuthReq := httptest.NewRequest(http.MethodPut, metaPath, strings.NewReader("<metadata/>"))
+	noAuthReq.Host = host
+	noAuthRec := httptest.NewRecorder()
+	router.ServeHTTP(noAuthRec, noAuthReq)
+	assert.Equal(t, http.StatusUnauthorized, noAuthRec.Code)
+
+	// Authed but no grant -> 403.
+	userID := uniqueID("user")
+	noGrantReq := httptest.NewRequest(http.MethodPut, metaPath, strings.NewReader("<metadata/>"))
+	noGrantReq.Host = host
+	noGrantReq = authedRequest(noGrantReq, userID)
+	noGrantRec := httptest.NewRecorder()
+	router.ServeHTTP(noGrantRec, noGrantReq)
+	assert.Equal(t, http.StatusForbidden, noGrantRec.Code)
+
+	// Granted -> 201, body discarded without error.
+	require.NoError(t, db.GrantRegistryAccess(&database.RegistryAccess{
+		RegistryID: regID,
+		UserID:     userID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+	t.Cleanup(func() { db.RevokeRegistryAccess(regID, userID) })
+
+	okReq := httptest.NewRequest(http.MethodPut, metaPath, strings.NewReader("<metadata><groupId>g</groupId></metadata>"))
+	okReq.Host = host
+	okReq = authedRequest(okReq, userID)
+	okRec := httptest.NewRecorder()
+	router.ServeHTTP(okRec, okReq)
+	assert.Equal(t, http.StatusCreated, okRec.Code)
+}
+
+// TestHandlePutArtifactGroupGrantSucceeds proves CanPublishRegistry's
+// group-based grant path (GroupRegistryAccess.CanPublish) is sufficient to
+// publish, without any per-user RegistryAccess row at all.
+func TestHandlePutArtifactGroupGrantSucceeds(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	router, _ := newTestRouter(t, db, c)
+
+	regID := uniqueID("put-group-reg")
+	host := uniqueID("put-group-host") + ".test"
+	seedRegistry(t, db, regID, host, true, false)
+
+	grp, err := db.CreateGroup(uniqueID("deployers"), "deployers group")
+	require.NoError(t, err)
+	t.Cleanup(func() { db.DeleteGroup(grp.ID) })
+
+	userID := uniqueID("user")
+	require.NoError(t, db.AddGroupMember(grp.ID, userID))
+	require.NoError(t, db.GrantGroupRegistryAccess(&database.GroupRegistryAccess{
+		RegistryID: regID,
+		GroupID:    grp.ID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+
+	group := uniqueID("grp")
+	artifact := "my-app"
+	version := "1.0.0"
+	jarData := []byte("group-granted jar bytes")
+
+	putPath := fmt.Sprintf("/%s/%s/%s/%s-%s.jar", group, artifact, version, artifact, version)
+	putReq := httptest.NewRequest(http.MethodPut, putPath, strings.NewReader(string(jarData)))
+	putReq.Host = host
+	putReq = authedRequest(putReq, userID)
+	putRec := httptest.NewRecorder()
+
+	router.ServeHTTP(putRec, putReq)
+	require.Equal(t, http.StatusCreated, putRec.Code)
+	t.Cleanup(func() { db.DeleteArtifact(regID, group, artifact, version) })
+}
+
+// TestHandlePutArtifactNonPrivateRegistryDenied proves CanPublishRegistry
+// denies publish to a public (non-private) registry even for a user with an
+// explicit CanPublish grant recorded against it — mirroring how Docker push
+// is denied against non-private registries.
+func TestHandlePutArtifactNonPrivateRegistryDenied(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	router, _ := newTestRouter(t, db, c)
+
+	regID := uniqueID("put-public-reg")
+	host := uniqueID("put-public-host") + ".test"
+	seedRegistry(t, db, regID, host, false, false) // private=false
+
+	userID := uniqueID("user")
+	require.NoError(t, db.GrantRegistryAccess(&database.RegistryAccess{
+		RegistryID: regID,
+		UserID:     userID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+	t.Cleanup(func() { db.RevokeRegistryAccess(regID, userID) })
+
+	group := uniqueID("grp")
+	artifact := "my-app"
+	version := "1.0.0"
+
+	putPath := fmt.Sprintf("/%s/%s/%s/%s-%s.jar", group, artifact, version, artifact, version)
+	putReq := httptest.NewRequest(http.MethodPut, putPath, strings.NewReader("jar bytes"))
+	putReq.Host = host
+	putReq = authedRequest(putReq, userID)
+	putRec := httptest.NewRecorder()
+
+	router.ServeHTTP(putRec, putReq)
+	assert.Equal(t, http.StatusForbidden, putRec.Code)
+}
+
+// TestHandlePutArtifactReadScopeDenied proves a read-scoped credential
+// (e.g. a read-only personal access token) can never publish, even with an
+// otherwise-valid CanPublish grant on a private registry.
+func TestHandlePutArtifactReadScopeDenied(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	router, _ := newTestRouter(t, db, c)
+
+	regID := uniqueID("put-readscope-reg")
+	host := uniqueID("put-readscope-host") + ".test"
+	seedRegistry(t, db, regID, host, true, false)
+
+	userID := uniqueID("user")
+	require.NoError(t, db.GrantRegistryAccess(&database.RegistryAccess{
+		RegistryID: regID,
+		UserID:     userID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+	t.Cleanup(func() { db.RevokeRegistryAccess(regID, userID) })
+
+	group := uniqueID("grp")
+	artifact := "my-app"
+	version := "1.0.0"
+
+	putPath := fmt.Sprintf("/%s/%s/%s/%s-%s.jar", group, artifact, version, artifact, version)
+	putReq := httptest.NewRequest(http.MethodPut, putPath, strings.NewReader("jar bytes"))
+	putReq.Host = host
+	ctx := context.WithValue(putReq.Context(), middleware.AuthUserKey, &middleware.User{UserID: userID, Username: userID, Scope: "read"})
+	putReq = putReq.WithContext(ctx)
+	putRec := httptest.NewRecorder()
+
+	router.ServeHTTP(putRec, putReq)
+	assert.Equal(t, http.StatusForbidden, putRec.Code)
+}
+
+// TestGradleAliasProxyPublishSucceeds proves NewMavenAliasProxy's write
+// routes work end-to-end for a non-"maven" registry type: p.registry
+// ("gradle") must thread through ResolveRegistry/RBAC/ArtifactType exactly
+// like the base Maven proxy does.
+func TestGradleAliasProxyPublishSucceeds(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	adapter, err := storage.NewLocalAdapter(map[string]string{"path": t.TempDir()})
+	require.NoError(t, err)
+	router := NewMavenAliasProxy(db, adapter, c, rbac.New(db), nil, "gradle")
+
+	regID := uniqueID("gradle-reg")
+	host := uniqueID("gradle-host") + ".test"
+	reg := &database.RegistryConfig{
+		ID:       regID,
+		Name:     regID,
+		URL:      "https://upstream.example.com",
+		Type:     "gradle",
+		Proxy:    false,
+		Enabled:  true,
+		Priority: 10,
+		Private:  true,
+		Host:     host,
+	}
+	require.NoError(t, db.SaveRegistry(reg))
+	t.Cleanup(func() { db.DeleteRegistry(regID) })
+
+	userID := uniqueID("user")
+	require.NoError(t, db.GrantRegistryAccess(&database.RegistryAccess{
+		RegistryID: regID,
+		UserID:     userID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+	t.Cleanup(func() { db.RevokeRegistryAccess(regID, userID) })
+
+	group := uniqueID("grp")
+	artifact := "gradle-app"
+	version := "1.0.0"
+	jarData := []byte("gradle jar bytes")
+
+	putPath := fmt.Sprintf("/%s/%s/%s/%s-%s.jar", group, artifact, version, artifact, version)
+	putReq := httptest.NewRequest(http.MethodPut, putPath, strings.NewReader(string(jarData)))
+	putReq.Host = host
+	putReq = authedRequest(putReq, userID)
+	putRec := httptest.NewRecorder()
+
+	router.ServeHTTP(putRec, putReq)
+	require.Equal(t, http.StatusCreated, putRec.Code)
+	t.Cleanup(func() { db.DeleteArtifact(regID, group, artifact, version) })
+
+	artifacts, err := db.ListArtifacts(regID, database.ListOptions{ArtifactType: "gradle", Namespace: group})
+	require.NoError(t, err)
+	require.Len(t, artifacts, 1)
+	assert.Equal(t, "gradle", artifacts[0].ArtifactType)
+
+	getReq := httptest.NewRequest(http.MethodGet, putPath, nil)
+	getReq.Host = host
+	getRec := httptest.NewRecorder()
+	router.ServeHTTP(getRec, getReq)
+	assert.Equal(t, http.StatusOK, getRec.Code)
+	assert.Equal(t, jarData, getRec.Body.Bytes())
 }
 
 func TestArtifactSearchByNamespace(t *testing.T) {

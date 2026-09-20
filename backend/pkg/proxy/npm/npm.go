@@ -11,6 +11,8 @@ package npm
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,6 +22,7 @@ import (
 
 	"github.com/simplylimitless/cargobay/backend/pkg/cache"
 	"github.com/simplylimitless/cargobay/backend/pkg/database"
+	"github.com/simplylimitless/cargobay/backend/pkg/middleware"
 	proxypkg "github.com/simplylimitless/cargobay/backend/pkg/proxy"
 	"github.com/simplylimitless/cargobay/backend/pkg/rbac"
 	"github.com/simplylimitless/cargobay/backend/pkg/storage"
@@ -28,11 +31,12 @@ import (
 
 // NPMProxy implements the npm Registry API proxy
 type NPMProxy struct {
-	db       *database.Database
-	storage  storage.StorageAdapter
-	cache    *cache.Cache
+	db         *database.Database
+	storage    storage.StorageAdapter
+	cache      *cache.Cache
+	rbacMgr    *rbac.RBAC
 	registries []database.RegistryConfig
-	registry string
+	registry   string
 }
 
 // NewNPMProxy creates a new npm proxy instance
@@ -43,6 +47,7 @@ func NewNPMProxy(db *database.Database, storage storage.StorageAdapter, cache *c
 		db:         db,
 		storage:    storage,
 		cache:      cache,
+		rbacMgr:    rbacMgr,
 		registries: registries,
 		registry:   "npm",
 	}
@@ -50,29 +55,57 @@ func NewNPMProxy(db *database.Database, storage storage.StorageAdapter, cache *c
 	// Resolve which registry a request addresses purely from the Host
 	// header the client connected on (falling back to the default public
 	// npm proxy) and enforce read access — no change to how packages are
-	// named or referenced.
-	r.Use(proxypkg.RequireReadAccess(db, rbacMgr, registries, "npm"))
+	// named or referenced. Scoped to a group so it applies only to the GET
+	// routes below, not the publish routes (which enforce publish access
+	// instead, via checkPublishAccess).
+	r.Group(func(r chi.Router) {
+		r.Use(proxypkg.RequireReadAccess(db, rbacMgr, registries, "npm"))
 
-	r.Get("/", proxy.handleRoot)
-	r.Get("/-/ping", proxy.handlePing)
-	r.Get("/-/user", proxy.handleUser)
-	r.Get("/-/user/sync", proxy.handleUserSync)
+		r.Get("/", proxy.handleRoot)
+		r.Get("/-/ping", proxy.handlePing)
+		r.Get("/-/user", proxy.handleUser)
+		r.Get("/-/user/sync", proxy.handleUserSync)
 
-	// Scoped packages: /@scope/pkgName
-	r.Get("/@{scope}/{pkgName}", proxy.handleScopedPackage)
-	r.Get("/@{scope}/{pkgName}/{version}", proxy.handleScopedPackageVersion)
+		// Scoped packages: /@scope/pkgName
+		r.Get("/@{scope}/{pkgName}", proxy.handleScopedPackage)
+		r.Get("/@{scope}/{pkgName}/{version}", proxy.handleScopedPackageVersion)
 
-	// Regular packages: /pkgName
-	r.Get("/{pkgName}", proxy.handlePackage)
-	r.Get("/{pkgName}/{version}", proxy.handlePackageVersion)
+		// Regular packages: /pkgName
+		r.Get("/{pkgName}", proxy.handlePackage)
+		r.Get("/{pkgName}/{version}", proxy.handlePackageVersion)
 
-	// Download tarballs. chi cannot match a literal suffix glued onto a
-	// {param} within the same path segment (e.g. "{tarballName}-{version}.tgz"),
-	// so the filename is captured as a wildcard and parsed in the handler.
-	r.Get("/{pkgName}/-/*", proxy.handleTarball)
-	r.Get("/@{scope}/{pkgName}/-/*", proxy.handleScopedTarball)
+		// Download tarballs. chi cannot match a literal suffix glued onto a
+		// {param} within the same path segment (e.g. "{tarballName}-{version}.tgz"),
+		// so the filename is captured as a wildcard and parsed in the handler.
+		r.Get("/{pkgName}/-/*", proxy.handleTarball)
+		r.Get("/@{scope}/{pkgName}/-/*", proxy.handleScopedTarball)
+	})
+
+	// Publish (npm publish sends PUT to the package's own metadata URL).
+	// Anonymous requests are rejected outright; checkPublishAccess further
+	// enforces that the authenticated user may publish to the resolved
+	// registry specifically.
+	r.Group(func(r chi.Router) {
+		r.Use(middleware.RequireAuth)
+
+		r.Put("/{pkgName}", proxy.handlePublish)
+		r.Put("/@{scope}/{pkgName}", proxy.handleScopedPublish)
+	})
 
 	return r
+}
+
+// checkPublishAccess resolves the registry addressed by r's Host header and
+// enforces publish access on it, writing a 401/403 and returning ok=false if
+// denied.
+func (p *NPMProxy) checkPublishAccess(w http.ResponseWriter, r *http.Request) (proxypkg.Target, bool) {
+	reg := proxypkg.ResolveRegistry(p.db, p.registries, r.Host, "npm")
+	label := "npm"
+	if reg != nil {
+		label = reg.ID
+	}
+	t := proxypkg.Target{Reg: reg, Label: label}
+	return t, proxypkg.CheckAccess(w, p.rbacMgr, middleware.GetUser(r), reg, true)
 }
 
 // handleRoot returns registry info
@@ -524,4 +557,126 @@ func (p *NPMProxy) savePackageVersionMetadata(registryLabel, packageName, versio
 	}
 
 	p.db.SaveArtifact(artifact)
+}
+
+// npmAttachment mirrors the shape of an entry in the "_attachments" map of
+// an npm publish payload.
+type npmAttachment struct {
+	ContentType string `json:"content_type"`
+	Data        string `json:"data"`
+	Length      int    `json:"length"`
+}
+
+// npmPublishPayload mirrors the JSON body npm publish sends: package
+// metadata (dist-tags, per-version manifests) plus a base64-encoded
+// tarball for each version being published.
+type npmPublishPayload struct {
+	Name        string                    `json:"name"`
+	DistTags    map[string]string         `json:"dist-tags"`
+	Versions    map[string]interface{}    `json:"versions"`
+	Attachments map[string]npmAttachment  `json:"_attachments"`
+}
+
+// handlePublish handles "npm publish" for an unscoped package: a PUT to the
+// package's own metadata URL with a JSON body containing package metadata
+// plus a base64-encoded tarball in "_attachments".
+func (p *NPMProxy) handlePublish(w http.ResponseWriter, r *http.Request) {
+	t, ok := p.checkPublishAccess(w, r)
+	if !ok {
+		return
+	}
+	pkgName := chi.URLParam(r, "pkgName")
+	p.publish(w, r, t, "", pkgName)
+}
+
+// handleScopedPublish handles "npm publish" for a scoped package
+// (@scope/pkgName).
+func (p *NPMProxy) handleScopedPublish(w http.ResponseWriter, r *http.Request) {
+	t, ok := p.checkPublishAccess(w, r)
+	if !ok {
+		return
+	}
+	scope := chi.URLParam(r, "scope")
+	pkgName := chi.URLParam(r, "pkgName")
+	p.publish(w, r, t, scope, pkgName)
+}
+
+// publish parses an npm publish payload, stores each attached tarball, and
+// records artifact metadata for each published version.
+func (p *NPMProxy) publish(w http.ResponseWriter, r *http.Request, t proxypkg.Target, namespace, pkgName string) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to read request body: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	var payload npmPublishPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid publish payload: %v", err), http.StatusBadRequest)
+		return
+	}
+	if len(payload.Attachments) == 0 {
+		http.Error(w, "Publish payload has no attachments", http.StatusBadRequest)
+		return
+	}
+
+	fullName := pkgName
+	if namespace != "" {
+		fullName = fmt.Sprintf("@%s/%s", namespace, pkgName)
+	}
+
+	for filename, att := range payload.Attachments {
+		version, ok := parseTarballVersion(filename, pkgName)
+		if !ok {
+			http.Error(w, fmt.Sprintf("Could not determine version from attachment %q", filename), http.StatusBadRequest)
+			return
+		}
+
+		tarball, err := base64.StdEncoding.DecodeString(att.Data)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to decode attachment %q: %v", filename, err), http.StatusBadRequest)
+			return
+		}
+
+		if _, err := p.storage.SaveArtifact(t.Label, namespace, pkgName, version, tarball); err != nil {
+			http.Error(w, fmt.Sprintf("Failed to save artifact: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		digest := sha256.Sum256(tarball)
+		var versionMeta interface{}
+		if payload.Versions != nil {
+			versionMeta = payload.Versions[version]
+		}
+		tags := []string{version}
+		if payload.DistTags["latest"] == version {
+			tags = append(tags, "latest")
+		}
+		artifact := &database.ArtifactMetadata{
+			ID:              fmt.Sprintf("npm:%s:%s:%s", t.Label, fullName, version),
+			RegistryID:      t.Label,
+			ArtifactType:    "npm",
+			Namespace:       namespace,
+			ArtifactName:    pkgName,
+			Version:         version,
+			Digest:          fmt.Sprintf("sha256:%x", digest),
+			DigestAlgorithm: "sha256",
+			Size:            int64(len(tarball)),
+			Created:         time.Now(),
+			Updated:         time.Now(),
+			Metadata:        map[string]interface{}{"version": versionMeta},
+			Tags:            tags,
+		}
+		if err := p.db.SaveArtifact(artifact); err != nil {
+			http.Error(w, fmt.Sprintf("Failed to save artifact metadata: %v", err), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"ok": true,
+		"id": fullName,
+	})
 }

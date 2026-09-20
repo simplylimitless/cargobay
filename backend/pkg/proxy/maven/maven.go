@@ -10,6 +10,8 @@
 package maven
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -63,27 +65,44 @@ func newMavenProxy(db *database.Database, storage storage.StorageAdapter, cache 
 		registry:   artifactType,
 	}
 
-	r.Use(proxypkg.RequireReadAccess(db, rbacMgr, registries, artifactType))
+	r.Group(func(r chi.Router) {
+		r.Use(proxypkg.RequireReadAccess(db, rbacMgr, registries, artifactType))
 
-	// Maven Repository Layout paths
-	// /group/artifact/version/artifact-version.ext
+		// Maven Repository Layout paths
+		// /group/artifact/version/artifact-version.ext
 
-	r.Get("/{group}/{artifact}/{version}/{fileName}-{fileVersion}.jar", proxy.handleJAR)
-	r.Get("/{group}/{artifact}/{version}/{fileName}-{fileVersion}.pom", proxy.handlePOM)
-	r.Get("/{group}/{artifact}/{version}/{fileName}-{fileVersion}.war", proxy.handleWAR)
-	r.Get("/{group}/{artifact}/{version}/{fileName}-{fileVersion}.zip", proxy.handleZIP)
-	r.Get("/{group}/{artifact}/{version}/{fileName}-{fileVersion}.tgz", proxy.handleTGZ)
+		r.Get("/{group}/{artifact}/{version}/{fileName}-{fileVersion}.jar", proxy.handleJAR)
+		r.Get("/{group}/{artifact}/{version}/{fileName}-{fileVersion}.pom", proxy.handlePOM)
+		r.Get("/{group}/{artifact}/{version}/{fileName}-{fileVersion}.war", proxy.handleWAR)
+		r.Get("/{group}/{artifact}/{version}/{fileName}-{fileVersion}.zip", proxy.handleZIP)
+		r.Get("/{group}/{artifact}/{version}/{fileName}-{fileVersion}.tgz", proxy.handleTGZ)
 
-	// Metadata files
-	r.Get("/{group}/{artifact}/{version}/maven-metadata.xml", proxy.handleMetadata)
+		// Metadata files
+		r.Get("/{group}/{artifact}/{version}/maven-metadata.xml", proxy.handleMetadata)
 
-	// Directory listing
-	r.Get("/{group}/{artifact}/{version}/", proxy.handleVersionDir)
-	r.Get("/{group}/{artifact}/", proxy.handleArtifactDir)
-	r.Get("/{group}/", proxy.handleGroupDir)
+		// Directory listing
+		r.Get("/{group}/{artifact}/{version}/", proxy.handleVersionDir)
+		r.Get("/{group}/{artifact}/", proxy.handleArtifactDir)
+		r.Get("/{group}/", proxy.handleGroupDir)
 
-	// Root
-	r.Get("/", proxy.handleRoot)
+		// Root
+		r.Get("/", proxy.handleRoot)
+	})
+
+	// Deploy (mvn/gradle/sbt publish sends a PUT to the same path shape as
+	// the corresponding GET download). Anonymous requests are rejected
+	// outright; checkPublishAccess further enforces that the authenticated
+	// user may publish to the resolved registry specifically.
+	r.Group(func(r chi.Router) {
+		r.Use(middleware.RequireAuth)
+
+		r.Put("/{group}/{artifact}/{version}/{fileName}-{fileVersion}.jar", proxy.handlePutArtifact("jar", "application/java-archive"))
+		r.Put("/{group}/{artifact}/{version}/{fileName}-{fileVersion}.pom", proxy.handlePutArtifact("pom", "application/xml"))
+		r.Put("/{group}/{artifact}/{version}/{fileName}-{fileVersion}.war", proxy.handlePutArtifact("war", "application/octet-stream"))
+		r.Put("/{group}/{artifact}/{version}/{fileName}-{fileVersion}.zip", proxy.handlePutArtifact("zip", "application/zip"))
+		r.Put("/{group}/{artifact}/{version}/{fileName}-{fileVersion}.tgz", proxy.handlePutArtifact("tgz", "application/gzip"))
+		r.Put("/{group}/{artifact}/{version}/maven-metadata.xml", proxy.handlePutMetadataNoop)
+	})
 
 	return r
 }
@@ -112,7 +131,7 @@ func (p *MavenProxy) handleJAR(w http.ResponseWriter, r *http.Request) {
 	t := proxypkg.TargetFromContext(r, "maven")
 
 	// Try cache first
-	if rc, err := p.storage.GetArtifactStream("maven", group, artifact, version); err == nil && rc != nil {
+	if rc, err := p.storage.GetArtifactStream(t.Label, group, artifact, version); err == nil && rc != nil {
 		defer rc.Close()
 		w.Header().Set("Content-Type", "application/java-archive")
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s-%s.jar", artifact, version))
@@ -131,14 +150,14 @@ func (p *MavenProxy) handleJAR(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	counter := &proxypkg.CountingReader{R: resp.Body}
-	_, err = p.storage.SaveArtifactStream("maven", group, artifact, version, counter)
+	_, err = p.storage.SaveArtifactStream(t.Label, group, artifact, version, counter)
 	resp.Body.Close()
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to save artifact: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	rc, err := p.storage.GetArtifactStream("maven", group, artifact, version)
+	rc, err := p.storage.GetArtifactStream(t.Label, group, artifact, version)
 	if err != nil || rc == nil {
 		http.Error(w, "Failed to serve artifact", http.StatusInternalServerError)
 		return
@@ -158,8 +177,10 @@ func (p *MavenProxy) handlePOM(w http.ResponseWriter, r *http.Request) {
 	artifact := chi.URLParam(r, "artifact")
 	version := chi.URLParam(r, "version")
 
+	t := proxypkg.TargetFromContext(r, "maven")
+
 	// Try cache first
-	if rc, err := p.storage.GetArtifactStream("maven", group, artifact, version); err == nil && rc != nil {
+	if rc, err := p.storage.GetArtifactStream(t.Label, group, artifact, version); err == nil && rc != nil {
 		defer rc.Close()
 		w.Header().Set("Content-Type", "application/xml")
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s-%s.pom", artifact, version))
@@ -168,7 +189,6 @@ func (p *MavenProxy) handlePOM(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Fetch from upstream
-	t := proxypkg.TargetFromContext(r, "maven")
 	candidates := p.resolveUpstreamCandidates(middleware.GetUser(r), t.Reg)
 	resp, _, err := p.fetchUpstreamStream(candidates, group, artifact, version, "pom")
 	if err != nil {
@@ -176,14 +196,14 @@ func (p *MavenProxy) handlePOM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	counter := &proxypkg.CountingReader{R: resp.Body}
-	_, err = p.storage.SaveArtifactStream("maven", group, artifact, version, counter)
+	_, err = p.storage.SaveArtifactStream(t.Label, group, artifact, version, counter)
 	resp.Body.Close()
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to save artifact: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	rc, err := p.storage.GetArtifactStream("maven", group, artifact, version)
+	rc, err := p.storage.GetArtifactStream(t.Label, group, artifact, version)
 	if err != nil || rc == nil {
 		http.Error(w, "Failed to serve artifact", http.StatusInternalServerError)
 		return
@@ -215,8 +235,10 @@ func (p *MavenProxy) handleArtifactFile(w http.ResponseWriter, r *http.Request, 
 	artifact := chi.URLParam(r, "artifact")
 	version := chi.URLParam(r, "version")
 
+	t := proxypkg.TargetFromContext(r, "maven")
+
 	// Try cache first
-	if rc, err := p.storage.GetArtifactStream("maven", group, artifact, version); err == nil && rc != nil {
+	if rc, err := p.storage.GetArtifactStream(t.Label, group, artifact, version); err == nil && rc != nil {
 		defer rc.Close()
 		w.Header().Set("Content-Type", contentType)
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s-%s.%s", artifact, version, ext))
@@ -225,7 +247,6 @@ func (p *MavenProxy) handleArtifactFile(w http.ResponseWriter, r *http.Request, 
 	}
 
 	// Fetch from upstream
-	t := proxypkg.TargetFromContext(r, "maven")
 	candidates := p.resolveUpstreamCandidates(middleware.GetUser(r), t.Reg)
 	resp, _, err := p.fetchUpstreamStream(candidates, group, artifact, version, ext)
 	if err != nil {
@@ -233,14 +254,14 @@ func (p *MavenProxy) handleArtifactFile(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	counter := &proxypkg.CountingReader{R: resp.Body}
-	_, err = p.storage.SaveArtifactStream("maven", group, artifact, version, counter)
+	_, err = p.storage.SaveArtifactStream(t.Label, group, artifact, version, counter)
 	resp.Body.Close()
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to save artifact: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	rc, err := p.storage.GetArtifactStream("maven", group, artifact, version)
+	rc, err := p.storage.GetArtifactStream(t.Label, group, artifact, version)
 	if err != nil || rc == nil {
 		http.Error(w, "Failed to serve artifact", http.StatusInternalServerError)
 		return
@@ -395,4 +416,74 @@ func (p *MavenProxy) fetchUpstreamStream(candidates []*database.RegistryConfig, 
 	return proxypkg.FetchFirstUpstreamStream(candidates, func(cand *database.RegistryConfig) (string, error) {
 		return p.getUpstreamURL(cand, group, artifact, version, ext)
 	})
+}
+
+// checkPublishAccess resolves the target registry from the Host header
+// (same resolution the GET routes use) and verifies the requester has
+// publish access to it, writing an error response and returning ok=false
+// if not.
+func (p *MavenProxy) checkPublishAccess(w http.ResponseWriter, r *http.Request) (proxypkg.Target, bool) {
+	reg := proxypkg.ResolveRegistry(p.db, p.registries, r.Host, p.registry)
+	label := p.registry
+	if reg != nil {
+		label = reg.ID
+	}
+	t := proxypkg.Target{Reg: reg, Label: label}
+	return t, proxypkg.CheckAccess(w, p.rbacMgr, middleware.GetUser(r), reg, true)
+}
+
+// handlePutArtifact returns a handler for deploying a Maven artifact file
+// (jar/pom/war/zip/tgz) via PUT, mirroring the corresponding GET download
+// path shape.
+func (p *MavenProxy) handlePutArtifact(ext, contentType string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		t, ok := p.checkPublishAccess(w, r)
+		if !ok {
+			return
+		}
+
+		group := chi.URLParam(r, "group")
+		artifact := chi.URLParam(r, "artifact")
+		version := chi.URLParam(r, "version")
+
+		hasher := sha256.New()
+		counter := &proxypkg.CountingReader{R: io.TeeReader(r.Body, hasher)}
+		_, err := p.storage.SaveArtifactStream(t.Label, group, artifact, version, counter)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to save artifact: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		am := &database.ArtifactMetadata{
+			ID:              fmt.Sprintf("%s:%s:%s:%s:%s", p.registry, t.Label, group, artifact, version),
+			RegistryID:      t.Label,
+			ArtifactType:    p.registry,
+			Namespace:       group,
+			ArtifactName:    artifact,
+			Version:         version,
+			Digest:          "sha256:" + hex.EncodeToString(hasher.Sum(nil)),
+			DigestAlgorithm: "sha256",
+			Size:            counter.N,
+			Created:         time.Now(),
+			Updated:         time.Now(),
+			Tags:            []string{version},
+		}
+		if err := p.db.SaveArtifact(am); err != nil {
+			http.Error(w, fmt.Sprintf("Failed to save artifact metadata: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusCreated)
+	}
+}
+
+// handlePutMetadataNoop accepts a maven-metadata.xml deploy without
+// persisting it — handleMetadata (GET) already generates this file
+// dynamically from stored artifact versions, so there is nothing to store.
+func (p *MavenProxy) handlePutMetadataNoop(w http.ResponseWriter, r *http.Request) {
+	if _, ok := p.checkPublishAccess(w, r); !ok {
+		return
+	}
+	io.Copy(io.Discard, r.Body)
+	w.WriteHeader(http.StatusCreated)
 }

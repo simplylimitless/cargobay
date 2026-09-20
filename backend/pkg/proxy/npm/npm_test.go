@@ -2,12 +2,14 @@ package npm
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 
 	"github.com/simplylimitless/cargobay/backend/pkg/cache"
 	"github.com/simplylimitless/cargobay/backend/pkg/database"
+	"github.com/simplylimitless/cargobay/backend/pkg/middleware"
 	"github.com/simplylimitless/cargobay/backend/pkg/rbac"
 	"github.com/simplylimitless/cargobay/backend/pkg/storage"
 )
@@ -53,9 +56,20 @@ func newTestProxy(t *testing.T, db *database.Database, c *cache.Cache, registrie
 		db:         db,
 		storage:    adapter,
 		cache:      c,
+		rbacMgr:    rbac.New(db),
 		registries: registries,
 		registry:   "npm",
 	}
+}
+
+// authedRequest injects an authenticated user into req's context, mirroring
+// what middleware.NewAuthMiddleware would have done in production (that
+// middleware is wired only in cmd/server/main.go, outside the router these
+// tests exercise directly).
+func authedRequest(req *http.Request, userID string) *http.Request {
+	user := &middleware.User{UserID: userID, Username: userID}
+	ctx := context.WithValue(req.Context(), middleware.AuthUserKey, user)
+	return req.WithContext(ctx)
 }
 
 func seedRegistry(t *testing.T, db *database.Database, id string, private, proxy bool) *database.RegistryConfig {
@@ -762,4 +776,482 @@ func TestNPMProxyRoutesPublicPing(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, "OK", rec.Body.String())
+}
+
+// publishPayload builds a minimal npm publish request body for pkgName@version
+// with a single tarball attachment.
+func publishPayload(pkgName, version string, tarball []byte) []byte {
+	return mustMarshal(map[string]interface{}{
+		"name":      pkgName,
+		"dist-tags": map[string]interface{}{"latest": version},
+		"versions": map[string]interface{}{
+			version: map[string]interface{}{"name": pkgName, "version": version},
+		},
+		"_attachments": map[string]interface{}{
+			fmt.Sprintf("%s-%s.tgz", pkgName, version): map[string]interface{}{
+				"content_type": "application/octet-stream",
+				"data":         base64.StdEncoding.EncodeToString(tarball),
+				"length":       len(tarball),
+			},
+		},
+	})
+}
+
+func TestHandlePublishRequiresAuth(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+
+	host := uniqueID("publish-noauth-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("publish-noauth-reg"), true, false)
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	router := NewNPMProxy(db, nil, c, rbac.New(db), nil)
+
+	pkgName := uniqueID("pkg")
+	body := publishPayload(pkgName, "1.0.0", []byte("tarball bytes"))
+	req := httptest.NewRequest(http.MethodPut, "/"+pkgName, strings.NewReader(string(body)))
+	req.Host = host
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+}
+
+func TestHandlePublishRequiresPublishGrant(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+
+	host := uniqueID("publish-noperm-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("publish-noperm-reg"), true, false)
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	router := NewNPMProxy(db, nil, c, rbac.New(db), nil)
+
+	pkgName := uniqueID("pkg")
+	body := publishPayload(pkgName, "1.0.0", []byte("tarball bytes"))
+	req := httptest.NewRequest(http.MethodPut, "/"+pkgName, strings.NewReader(string(body)))
+	req.Host = host
+	req = authedRequest(req, uniqueID("user"))
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+}
+
+func TestHandlePublishSucceedsWithPublishGrant(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+
+	host := uniqueID("publish-ok-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("publish-ok-reg"), true, false)
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	userID := uniqueID("user")
+	require.NoError(t, db.GrantRegistryAccess(&database.RegistryAccess{
+		RegistryID: reg.ID,
+		UserID:     userID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+	t.Cleanup(func() { db.RevokeRegistryAccess(reg.ID, userID) })
+
+	adapter, err := storage.NewLocalAdapter(map[string]string{"path": t.TempDir()})
+	require.NoError(t, err)
+	router := NewNPMProxy(db, adapter, c, rbac.New(db), nil)
+
+	pkgName := uniqueID("pkg")
+	version := "1.0.0"
+	tarball := []byte("tarball bytes")
+	body := publishPayload(pkgName, version, tarball)
+
+	req := httptest.NewRequest(http.MethodPut, "/"+pkgName, strings.NewReader(string(body)))
+	req.Host = host
+	req = authedRequest(req, userID)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusCreated, rec.Code)
+	t.Cleanup(func() { db.DeleteArtifact(reg.ID, "", pkgName, version) })
+
+	stored, err := adapter.GetArtifact(reg.ID, "", pkgName, version)
+	require.NoError(t, err)
+	assert.Equal(t, tarball, stored)
+
+	artifacts, err := db.ListArtifacts(reg.ID, database.ListOptions{ArtifactType: "npm"})
+	require.NoError(t, err)
+	require.Len(t, artifacts, 1)
+	assert.Equal(t, pkgName, artifacts[0].ArtifactName)
+	assert.Equal(t, version, artifacts[0].Version)
+}
+
+func TestHandleScopedPublishSucceedsWithPublishGrant(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+
+	host := uniqueID("scoped-publish-ok-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("scoped-publish-ok-reg"), true, false)
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	userID := uniqueID("user")
+	require.NoError(t, db.GrantRegistryAccess(&database.RegistryAccess{
+		RegistryID: reg.ID,
+		UserID:     userID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+	t.Cleanup(func() { db.RevokeRegistryAccess(reg.ID, userID) })
+
+	adapter, err := storage.NewLocalAdapter(map[string]string{"path": t.TempDir()})
+	require.NoError(t, err)
+	router := NewNPMProxy(db, adapter, c, rbac.New(db), nil)
+
+	scope := uniqueID("scope")
+	pkgName := "node"
+	fullName := fmt.Sprintf("@%s/%s", scope, pkgName)
+	version := "1.0.0"
+	tarball := []byte("scoped tarball bytes")
+	body := publishPayload(pkgName, version, tarball)
+
+	req := httptest.NewRequest(http.MethodPut, "/@"+scope+"/"+pkgName, strings.NewReader(string(body)))
+	req.Host = host
+	req = authedRequest(req, userID)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusCreated, rec.Code)
+	t.Cleanup(func() { db.DeleteArtifact(reg.ID, scope, pkgName, version) })
+
+	stored, err := adapter.GetArtifact(reg.ID, scope, pkgName, version)
+	require.NoError(t, err)
+	assert.Equal(t, tarball, stored)
+
+	artifacts, err := db.ListArtifacts(reg.ID, database.ListOptions{ArtifactType: "npm", Namespace: scope})
+	require.NoError(t, err)
+	require.Len(t, artifacts, 1)
+	assert.Equal(t, pkgName, artifacts[0].ArtifactName)
+	assert.Equal(t, scope, artifacts[0].Namespace)
+
+	var body2 map[string]interface{}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&body2))
+	assert.Equal(t, fullName, body2["id"])
+}
+
+func TestHandlePublishMalformedJSON(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+
+	host := uniqueID("publish-badjson-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("publish-badjson-reg"), true, false)
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	userID := uniqueID("user")
+	require.NoError(t, db.GrantRegistryAccess(&database.RegistryAccess{
+		RegistryID: reg.ID,
+		UserID:     userID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+	t.Cleanup(func() { db.RevokeRegistryAccess(reg.ID, userID) })
+
+	router := NewNPMProxy(db, nil, c, rbac.New(db), nil)
+
+	pkgName := uniqueID("pkg")
+	req := httptest.NewRequest(http.MethodPut, "/"+pkgName, strings.NewReader("not json"))
+	req.Host = host
+	req = authedRequest(req, userID)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+// TestHandlePublishGroupGrantSucceeds proves CanPublishRegistry's
+// group-based grant path (GroupRegistryAccess.CanPublish) is sufficient to
+// publish, without any per-user RegistryAccess row at all.
+func TestHandlePublishGroupGrantSucceeds(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+
+	host := uniqueID("publish-group-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("publish-group-reg"), true, false)
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	grp, err := db.CreateGroup(uniqueID("publishers"), "publishers group")
+	require.NoError(t, err)
+	t.Cleanup(func() { db.DeleteGroup(grp.ID) })
+
+	userID := uniqueID("user")
+	require.NoError(t, db.AddGroupMember(grp.ID, userID))
+	require.NoError(t, db.GrantGroupRegistryAccess(&database.GroupRegistryAccess{
+		RegistryID: reg.ID,
+		GroupID:    grp.ID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+
+	adapter, err := storage.NewLocalAdapter(map[string]string{"path": t.TempDir()})
+	require.NoError(t, err)
+	router := NewNPMProxy(db, adapter, c, rbac.New(db), nil)
+
+	pkgName := uniqueID("pkg")
+	version := "1.0.0"
+	tarball := []byte("group-granted tarball bytes")
+	body := publishPayload(pkgName, version, tarball)
+
+	req := httptest.NewRequest(http.MethodPut, "/"+pkgName, strings.NewReader(string(body)))
+	req.Host = host
+	req = authedRequest(req, userID)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusCreated, rec.Code)
+	t.Cleanup(func() { db.DeleteArtifact(reg.ID, "", pkgName, version) })
+}
+
+// TestHandlePublishNonPrivateRegistryDenied proves CanPublishRegistry
+// denies publish to a public (non-private) registry even for a user with an
+// explicit CanPublish grant recorded against it — mirroring how Docker push
+// is denied against non-private registries.
+func TestHandlePublishNonPrivateRegistryDenied(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+
+	host := uniqueID("publish-public-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("publish-public-reg"), false, false) // private=false
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	userID := uniqueID("user")
+	require.NoError(t, db.GrantRegistryAccess(&database.RegistryAccess{
+		RegistryID: reg.ID,
+		UserID:     userID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+	t.Cleanup(func() { db.RevokeRegistryAccess(reg.ID, userID) })
+
+	router := NewNPMProxy(db, nil, c, rbac.New(db), nil)
+
+	pkgName := uniqueID("pkg")
+	body := publishPayload(pkgName, "1.0.0", []byte("tarball bytes"))
+	req := httptest.NewRequest(http.MethodPut, "/"+pkgName, strings.NewReader(string(body)))
+	req.Host = host
+	req = authedRequest(req, userID)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+}
+
+// TestHandlePublishReadScopeDenied proves a read-scoped credential (e.g. a
+// read-only personal access token) can never publish, even with an
+// otherwise-valid CanPublish grant on a private registry.
+func TestHandlePublishReadScopeDenied(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+
+	host := uniqueID("publish-readscope-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("publish-readscope-reg"), true, false)
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	userID := uniqueID("user")
+	require.NoError(t, db.GrantRegistryAccess(&database.RegistryAccess{
+		RegistryID: reg.ID,
+		UserID:     userID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+	t.Cleanup(func() { db.RevokeRegistryAccess(reg.ID, userID) })
+
+	router := NewNPMProxy(db, nil, c, rbac.New(db), nil)
+
+	pkgName := uniqueID("pkg")
+	body := publishPayload(pkgName, "1.0.0", []byte("tarball bytes"))
+	req := httptest.NewRequest(http.MethodPut, "/"+pkgName, strings.NewReader(string(body)))
+	req.Host = host
+	ctx := context.WithValue(req.Context(), middleware.AuthUserKey, &middleware.User{UserID: userID, Username: userID, Scope: "read"})
+	req = req.WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+}
+
+// multiAttachmentPublishPayload builds an npm publish body with several
+// tarball attachments in a single request, as npm CLI can send when
+// republishing dist-tags across multiple existing versions.
+func multiAttachmentPublishPayload(pkgName string, versions map[string][]byte) []byte {
+	attachments := map[string]interface{}{}
+	versionsMeta := map[string]interface{}{}
+	for version, tarball := range versions {
+		attachments[fmt.Sprintf("%s-%s.tgz", pkgName, version)] = map[string]interface{}{
+			"content_type": "application/octet-stream",
+			"data":         base64.StdEncoding.EncodeToString(tarball),
+			"length":       len(tarball),
+		}
+		versionsMeta[version] = map[string]interface{}{"name": pkgName, "version": version}
+	}
+	return mustMarshal(map[string]interface{}{
+		"name":         pkgName,
+		"dist-tags":    map[string]interface{}{"latest": "2.0.0"},
+		"versions":     versionsMeta,
+		"_attachments": attachments,
+	})
+}
+
+// TestHandlePublishMultipleVersionsInOnePayload covers a single npm publish
+// call carrying attachments for more than one version, asserting each is
+// stored and surfaced independently.
+func TestHandlePublishMultipleVersionsInOnePayload(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+
+	host := uniqueID("publish-multi-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("publish-multi-reg"), true, false)
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	userID := uniqueID("user")
+	require.NoError(t, db.GrantRegistryAccess(&database.RegistryAccess{
+		RegistryID: reg.ID,
+		UserID:     userID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+	t.Cleanup(func() { db.RevokeRegistryAccess(reg.ID, userID) })
+
+	adapter, err := storage.NewLocalAdapter(map[string]string{"path": t.TempDir()})
+	require.NoError(t, err)
+	router := NewNPMProxy(db, adapter, c, rbac.New(db), nil)
+
+	pkgName := uniqueID("pkg")
+	versions := map[string][]byte{
+		"1.0.0": []byte("v1 tarball bytes"),
+		"2.0.0": []byte("v2 tarball bytes"),
+	}
+	body := multiAttachmentPublishPayload(pkgName, versions)
+
+	req := httptest.NewRequest(http.MethodPut, "/"+pkgName, strings.NewReader(string(body)))
+	req.Host = host
+	req = authedRequest(req, userID)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusCreated, rec.Code)
+	for version := range versions {
+		version := version
+		t.Cleanup(func() { db.DeleteArtifact(reg.ID, "", pkgName, version) })
+	}
+
+	for version, tarball := range versions {
+		stored, err := adapter.GetArtifact(reg.ID, "", pkgName, version)
+		require.NoError(t, err)
+		assert.Equal(t, tarball, stored)
+	}
+
+	artifacts, err := db.ListArtifacts(reg.ID, database.ListOptions{ArtifactType: "npm"})
+	require.NoError(t, err)
+	require.Len(t, artifacts, 2)
+}
+
+// TestHandlePublishRepublishOverwritesVersion covers publishing the same
+// version twice: the second publish should overwrite the stored tarball
+// rather than erroring or duplicating the artifact row.
+func TestHandlePublishRepublishOverwritesVersion(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+
+	host := uniqueID("publish-republish-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("publish-republish-reg"), true, false)
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	userID := uniqueID("user")
+	require.NoError(t, db.GrantRegistryAccess(&database.RegistryAccess{
+		RegistryID: reg.ID,
+		UserID:     userID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+	t.Cleanup(func() { db.RevokeRegistryAccess(reg.ID, userID) })
+
+	adapter, err := storage.NewLocalAdapter(map[string]string{"path": t.TempDir()})
+	require.NoError(t, err)
+	router := NewNPMProxy(db, adapter, c, rbac.New(db), nil)
+
+	pkgName := uniqueID("pkg")
+	version := "1.0.0"
+	t.Cleanup(func() { db.DeleteArtifact(reg.ID, "", pkgName, version) })
+
+	publish := func(tarball []byte) int {
+		body := publishPayload(pkgName, version, tarball)
+		req := httptest.NewRequest(http.MethodPut, "/"+pkgName, strings.NewReader(string(body)))
+		req.Host = host
+		req = authedRequest(req, userID)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	require.Equal(t, http.StatusCreated, publish([]byte("first tarball")))
+	require.Equal(t, http.StatusCreated, publish([]byte("second tarball")))
+
+	stored, err := adapter.GetArtifact(reg.ID, "", pkgName, version)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("second tarball"), stored)
+
+	artifacts, err := db.ListArtifacts(reg.ID, database.ListOptions{ArtifactType: "npm"})
+	require.NoError(t, err)
+	require.Len(t, artifacts, 1)
+}
+
+func TestHandlePublishMissingAttachments(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+
+	host := uniqueID("publish-noattach-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("publish-noattach-reg"), true, false)
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	userID := uniqueID("user")
+	require.NoError(t, db.GrantRegistryAccess(&database.RegistryAccess{
+		RegistryID: reg.ID,
+		UserID:     userID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+	t.Cleanup(func() { db.RevokeRegistryAccess(reg.ID, userID) })
+
+	router := NewNPMProxy(db, nil, c, rbac.New(db), nil)
+
+	pkgName := uniqueID("pkg")
+	body := mustMarshal(map[string]interface{}{
+		"name":      pkgName,
+		"dist-tags": map[string]interface{}{"latest": "1.0.0"},
+	})
+	req := httptest.NewRequest(http.MethodPut, "/"+pkgName, strings.NewReader(string(body)))
+	req.Host = host
+	req = authedRequest(req, userID)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
