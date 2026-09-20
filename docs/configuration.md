@@ -249,18 +249,19 @@ docker tag myimage cargobay.example.com/dkr/tinkertown/myimage:latest
 docker push cargobay.example.com/dkr/tinkertown/myimage:latest
 ```
 
-## npm and Maven Registries
+## npm, Maven, and PyPI Registries
 
-Like Docker, the npm and Maven proxies (Maven's implementation is shared by
-Gradle and SBT, since all three consume standard Maven-layout repositories)
-support publishing to a private registry, not just pulling from one. There
-is no `dkr/`-style path-prefix addressing for npm/Maven — a private registry
-must be bound to a `Host` (see [Private Docker registries](#privatemultiple-docker-registries)
-for the general mechanism; it applies the same way regardless of registry
-`type`), and clients publish to it via that hostname, same as pulls. The
-publishing user needs a `CanPublish` grant on the registry — per-user via
-the registry access API/UI, or via a [group](api.md#groups) — same
-requirement as `docker push`.
+Like Docker, the npm, Maven, and PyPI proxies (Maven's implementation is
+shared by Gradle and SBT, since all three consume standard Maven-layout
+repositories) support publishing to a private registry, not just pulling
+from one. There is no `dkr/`-style path-prefix addressing for these
+registries — a private registry must be bound to a `Host` (see
+[Private Docker registries](#privatemultiple-docker-registries) for the
+general mechanism; it applies the same way regardless of registry `type`),
+and clients publish to it via that hostname, same as pulls. The publishing
+user needs a `CanPublish` grant on the registry — per-user via the registry
+access API/UI, or via a [group](api.md#groups) — same requirement as
+`docker push`.
 
 ### Publishing to npm
 
@@ -314,6 +315,29 @@ Gradle and SBT publish to the same repository layout — point their
 publish-repository configuration at `https://gradle.cargobay.example.com/gradle/`
 or `https://sbt.cargobay.example.com/sbt/` respectively, using the same
 credentials.
+
+### Publishing to PyPI
+
+```ini
+# ~/.pypirc
+[distutils]
+index-servers = cargobay
+
+[cargobay]
+repository = https://pypi.cargobay.example.com/legacy/
+username = __token__
+password = <personal-access-token>
+```
+
+```
+twine upload --repository cargobay dist/*
+```
+
+Unlike npm (PUT to a per-package URL) and Maven (PUT to a per-file URL),
+PyPI's legacy upload API is a single `POST` of a `multipart/form-data` body
+carrying the package name, version, and file as form fields — twine's
+`repository`/`repository-url` setting can point at either the registry root
+or its `/legacy/` alias, both work identically.
 
 ## Storage Backend Configuration
 

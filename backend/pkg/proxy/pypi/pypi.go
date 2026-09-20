@@ -10,6 +10,8 @@
 package pypi
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,6 +21,7 @@ import (
 
 	"github.com/simplylimitless/cargobay/backend/pkg/cache"
 	"github.com/simplylimitless/cargobay/backend/pkg/database"
+	"github.com/simplylimitless/cargobay/backend/pkg/middleware"
 	proxypkg "github.com/simplylimitless/cargobay/backend/pkg/proxy"
 	"github.com/simplylimitless/cargobay/backend/pkg/rbac"
 	"github.com/simplylimitless/cargobay/backend/pkg/storage"
@@ -30,6 +33,7 @@ type PyPIProxy struct {
 	db         *database.Database
 	storage    storage.StorageAdapter
 	cache      *cache.Cache
+	rbacMgr    *rbac.RBAC
 	registries []database.RegistryConfig
 	registry   string
 }
@@ -42,33 +46,138 @@ func NewPyPIProxy(db *database.Database, storage storage.StorageAdapter, cache *
 		db:         db,
 		storage:    storage,
 		cache:      cache,
+		rbacMgr:    rbacMgr,
 		registries: registries,
 		registry:   "pypi",
 	}
 
-	r.Use(proxypkg.RequireReadAccess(db, rbacMgr, registries, "pypi"))
+	// Resolve which registry a request addresses purely from the Host
+	// header (falling back to the default public proxy) and enforce read
+	// access. Scoped to a group so it applies only to the GET routes below,
+	// not the upload routes (which enforce publish access instead, via
+	// checkPublishAccess).
+	r.Group(func(r chi.Router) {
+		r.Use(proxypkg.RequireReadAccess(db, rbacMgr, registries, "pypi"))
 
-	// PyPI Simple API routes
-	// Root: /simple/ - lists all available packages
-	r.Get("/simple/", proxy.handleSimpleRoot)
-	r.Get("/simple", proxy.handleSimpleRoot)
+		// PyPI Simple API routes
+		// Root: /simple/ - lists all available packages
+		r.Get("/simple/", proxy.handleSimpleRoot)
+		r.Get("/simple", proxy.handleSimpleRoot)
 
-	// Package index: /simple/{package}/ - lists versions of a package
-	r.Get("/simple/{packageName}/", proxy.handlePackageIndex)
-	r.Get("/simple/{packageName}", proxy.handlePackageIndex)
+		// Package index: /simple/{package}/ - lists versions of a package
+		r.Get("/simple/{packageName}/", proxy.handlePackageIndex)
+		r.Get("/simple/{packageName}", proxy.handlePackageIndex)
 
-	// Package detail: /simple/{package}/{version}/ - shows package info
-	r.Get("/simple/{packageName}/{version}/", proxy.handlePackageVersion)
+		// Package detail: /simple/{package}/{version}/ - shows package info
+		r.Get("/simple/{packageName}/{version}/", proxy.handlePackageVersion)
 
-	// Download routes
-	// Wheel: /packages/{package}/{version}/{package}-{version}-{python}-{abi}-{platform}.whl
-	r.Get("/packages/{packageName}/{version}/{fileName}", proxy.handlePackageFile)
+		// Download routes
+		// Wheel: /packages/{package}/{version}/{package}-{version}-{python}-{abi}-{platform}.whl
+		r.Get("/packages/{packageName}/{version}/{fileName}", proxy.handlePackageFile)
 
-	// Legacy redirect support
-	r.Get("/{packageName}/", proxy.handleLegacyPackage)
-	r.Get("/{packageName}/{version}/", proxy.handleLegacyPackageVersion)
+		// Legacy redirect support
+		r.Get("/{packageName}/", proxy.handleLegacyPackage)
+		r.Get("/{packageName}/{version}/", proxy.handleLegacyPackageVersion)
+	})
+
+	// Upload (twine sends a multipart/form-data POST to the repository
+	// root, or its "/legacy/" alias — unlike npm/Maven's per-path PUT,
+	// PyPI's legacy upload API identifies the package purely via form
+	// fields). Anonymous requests are rejected outright; checkPublishAccess
+	// further enforces that the authenticated user may publish to the
+	// resolved registry specifically.
+	r.Group(func(r chi.Router) {
+		r.Use(middleware.RequireAuth)
+
+		r.Post("/legacy/", proxy.handleUpload)
+		r.Post("/", proxy.handleUpload)
+	})
 
 	return r
+}
+
+// checkPublishAccess resolves the registry addressed by r's Host header and
+// enforces publish access on it, writing a 401/403 and returning ok=false if
+// denied.
+func (p *PyPIProxy) checkPublishAccess(w http.ResponseWriter, r *http.Request) (proxypkg.Target, bool) {
+	reg := proxypkg.ResolveRegistry(p.db, p.registries, r.Host, "pypi")
+	label := "pypi"
+	if reg != nil {
+		label = reg.ID
+	}
+	t := proxypkg.Target{Reg: reg, Label: label}
+	return t, proxypkg.CheckAccess(w, p.rbacMgr, middleware.GetUser(r), reg, true)
+}
+
+// handleUpload handles "twine upload": a multipart/form-data POST containing
+// package metadata (name, version, filetype, pyversion) and the distribution
+// file itself under the "content" field. See
+// https://docs.pypi.org/api/upload/ for the wire format.
+func (p *PyPIProxy) handleUpload(w http.ResponseWriter, r *http.Request) {
+	t, ok := p.checkPublishAccess(w, r)
+	if !ok {
+		return
+	}
+
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to parse upload: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	if action := r.FormValue(":action"); action != "" && action != "file_upload" {
+		http.Error(w, fmt.Sprintf("Unsupported action %q", action), http.StatusBadRequest)
+		return
+	}
+
+	name := r.FormValue("name")
+	version := r.FormValue("version")
+	if name == "" || version == "" {
+		http.Error(w, "Missing required field: name and version are required", http.StatusBadRequest)
+		return
+	}
+	filetype := r.FormValue("filetype")
+	pyversion := r.FormValue("pyversion")
+
+	file, header, err := r.FormFile("content")
+	if err != nil {
+		http.Error(w, "Missing required field: content", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	hasher := sha256.New()
+	if _, err := p.storage.SaveArtifactStream(t.Label, "", name, version, io.TeeReader(file, hasher)); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to save artifact: %v", err), http.StatusInternalServerError)
+		return
+	}
+	digest := hex.EncodeToString(hasher.Sum(nil))
+
+	if wantDigest := r.FormValue("sha256_digest"); wantDigest != "" && !strings.EqualFold(wantDigest, digest) {
+		http.Error(w, "sha256_digest does not match uploaded file", http.StatusBadRequest)
+		return
+	}
+
+	artifact := &database.ArtifactMetadata{
+		ID:              fmt.Sprintf("pypi:%s:%s:%s", t.Label, name, version),
+		RegistryID:      t.Label,
+		ArtifactType:    "pypi",
+		Namespace:       "",
+		ArtifactName:    name,
+		Version:         version,
+		Digest:          "sha256:" + digest,
+		DigestAlgorithm: "sha256",
+		Size:            header.Size,
+		Created:         time.Now(),
+		Updated:         time.Now(),
+		Metadata:        map[string]interface{}{"filetype": filetype, "pyversion": pyversion, "filename": header.Filename},
+		Tags:            []string{version},
+	}
+	if err := p.db.SaveArtifact(artifact); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to save artifact metadata: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
 }
 
 // handleSimpleRoot returns the root of the simple API (list of packages)

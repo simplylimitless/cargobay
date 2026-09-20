@@ -1,8 +1,11 @@
 package pypi
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -13,6 +16,7 @@ import (
 
 	"github.com/simplylimitless/cargobay/backend/pkg/cache"
 	"github.com/simplylimitless/cargobay/backend/pkg/database"
+	"github.com/simplylimitless/cargobay/backend/pkg/middleware"
 	"github.com/simplylimitless/cargobay/backend/pkg/rbac"
 	"github.com/simplylimitless/cargobay/backend/pkg/storage"
 )
@@ -101,6 +105,33 @@ func seedRegistryWithHost(t *testing.T, db *database.Database, host string, prox
 	require.NoError(t, db.SaveRegistry(reg))
 	t.Cleanup(func() { db.DeleteRegistry(reg.ID) })
 	return reg
+}
+
+// authedRequest injects an authenticated user into req's context, mirroring
+// what middleware.NewAuthMiddleware would have done in production (that
+// middleware is wired only in cmd/server/main.go, outside the router these
+// tests exercise directly).
+func authedRequest(req *http.Request, userID string) *http.Request {
+	user := &middleware.User{UserID: userID, Username: userID}
+	ctx := context.WithValue(req.Context(), middleware.AuthUserKey, user)
+	return req.WithContext(ctx)
+}
+
+// buildUploadBody constructs a valid PyPI legacy-upload multipart/form-data
+// body for name@version with the given file content, returning the body
+// bytes and the multipart Content-Type header value (including boundary).
+func buildUploadBody(name, version string, content []byte) ([]byte, string) {
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	_ = w.WriteField(":action", "file_upload")
+	_ = w.WriteField("name", name)
+	_ = w.WriteField("version", version)
+	_ = w.WriteField("filetype", "sdist")
+	_ = w.WriteField("pyversion", "source")
+	part, _ := w.CreateFormFile("content", fmt.Sprintf("%s-%s.tar.gz", name, version))
+	_, _ = part.Write(content)
+	_ = w.Close()
+	return buf.Bytes(), w.FormDataContentType()
 }
 
 func TestNewPyPIProxy(t *testing.T) {
@@ -471,4 +502,279 @@ func TestNamespaceFiltering(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, results, 1)
 	assert.Equal(t, "google/cloud", results[0].Namespace)
+}
+
+// TestHandleUploadNoAuthDenied proves an unauthenticated twine upload is
+// rejected outright, before any publish-grant check runs.
+func TestHandleUploadNoAuthDenied(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+
+	host := uniqueID("upload-noauth-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("upload-noauth-reg"), true, false)
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	router := NewPyPIProxy(db, nil, c, rbac.New(db), nil)
+
+	pkgName := uniqueID("pkg")
+	body, contentType := buildUploadBody(pkgName, "1.0.0", []byte("sdist bytes"))
+	req := httptest.NewRequest(http.MethodPost, "/legacy/", bytes.NewReader(body))
+	req.Host = host
+	req.Header.Set("Content-Type", contentType)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+}
+
+// TestHandleUploadReadScopeDenied proves a read-scoped credential can never
+// publish, even with an otherwise-valid CanPublish grant on a private
+// registry.
+func TestHandleUploadReadScopeDenied(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+
+	host := uniqueID("upload-readscope-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("upload-readscope-reg"), true, false)
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	userID := uniqueID("user")
+	require.NoError(t, db.GrantRegistryAccess(&database.RegistryAccess{
+		RegistryID: reg.ID,
+		UserID:     userID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+	t.Cleanup(func() { db.RevokeRegistryAccess(reg.ID, userID) })
+
+	router := NewPyPIProxy(db, nil, c, rbac.New(db), nil)
+
+	pkgName := uniqueID("pkg")
+	body, contentType := buildUploadBody(pkgName, "1.0.0", []byte("sdist bytes"))
+	req := httptest.NewRequest(http.MethodPost, "/legacy/", bytes.NewReader(body))
+	req.Host = host
+	req.Header.Set("Content-Type", contentType)
+	ctx := context.WithValue(req.Context(), middleware.AuthUserKey, &middleware.User{UserID: userID, Username: userID, Scope: "read"})
+	req = req.WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+}
+
+// TestHandleUploadNonPrivateRegistryDenied proves CanPublishRegistry denies
+// publish to a public (non-private) registry even for a user with an
+// explicit CanPublish grant recorded against it.
+func TestHandleUploadNonPrivateRegistryDenied(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+
+	host := uniqueID("upload-public-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("upload-public-reg"), false, false) // private=false
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	userID := uniqueID("user")
+	require.NoError(t, db.GrantRegistryAccess(&database.RegistryAccess{
+		RegistryID: reg.ID,
+		UserID:     userID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+	t.Cleanup(func() { db.RevokeRegistryAccess(reg.ID, userID) })
+
+	router := NewPyPIProxy(db, nil, c, rbac.New(db), nil)
+
+	pkgName := uniqueID("pkg")
+	body, contentType := buildUploadBody(pkgName, "1.0.0", []byte("sdist bytes"))
+	req := httptest.NewRequest(http.MethodPost, "/legacy/", bytes.NewReader(body))
+	req.Host = host
+	req.Header.Set("Content-Type", contentType)
+	req = authedRequest(req, userID)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+}
+
+// TestHandleUploadSuccess covers the full happy path: a user with an
+// explicit publish grant on a private registry uploads a distribution file,
+// and it becomes visible via both storage and the artifact database.
+func TestHandleUploadSuccess(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+
+	host := uniqueID("upload-ok-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("upload-ok-reg"), true, false)
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	userID := uniqueID("user")
+	require.NoError(t, db.GrantRegistryAccess(&database.RegistryAccess{
+		RegistryID: reg.ID,
+		UserID:     userID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+	t.Cleanup(func() { db.RevokeRegistryAccess(reg.ID, userID) })
+
+	adapter, err := storage.NewLocalAdapter(map[string]string{"path": t.TempDir()})
+	require.NoError(t, err)
+	router := NewPyPIProxy(db, adapter, c, rbac.New(db), nil)
+
+	pkgName := uniqueID("pkg")
+	version := "1.0.0"
+	content := []byte("sdist bytes")
+	body, contentType := buildUploadBody(pkgName, version, content)
+
+	req := httptest.NewRequest(http.MethodPost, "/legacy/", bytes.NewReader(body))
+	req.Host = host
+	req.Header.Set("Content-Type", contentType)
+	req = authedRequest(req, userID)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	t.Cleanup(func() { db.DeleteArtifact(reg.ID, "", pkgName, version) })
+
+	stored, err := adapter.GetArtifact(reg.ID, "", pkgName, version)
+	require.NoError(t, err)
+	assert.Equal(t, content, stored)
+
+	artifacts, err := db.ListArtifacts(reg.ID, database.ListOptions{ArtifactType: "pypi"})
+	require.NoError(t, err)
+	require.Len(t, artifacts, 1)
+	assert.Equal(t, pkgName, artifacts[0].ArtifactName)
+	assert.Equal(t, version, artifacts[0].Version)
+}
+
+// TestHandleUploadMissingContentField proves a multipart body without the
+// "content" file part is rejected with 400, not a 500 from a nil file.
+func TestHandleUploadMissingContentField(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+
+	host := uniqueID("upload-nocontent-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("upload-nocontent-reg"), true, false)
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	userID := uniqueID("user")
+	require.NoError(t, db.GrantRegistryAccess(&database.RegistryAccess{
+		RegistryID: reg.ID,
+		UserID:     userID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+	t.Cleanup(func() { db.RevokeRegistryAccess(reg.ID, userID) })
+
+	router := NewPyPIProxy(db, nil, c, rbac.New(db), nil)
+
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	_ = w.WriteField(":action", "file_upload")
+	_ = w.WriteField("name", uniqueID("pkg"))
+	_ = w.WriteField("version", "1.0.0")
+	_ = w.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/legacy/", bytes.NewReader(buf.Bytes()))
+	req.Host = host
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	req = authedRequest(req, userID)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+// TestHandleUploadMissingNameOrVersion proves a multipart body missing the
+// required "name"/"version" fields is rejected with 400.
+func TestHandleUploadMissingNameOrVersion(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+
+	host := uniqueID("upload-noname-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("upload-noname-reg"), true, false)
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	userID := uniqueID("user")
+	require.NoError(t, db.GrantRegistryAccess(&database.RegistryAccess{
+		RegistryID: reg.ID,
+		UserID:     userID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+	t.Cleanup(func() { db.RevokeRegistryAccess(reg.ID, userID) })
+
+	router := NewPyPIProxy(db, nil, c, rbac.New(db), nil)
+
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	_ = w.WriteField(":action", "file_upload")
+	part, _ := w.CreateFormFile("content", "pkg-1.0.0.tar.gz")
+	_, _ = part.Write([]byte("sdist bytes"))
+	_ = w.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/legacy/", bytes.NewReader(buf.Bytes()))
+	req.Host = host
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	req = authedRequest(req, userID)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+// TestHandleUploadGroupGrantPublish proves CanPublishRegistry's group-based
+// grant path (GroupRegistryAccess.CanPublish) is sufficient to publish,
+// without any per-user RegistryAccess row at all.
+func TestHandleUploadGroupGrantPublish(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+
+	host := uniqueID("upload-group-host") + ".test"
+	reg := seedRegistry(t, db, uniqueID("upload-group-reg"), true, false)
+	reg.Host = host
+	require.NoError(t, db.SaveRegistry(reg))
+
+	grp, err := db.CreateGroup(uniqueID("publishers"), "publishers group")
+	require.NoError(t, err)
+	t.Cleanup(func() { db.DeleteGroup(grp.ID) })
+
+	userID := uniqueID("user")
+	require.NoError(t, db.AddGroupMember(grp.ID, userID))
+	require.NoError(t, db.GrantGroupRegistryAccess(&database.GroupRegistryAccess{
+		RegistryID: reg.ID,
+		GroupID:    grp.ID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+
+	adapter, err := storage.NewLocalAdapter(map[string]string{"path": t.TempDir()})
+	require.NoError(t, err)
+	router := NewPyPIProxy(db, adapter, c, rbac.New(db), nil)
+
+	pkgName := uniqueID("pkg")
+	version := "1.0.0"
+	body, contentType := buildUploadBody(pkgName, version, []byte("group-granted sdist bytes"))
+
+	req := httptest.NewRequest(http.MethodPost, "/legacy/", bytes.NewReader(body))
+	req.Host = host
+	req.Header.Set("Content-Type", contentType)
+	req = authedRequest(req, userID)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	t.Cleanup(func() { db.DeleteArtifact(reg.ID, "", pkgName, version) })
 }
