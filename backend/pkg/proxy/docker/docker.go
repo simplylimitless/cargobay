@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/simplylimitless/cargobay/backend/pkg/auth"
 	"github.com/simplylimitless/cargobay/backend/pkg/cache"
 	"github.com/simplylimitless/cargobay/backend/pkg/database"
 	"github.com/simplylimitless/cargobay/backend/pkg/middleware"
@@ -74,6 +75,13 @@ func NewDockerProxy(db *database.Database, storage storage.StorageAdapter, cache
 
 	// Health check
 	r.Get("/", p.handleHealth)
+
+	// Bearer-token issuance (Docker Registry v2 token auth spec). Registered
+	// as a static route so chi matches it ahead of the "/*" wildcard reads
+	// below; it inherits the same auth middleware mounted around "/v2" by
+	// the caller, so a docker login/push's Basic credentials are already
+	// resolved into middleware.GetUser(r) by the time handleToken runs.
+	r.Get("/token", p.handleToken)
 
 	// List repositories
 	r.Get("/_catalog", p.handleCatalog)
@@ -285,8 +293,15 @@ const dockerPathPrefixSegment = "dkr/"
 // unchanged, if neither matches. Returns the resolved target along with the
 // path handlers should parse the repository/reference/digest out of.
 func (p *DockerProxy) resolveTarget(r *http.Request) (target, string) {
-	path := strings.TrimPrefix(r.URL.Path, "/v2/")
+	return p.resolveTargetForPath(r, strings.TrimPrefix(r.URL.Path, "/v2/"))
+}
 
+// resolveTargetForPath is resolveTarget's path-independent core, split out
+// so the token endpoint (handleToken) can resolve a registry from a scope
+// string's repository name rather than the request's own URL path — the
+// scope is the only place a dkr/-prefixed repository selector is visible to
+// an otherwise pathless request like the v2 ping's token fetch.
+func (p *DockerProxy) resolveTargetForPath(r *http.Request, path string) (target, string) {
 	var reg *database.RegistryConfig
 	if rest, ok := strings.CutPrefix(path, dockerPathPrefixSegment); ok {
 		reg, path = proxy.ResolveRegistryWithPathPrefix(p.db, r.Host, rest, "docker")
@@ -1147,28 +1162,162 @@ func (p *DockerProxy) streamBlobFromUpstream(reg *database.RegistryConfig, repos
 	return err
 }
 
-// handleHealth is the registry v2 ping/discovery endpoint. This is the very
-// first request any Docker client makes, and its response shape decides
-// whether the client bothers sending credentials on every request after it:
-// a 200 here tells the client "no auth needed," so it never attaches its
-// stored `docker login` credentials to the push requests that follow — even
-// against a private registry — and every write then gets rejected as
-// anonymous by CheckAccess. So a private (Host-bound) registry must 401 an
-// anonymous ping here, the same way it would 401 an anonymous pull, to make
-// the client authenticate up front. Public registries keep succeeding
-// anonymously, so unauthenticated `docker pull` is unaffected. A request
-// that *does* present credentials only succeeds if they resolved to a user
-// — this is also what `docker login` probes to validate a username/password.
+// handleHealth is the registry v2 ping/discovery endpoint — the very first
+// request any Docker client makes. Its response shape decides whether the
+// client bothers fetching a token / attaching credentials on the requests
+// that follow it. Because the ping has no path (just "/v2/"), it can never
+// carry a repository selector — a dkr/-prefixed private registry addressed
+// by path is invisible to it, so this handler cannot make a per-registry
+// decision the way real pull/push requests do via checkAccess. Instead it
+// unconditionally challenges an anonymous caller with a Bearer challenge,
+// exactly like Docker Hub/GHCR/Harbor: the client then calls handleToken,
+// whose request *does* carry a scope naming the real repository, and the
+// actual admit/deny decision happens there. An authenticated caller (one
+// whose Basic credentials already resolved to a user via the auth
+// middleware) gets a plain 200 — this is also what `docker login` itself
+// probes to validate a username/password.
 func (p *DockerProxy) handleHealth(w http.ResponseWriter, r *http.Request) {
-	t, _ := p.resolveTarget(r)
-	requiresAuth := t.reg != nil && t.reg.Private
-	if (requiresAuth || r.Header.Get("Authorization") != "") && middleware.GetUser(r) == nil {
-		w.Header().Set("WWW-Authenticate", `Basic realm="cargobay Docker Registry"`)
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	if middleware.GetUser(r) != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status": "healthy",
+		})
 		return
 	}
+	w.Header().Set("WWW-Authenticate", fmt.Sprintf(
+		`Bearer realm="%s://%s/v2/token",service="%s"`, schemeFor(r), r.Host, r.Host))
+	http.Error(w, "authentication required", http.StatusUnauthorized)
+}
+
+// schemeFor returns "https" if the request arrived over TLS or via a
+// terminating proxy that says so, else "http". Used to build an absolute
+// token-endpoint URL for the ping's WWW-Authenticate challenge.
+func schemeFor(r *http.Request) string {
+	if r.TLS != nil {
+		return "https"
+	}
+	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+		return proto
+	}
+	return "http"
+}
+
+// dockerScope is a parsed Docker Registry v2 token-request scope, e.g.
+// "repository:library/nginx:pull,push".
+type dockerScope struct {
+	repository string
+	actions    []string
+}
+
+// parseDockerScope parses the "scope" query parameter Docker clients send
+// when fetching a token, in the form "repository:<name>:<action>[,<action>...]".
+// Returns ok=false for an empty or unrecognized scope (the shape docker
+// login's own credential-check request uses, which asks for a token with
+// no specific repository in mind).
+func parseDockerScope(scope string) (dockerScope, bool) {
+	kind, rest, ok := strings.Cut(scope, ":")
+	if !ok || kind != "repository" {
+		return dockerScope{}, false
+	}
+	repository, actionList, ok := strings.Cut(rest, ":")
+	if !ok || repository == "" {
+		return dockerScope{}, false
+	}
+	return dockerScope{repository: repository, actions: strings.Split(actionList, ",")}, true
+}
+
+func (s dockerScope) has(action string) bool {
+	for _, a := range s.actions {
+		if a == action {
+			return true
+		}
+	}
+	return false
+}
+
+// handleToken issues a short-lived Bearer token for the Docker Registry v2
+// token-auth flow. This is the realm URL advertised by handleHealth's (and
+// any upstream-relayed) WWW-Authenticate challenge. Unlike the ping, the
+// request here carries a "scope" parameter naming the real repository being
+// accessed — including any dkr/-prefix registry selector — so this is where
+// per-registry read/publish access is actually decided; handleHealth itself
+// no longer makes that decision at all.
+//
+// The minted token is an ordinary session access key (see
+// database.CreateAccessKey, the same mechanism auth.Login uses): it round-
+// trips through middleware.NewAuthMiddleware's existing Bearer-parsing path
+// with no changes needed there, so every downstream handler's checkAccess
+// call keeps working unmodified.
+func (p *DockerProxy) handleToken(w http.ResponseWriter, r *http.Request) {
+	user := middleware.GetUser(r)
+	scope, hasScope := parseDockerScope(r.URL.Query().Get("scope"))
+
+	permissions := []string{"read"}
+
+	if !hasScope {
+		// docker login's credential-check request: no repository in mind,
+		// just prove the caller is who they say they are.
+		if user == nil {
+			w.Header().Set("WWW-Authenticate", fmt.Sprintf(
+				`Bearer realm="%s://%s/v2/token",service="%s"`, schemeFor(r), r.Host, r.Host))
+			http.Error(w, "authentication required", http.StatusUnauthorized)
+			return
+		}
+		if user.Scope != "read" {
+			permissions = []string{"read", "write"}
+		}
+	} else {
+		t, _ := p.resolveTargetForPath(r, scope.repository)
+
+		wantPull := scope.has("pull") && p.rbac.CanReadRegistry(user, t.reg)
+		wantPush := scope.has("push") && p.rbac.CanPublishRegistry(user, t.reg)
+
+		if !wantPull && !wantPush {
+			status := http.StatusForbidden
+			if user == nil {
+				status = http.StatusUnauthorized
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			json.NewEncoder(w).Encode(map[string]string{"error": "access denied for this registry"})
+			return
+		}
+		if wantPush {
+			permissions = []string{"read", "write"}
+		}
+	}
+
+	if user == nil {
+		// Anonymous pull of a public registry (the only way to reach here
+		// with no user): there's no account to mint a session key against,
+		// and none is needed — a random, unpersisted token satisfies the
+		// client's Bearer-auth flow. It won't resolve to any user on the
+		// requests that follow, so those fall back to anonymous access,
+		// which CanReadRegistry already allows for a public registry.
+		tokenValue, err := auth.GenerateToken()
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to issue token: %v", err), http.StatusInternalServerError)
+			return
+		}
+		writeTokenResponse(w, tokenValue)
+		return
+	}
+
+	expiresAt := time.Now().Add(24 * time.Hour)
+	key, err := p.db.CreateAccessKey(user.UserID, "docker-token", permissions, &expiresAt)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to issue token: %v", err), http.StatusInternalServerError)
+		return
+	}
+	writeTokenResponse(w, key.KeyHash)
+}
+
+func writeTokenResponse(w http.ResponseWriter, token string) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"status": "healthy",
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"token":        token,
+		"access_token": token,
+		"expires_in":   int((24 * time.Hour).Seconds()),
+		"issued_at":    time.Now().UTC().Format(time.RFC3339),
 	})
 }

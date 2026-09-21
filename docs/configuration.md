@@ -249,6 +249,20 @@ docker tag myimage cargobay.example.com/dkr/tinkertown/myimage:latest
 docker push cargobay.example.com/dkr/tinkertown/myimage:latest
 ```
 
+### Authentication: Bearer tokens, not just Basic
+
+The Docker proxy speaks the standard [Docker Registry v2 token
+auth](https://docs.docker.com/registry/spec/auth/token/) flow (the same
+protocol Docker Hub, GHCR, and Harbor use), not plain HTTP Basic. This is
+what makes the `dkr/`-prefixed addressing above work correctly for private
+registries: the initial `GET /v2/` ping has no path and so can never tell
+which repository a request is actually headed for, but the token request
+that follows a 401 challenge *does* carry a `scope` naming the real
+repository — including any `dkr/` selector — so that's where read/publish
+access is actually decided. There's nothing to configure for this: `docker
+login`/`docker push`/`docker pull` already implement the client side of this
+flow, so it's transparent to any standard Docker client.
+
 ## npm, Maven, PyPI, Cargo, and NuGet Registries
 
 Like Docker, the npm, Maven, PyPI, Cargo, and NuGet proxies (Maven's

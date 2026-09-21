@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
+	"github.com/simplylimitless/cargobay/backend/pkg/auth"
 	"github.com/simplylimitless/cargobay/backend/pkg/cache"
 	"github.com/simplylimitless/cargobay/backend/pkg/database"
 	"github.com/simplylimitless/cargobay/backend/pkg/middleware"
@@ -83,6 +86,20 @@ func authedRequest(req *http.Request, userID string) *http.Request {
 	return req.WithContext(context.WithValue(req.Context(), middleware.AuthUserKey, user))
 }
 
+// seedTestUser creates a real user row so handleToken's CreateAccessKey
+// call (which has a foreign key on users) and GrantRegistryAccess calls
+// succeed. Returns the user's ID.
+func seedTestUser(t *testing.T, db *database.Database) string {
+	t.Helper()
+	hash, err := auth.HashPassword("test-password")
+	require.NoError(t, err)
+	username := uniqueID("docker-token-user")
+	user, err := db.CreateUser(username, username+"@example.com", hash, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { db.Exec(context.Background(), "DELETE FROM users WHERE user_id = $1", user.UserID) })
+	return user.UserID
+}
+
 func TestNewDockerProxy(t *testing.T) {
 	db := connectTestDB(t)
 	c := connectTestCache(t)
@@ -92,12 +109,40 @@ func TestNewDockerProxy(t *testing.T) {
 	assert.NotNil(t, router)
 }
 
-func TestHandleHealth(t *testing.T) {
+// TestHandleHealthAnonymousChallengesBearer guards against the bug behind
+// "docker login && docker push" silently failing: the ping has no path, so
+// it can never tell whether the request is actually headed for a private,
+// dkr/-prefix-addressed registry. Rather than guess, it unconditionally
+// challenges an anonymous caller with Bearer auth (matching Docker Hub/
+// GHCR/Harbor) — the client then fetches a token from the realm URL in the
+// challenge, and that request's scope parameter is where per-registry
+// access is actually decided (see handleToken).
+func TestHandleHealthAnonymousChallengesBearer(t *testing.T) {
 	db := connectTestDB(t)
 	c := connectTestCache(t)
 	p := newTestProxy(t, db, c)
 
 	req := httptest.NewRequest(http.MethodGet, "/v2/", nil)
+	rec := httptest.NewRecorder()
+
+	p.handleHealth(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	assert.Contains(t, rec.Header().Get("WWW-Authenticate"), "Bearer")
+	assert.Contains(t, rec.Header().Get("WWW-Authenticate"), "/v2/token")
+}
+
+// TestHandleHealthAuthenticatedSucceeds verifies the ping succeeds once the
+// caller is authenticated (i.e. middleware.GetUser already resolved a user
+// from the request's credentials), regardless of which registry a later
+// request might address.
+func TestHandleHealthAuthenticatedSucceeds(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p := newTestProxy(t, db, c)
+
+	req := httptest.NewRequest(http.MethodGet, "/v2/", nil)
+	req = authedRequest(req, uniqueID("user"))
 	rec := httptest.NewRecorder()
 
 	p.handleHealth(rec, req)
@@ -106,88 +151,174 @@ func TestHandleHealth(t *testing.T) {
 	assert.Contains(t, rec.Body.String(), "healthy")
 }
 
-func TestHandleHealthUnauthorizedWithBadCreds(t *testing.T) {
+func TestParseDockerScope(t *testing.T) {
+	scope, ok := parseDockerScope("repository:dkr/ghcr.io/org/image:push,pull")
+	require.True(t, ok)
+	assert.Equal(t, "dkr/ghcr.io/org/image", scope.repository)
+	assert.True(t, scope.has("push"))
+	assert.True(t, scope.has("pull"))
+	assert.False(t, scope.has("delete"))
+
+	_, ok = parseDockerScope("")
+	assert.False(t, ok)
+
+	_, ok = parseDockerScope("registry:catalog:*")
+	assert.False(t, ok)
+}
+
+// TestHandleTokenLoginCheckAnonymousDenied covers docker login's own
+// credential-check request: no scope, no user — must be denied so a bad
+// username/password is reported as a login failure.
+func TestHandleTokenLoginCheckAnonymousDenied(t *testing.T) {
 	db := connectTestDB(t)
 	c := connectTestCache(t)
 	p := newTestProxy(t, db, c)
 
-	req := httptest.NewRequest(http.MethodGet, "/v2/", nil)
-	req.Header.Set("Authorization", "Basic bm9wZTpub3Blbg==")
+	req := httptest.NewRequest(http.MethodGet, "/v2/token", nil)
 	rec := httptest.NewRecorder()
 
-	p.handleHealth(rec, req)
+	p.handleToken(rec, req)
 
 	assert.Equal(t, http.StatusUnauthorized, rec.Code)
 }
 
-// TestHandleHealthPrivateRegistryAnonymousDenied guards against the bug
-// behind "docker login && docker push" silently failing: the v2 ping must
-// 401 an anonymous request against a private registry, or the Docker client
-// concludes no auth is needed and never attaches its login credentials to
-// the push requests that follow, which then get rejected as anonymous.
-func TestHandleHealthPrivateRegistryAnonymousDenied(t *testing.T) {
+// TestHandleTokenLoginCheckSucceeds covers docker login's credential-check
+// request when the caller's Basic credentials already resolved to a user.
+func TestHandleTokenLoginCheckSucceeds(t *testing.T) {
 	db := connectTestDB(t)
 	c := connectTestCache(t)
 	p := newTestProxy(t, db, c)
 
-	host := uniqueID("private-ping-host") + ".test"
-	reg := seedRegistry(t, db, uniqueID("private-ping-reg"), true, false)
-	reg.Host = host
-	require.NoError(t, db.SaveRegistry(reg))
-
-	req := httptest.NewRequest(http.MethodGet, "/v2/", nil)
-	req.Host = host
+	userID := seedTestUser(t, db)
+	req := httptest.NewRequest(http.MethodGet, "/v2/token", nil)
+	req = authedRequest(req, userID)
 	rec := httptest.NewRecorder()
 
-	p.handleHealth(rec, req)
+	p.handleToken(rec, req)
 
-	assert.Equal(t, http.StatusUnauthorized, rec.Code)
-	assert.NotEmpty(t, rec.Header().Get("WWW-Authenticate"))
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), `"token"`)
 }
 
-// TestHandleHealthPrivateRegistryAuthenticatedSucceeds verifies the ping
-// still succeeds for a private registry once the caller is authenticated,
-// so a correctly-configured `docker push` isn't blocked by the fix above.
-func TestHandleHealthPrivateRegistryAuthenticatedSucceeds(t *testing.T) {
+// TestHandleTokenAnonymousPublicRegistryPullSucceeds verifies anonymous
+// `docker pull` against a public registry keeps working through the token
+// flow: no credentials, but the requested scope only asks for pull against
+// a non-private registry, which CanReadRegistry allows for anyone.
+func TestHandleTokenAnonymousPublicRegistryPullSucceeds(t *testing.T) {
 	db := connectTestDB(t)
 	c := connectTestCache(t)
 	p := newTestProxy(t, db, c)
 
-	host := uniqueID("private-ping-auth-host") + ".test"
-	reg := seedRegistry(t, db, uniqueID("private-ping-auth-reg"), true, false)
-	reg.Host = host
-	require.NoError(t, db.SaveRegistry(reg))
+	regID := uniqueID("token-public-reg")
+	seedRegistry(t, db, regID, false, false)
 
-	req := httptest.NewRequest(http.MethodGet, "/v2/", nil)
-	req.Host = host
-	req = authedRequest(req, uniqueID("user"))
+	req := httptest.NewRequest(http.MethodGet, "/v2/token?scope="+url.QueryEscape("repository:dkr/"+regID+"/library/nginx:pull"), nil)
 	rec := httptest.NewRecorder()
 
-	p.handleHealth(rec, req)
+	p.handleToken(rec, req)
 
-	assert.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), `"token"`)
 }
 
-// TestHandleHealthPublicRegistryAllowsAnonymous verifies the fix is scoped
-// to private registries only — anonymous `docker pull` against a public
-// registry must keep working unauthenticated.
-func TestHandleHealthPublicRegistryAllowsAnonymous(t *testing.T) {
+// TestHandleTokenPrivateRegistryNoGrantDenied verifies an authenticated
+// user with no grant on a private registry is denied a token for it.
+func TestHandleTokenPrivateRegistryNoGrantDenied(t *testing.T) {
 	db := connectTestDB(t)
 	c := connectTestCache(t)
 	p := newTestProxy(t, db, c)
 
-	host := uniqueID("public-ping-host") + ".test"
-	reg := seedRegistry(t, db, uniqueID("public-ping-reg"), false, false)
-	reg.Host = host
-	require.NoError(t, db.SaveRegistry(reg))
+	regID := uniqueID("token-private-nogrant-reg")
+	seedRegistry(t, db, regID, true, false)
 
-	req := httptest.NewRequest(http.MethodGet, "/v2/", nil)
-	req.Host = host
+	userID := seedTestUser(t, db)
+	req := httptest.NewRequest(http.MethodGet, "/v2/token?scope="+url.QueryEscape("repository:dkr/"+regID+"/org/image:pull"), nil)
+	req = authedRequest(req, userID)
 	rec := httptest.NewRecorder()
 
-	p.handleHealth(rec, req)
+	p.handleToken(rec, req)
 
-	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+}
+
+// TestHandleTokenPathPrefixPrivateRegistryGrantsPush is the regression case
+// for the reported bug: a private registry addressed via the dkr/ path
+// prefix (not Host binding) must resolve correctly from the token
+// request's scope, and a user with a publish grant must receive a token
+// carrying write permissions.
+func TestHandleTokenPathPrefixPrivateRegistryGrantsPush(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p := newTestProxy(t, db, c)
+
+	reg := seedRegistry(t, db, uniqueID("token-private-push-reg"), true, false)
+
+	userID := seedTestUser(t, db)
+	require.NoError(t, db.GrantRegistryAccess(&database.RegistryAccess{
+		RegistryID: reg.ID,
+		UserID:     userID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+	t.Cleanup(func() { db.RevokeRegistryAccess(reg.ID, userID) })
+
+	req := httptest.NewRequest(http.MethodGet, "/v2/token?scope="+url.QueryEscape("repository:dkr/"+reg.ID+"/org/image:push,pull"), nil)
+	req = authedRequest(req, userID)
+	rec := httptest.NewRecorder()
+
+	p.handleToken(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var body struct {
+		Token string `json:"token"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	require.NotEmpty(t, body.Token)
+
+	key, err := db.ValidateAccessKey(body.Token)
+	require.NoError(t, err)
+	require.NotNil(t, key)
+	assert.Contains(t, key.Permissions, "write")
+}
+
+// TestHandleTokenPathPrefixReadOnlyDeniesPush verifies a user with only a
+// read grant gets a token, but that token does not carry write permissions
+// — so a subsequent push still gets rejected by checkAccess even though the
+// token request itself succeeded.
+func TestHandleTokenPathPrefixReadOnlyDeniesPush(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p := newTestProxy(t, db, c)
+
+	reg := seedRegistry(t, db, uniqueID("token-private-readonly-reg"), true, false)
+
+	userID := seedTestUser(t, db)
+	require.NoError(t, db.GrantRegistryAccess(&database.RegistryAccess{
+		RegistryID: reg.ID,
+		UserID:     userID,
+		CanRead:    true,
+		CanPublish: false,
+	}))
+	t.Cleanup(func() { db.RevokeRegistryAccess(reg.ID, userID) })
+
+	req := httptest.NewRequest(http.MethodGet, "/v2/token?scope="+url.QueryEscape("repository:dkr/"+reg.ID+"/org/image:push,pull"), nil)
+	req = authedRequest(req, userID)
+	rec := httptest.NewRecorder()
+
+	p.handleToken(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var body struct {
+		Token string `json:"token"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+
+	key, err := db.ValidateAccessKey(body.Token)
+	require.NoError(t, err)
+	require.NotNil(t, key)
+	assert.NotContains(t, key.Permissions, "write")
 }
 
 func TestHandleCatalog(t *testing.T) {
@@ -614,10 +745,14 @@ func TestDockerProxyIntegration(t *testing.T) {
 	server := httptest.NewServer(router)
 	defer server.Close()
 
+	// Anonymous ping now unconditionally challenges Bearer auth (see
+	// TestHandleHealthAnonymousChallengesBearer) rather than resolving a
+	// target registry itself.
 	resp, err := http.Get(server.URL + "/")
 	require.NoError(t, err)
 	defer resp.Body.Close()
-	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	assert.Contains(t, resp.Header.Get("WWW-Authenticate"), "Bearer")
 
 	catalogResp, err := http.Get(server.URL + "/_catalog")
 	require.NoError(t, err)
