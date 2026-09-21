@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -589,6 +590,49 @@ func TestHandleBlobUploadLifecycle(t *testing.T) {
 	headRec := httptest.NewRecorder()
 	p.handleHeadBlob(headRec, headReq, tgt, "library/nginx", "sha256:deadbeef")
 	assert.Equal(t, http.StatusOK, headRec.Code)
+}
+
+// TestHandleStartUploadPreservesDkrPrefixInLocation guards against a
+// regression where the Location header returned to start a blob upload
+// dropped the "dkr/<registry-id>/" prefix a client used to address a
+// path-prefixed registry. Docker's client follows Location verbatim for the
+// next PATCH; a stripped prefix makes that follow-up request resolve
+// against the wrong (default) registry and get denied, even though the
+// initial POST succeeded.
+func TestHandleStartUploadPreservesDkrPrefixInLocation(t *testing.T) {
+	db := connectTestDB(t)
+	c := connectTestCache(t)
+	p := newTestProxy(t, db, c)
+
+	reg := seedRegistry(t, db, uniqueID("dkr-prefix-reg"), true, false)
+
+	userID := seedTestUser(t, db)
+	require.NoError(t, db.GrantRegistryAccess(&database.RegistryAccess{
+		RegistryID: reg.ID,
+		UserID:     userID,
+		CanRead:    true,
+		CanPublish: true,
+	}))
+	t.Cleanup(func() { db.RevokeRegistryAccess(reg.ID, userID) })
+
+	req := httptest.NewRequest(http.MethodPost, "/v2/dkr/"+reg.ID+"/simplylimitless/maindeck/blobs/uploads/", nil)
+	req = authedRequest(req, userID)
+	rec := httptest.NewRecorder()
+
+	tgt, path, ok := p.checkAccess(rec, req, true)
+	require.True(t, ok)
+	require.Equal(t, "dkr/"+reg.ID+"/", tgt.prefix)
+
+	repo, ok := trimSuffixSep(path, "/blobs/uploads/")
+	require.True(t, ok)
+
+	startRec := httptest.NewRecorder()
+	p.handleStartUpload(startRec, req, tgt, repo)
+
+	require.Equal(t, http.StatusAccepted, startRec.Code)
+	location := startRec.Header().Get("Location")
+	assert.True(t, strings.HasPrefix(location, "/v2/dkr/"+reg.ID+"/"), "Location %q must preserve the dkr/ registry prefix", location)
+	assert.Contains(t, location, "simplylimitless/maindeck/blobs/uploads/")
 }
 
 func TestHandleGetBlobNotFound(t *testing.T) {

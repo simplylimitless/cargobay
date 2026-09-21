@@ -272,6 +272,14 @@ func splitDockerRepository(repository string) (namespace, name string) {
 type target struct {
 	reg   *database.RegistryConfig
 	label string
+	// prefix is the leading path segment(s) resolveTarget stripped to find
+	// reg (e.g. "dkr/container-registry.tinkertown.net/"), empty when the
+	// registry was resolved by Host header or is the default. Upload
+	// handlers must re-prepend this to any repository-relative URL they
+	// hand back to the client (e.g. the blob-upload Location header) —
+	// otherwise the client's next request loses the registry selector and
+	// silently resolves against the wrong (default) registry instead.
+	prefix string
 }
 
 // dockerPathPrefixSegment marks a request as addressing a registry by path
@@ -303,8 +311,12 @@ func (p *DockerProxy) resolveTarget(r *http.Request) (target, string) {
 // an otherwise pathless request like the v2 ping's token fetch.
 func (p *DockerProxy) resolveTargetForPath(r *http.Request, path string) (target, string) {
 	var reg *database.RegistryConfig
+	prefix := ""
 	if rest, ok := strings.CutPrefix(path, dockerPathPrefixSegment); ok {
-		reg, path = proxy.ResolveRegistryWithPathPrefix(p.db, r.Host, rest, "docker")
+		var trimmed string
+		reg, trimmed = proxy.ResolveRegistryWithPathPrefix(p.db, r.Host, rest, "docker")
+		prefix = path[:len(path)-len(trimmed)]
+		path = trimmed
 	} else {
 		reg = proxy.ResolveRegistry(p.db, p.registries, r.Host, "docker")
 	}
@@ -313,7 +325,7 @@ func (p *DockerProxy) resolveTargetForPath(r *http.Request, path string) (target
 	if reg != nil {
 		label = reg.ID
 	}
-	return target{reg: reg, label: label}, path
+	return target{reg: reg, label: label, prefix: prefix}, path
 }
 
 // checkAccess resolves the target registry (and repository-parseable path)
@@ -898,7 +910,7 @@ func (p *DockerProxy) handleHeadBlob(w http.ResponseWriter, r *http.Request, t t
 func (p *DockerProxy) handleStartUpload(w http.ResponseWriter, r *http.Request, t target, repository string) {
 	uploadID := fmt.Sprintf("upload-%d", time.Now().UnixNano())
 
-	w.Header().Set("Location", fmt.Sprintf("/v2/%s/blobs/uploads/%s", repository, uploadID))
+	w.Header().Set("Location", fmt.Sprintf("/v2/%s%s/blobs/uploads/%s", t.prefix, repository, uploadID))
 	w.Header().Set("Docker-Upload-UUID", uploadID)
 	w.WriteHeader(http.StatusAccepted)
 }
@@ -913,7 +925,7 @@ func (p *DockerProxy) handlePatchUpload(w http.ResponseWriter, r *http.Request, 
 
 	p.cache.Set(fmt.Sprintf("upload:%s:%s", repository, uploadID), body)
 
-	w.Header().Set("Location", fmt.Sprintf("/v2/%s/blobs/uploads/%s", repository, uploadID))
+	w.Header().Set("Location", fmt.Sprintf("/v2/%s%s/blobs/uploads/%s", t.prefix, repository, uploadID))
 	w.Header().Set("Docker-Upload-UUID", uploadID)
 	w.WriteHeader(http.StatusAccepted)
 }
