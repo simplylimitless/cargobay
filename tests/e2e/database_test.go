@@ -478,6 +478,42 @@ func TestUserOperations(t *testing.T) {
 	assert.Nil(t, deleted)
 }
 
+// TestGroupMembership tests group creation and membership listing against a
+// real Postgres instance. ListGroupMembers previously grouped by user_id but
+// ordered by gm.added_at without including it in GROUP BY, which Postgres
+// rejects outright — a mock-backed test can't catch this since it never
+// executes real SQL.
+func TestGroupMembership(t *testing.T) {
+	db := database.New("postgres://localhost:5432/cargobay")
+
+	group, err := db.CreateGroup("test-group-e2e", "e2e group")
+	require.NoError(t, err)
+	defer db.DeleteGroup(group.ID)
+
+	user := &database.User{
+		UserID:       "test-group-member-e2e",
+		Username:     "groupmembertestuser",
+		Email:        "groupmember@example.com",
+		PasswordHash: "$2a$10$testpasswordhash",
+		Roles:        []string{"viewer"},
+	}
+	require.NoError(t, db.SaveUser(user))
+	defer db.DeleteUser(user.UserID)
+
+	require.NoError(t, db.AddGroupMember(group.ID, user.UserID))
+
+	members, err := db.ListGroupMembers(group.ID)
+	require.NoError(t, err)
+	require.Len(t, members, 1)
+	assert.Equal(t, user.UserID, members[0].UserID)
+
+	require.NoError(t, db.RemoveGroupMember(group.ID, user.UserID))
+
+	members, err = db.ListGroupMembers(group.ID)
+	require.NoError(t, err)
+	assert.Empty(t, members)
+}
+
 // generateID generates a random ID for testing
 func generateID() string {
 	return "e2e-" + string(rune('a'+1)) + string(rune('0'+1))

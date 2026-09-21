@@ -1363,7 +1363,7 @@ func (db *Database) ListGroupMembers(groupID string) ([]UserRepository, error) {
 		 JOIN users u ON u.user_id = gm.user_id
 		 LEFT JOIN user_roles ur ON u.user_id = ur.user_id
 		 WHERE gm.group_id = $1
-		 GROUP BY u.user_id
+		 GROUP BY u.user_id, gm.added_at
 		 ORDER BY gm.added_at ASC`,
 		groupID,
 	)
