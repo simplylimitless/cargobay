@@ -48,8 +48,9 @@ func TestServerConfigDefault(t *testing.T) {
 
 	assert.Equal(t, 4500, defaultConfig.Server.Port)
 	assert.Equal(t, "0.0.0.0", defaultConfig.Server.Host)
-	assert.Equal(t, Duration(30*time.Second), defaultConfig.Server.ReadTimeout)
-	assert.Equal(t, Duration(30*time.Second), defaultConfig.Server.WriteTimeout)
+	assert.Equal(t, Duration(10*time.Second), defaultConfig.Server.ReadHeaderTimeout)
+	assert.Equal(t, Duration(10*time.Minute), defaultConfig.Server.ReadTimeout)
+	assert.Equal(t, Duration(10*time.Minute), defaultConfig.Server.WriteTimeout)
 	assert.Equal(t, Duration(120*time.Second), defaultConfig.Server.IdleTimeout)
 
 	assert.Equal(t, "local", defaultConfig.Storage.Type)

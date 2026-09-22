@@ -345,11 +345,12 @@ func main() {
 
 	// Server setup
 	server := &http.Server{
-		Addr:         fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port),
-		Handler:      r,
-		ReadTimeout:  cfg.Server.ReadTimeout.Std(),
-		WriteTimeout: cfg.Server.WriteTimeout.Std(),
-		IdleTimeout:  cfg.Server.IdleTimeout.Std(),
+		Addr:              fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port),
+		Handler:           r,
+		ReadHeaderTimeout: cfg.Server.ReadHeaderTimeout.Std(),
+		ReadTimeout:       cfg.Server.ReadTimeout.Std(),
+		WriteTimeout:      cfg.Server.WriteTimeout.Std(),
+		IdleTimeout:       cfg.Server.IdleTimeout.Std(),
 	}
 
 	log.Printf("Server starting on %s", server.Addr)

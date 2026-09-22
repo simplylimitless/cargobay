@@ -49,8 +49,19 @@ func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 
 // ServerConfig holds server configuration
 type ServerConfig struct {
-	Port         int      `yaml:"port"`
-	Host         string   `yaml:"host"`
+	Port int    `yaml:"port"`
+	Host string `yaml:"host"`
+	// ReadHeaderTimeout bounds only the request line + headers, so
+	// slowloris-style connections still get cut off quickly even though
+	// ReadTimeout (below) is generous.
+	ReadHeaderTimeout Duration `yaml:"read_header_timeout"`
+	// ReadTimeout/WriteTimeout bound an entire request/response body, not
+	// just headers. Docker blob-upload PATCH chunks (and blob downloads) can
+	// be large, and a `docker push`/`pull` opens many concurrent blob
+	// sessions that compete for the pod's bandwidth/CPU, so a single chunk
+	// can legitimately take much longer than a typical API request to fully
+	// transfer. A short timeout here cuts the connection mid-transfer with
+	// "unexpected EOF", which surfaces to clients as a 400 on that chunk.
 	ReadTimeout  Duration `yaml:"read_timeout"`
 	WriteTimeout Duration `yaml:"write_timeout"`
 	IdleTimeout  Duration `yaml:"idle_timeout"`
@@ -101,11 +112,12 @@ type Config struct {
 func DefaultConfig() *Config {
 	return &Config{
 		Server: ServerConfig{
-			Port:         4500,
-			Host:         "0.0.0.0",
-			ReadTimeout:  Duration(30 * time.Second),
-			WriteTimeout: Duration(30 * time.Second),
-			IdleTimeout:  Duration(120 * time.Second),
+			Port:              4500,
+			Host:              "0.0.0.0",
+			ReadHeaderTimeout: Duration(10 * time.Second),
+			ReadTimeout:       Duration(10 * time.Minute),
+			WriteTimeout:      Duration(10 * time.Minute),
+			IdleTimeout:       Duration(120 * time.Second),
 		},
 		Storage: StorageConfig{
 			Type:   "local",
