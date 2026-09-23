@@ -2550,9 +2550,11 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	output, err := auth.Login(s.db, input.Username, input.Password)
 	if err != nil {
 		_ = s.db.GenerateAuditLog(input.Username, "user.login_failed", "user", input.Username, "{}")
-		switch err {
-		case fmt.Errorf("invalid credentials"):
+		switch err.Error() {
+		case "invalid credentials":
 			s.writeJSONError(w, http.StatusUnauthorized, "Invalid credentials")
+		case "user account is deactivated":
+			s.writeJSONError(w, http.StatusUnauthorized, "User account is deactivated")
 		default:
 			s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Login failed: %v", err))
 		}
