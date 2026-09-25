@@ -917,8 +917,16 @@ func (p *DockerProxy) handleStartUpload(w http.ResponseWriter, r *http.Request, 
 
 // handlePatchUpload appends a chunk to an in-progress blob upload
 func (p *DockerProxy) handlePatchUpload(w http.ResponseWriter, r *http.Request, t target, repository, uploadID string) {
+	start := time.Now()
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		// len(body) is the partial read io.ReadAll returns alongside the
+		// error — comparing it to the client-declared Content-Length tells
+		// us whether this is a near-immediate connection drop (bytes-read
+		// ~0) or a mid-stream truncation (bytes-read close to but short of
+		// content-length), which grep/read of this handler alone can't.
+		log.Printf("docker patch-upload: chunk read failed repo=%s upload=%s remote=%s content-length=%d bytes-read=%d elapsed=%s err=%v",
+			repository, uploadID, r.RemoteAddr, r.ContentLength, len(body), time.Since(start), err)
 		http.Error(w, fmt.Sprintf("Failed to read chunk: %v", err), http.StatusBadRequest)
 		return
 	}
@@ -934,8 +942,11 @@ func (p *DockerProxy) handlePatchUpload(w http.ResponseWriter, r *http.Request, 
 func (p *DockerProxy) handleFinishUpload(w http.ResponseWriter, r *http.Request, t target, repository, uploadID string) {
 	digest := r.URL.Query().Get("digest")
 
+	start := time.Now()
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		log.Printf("docker finish-upload: blob read failed repo=%s upload=%s digest=%s remote=%s content-length=%d bytes-read=%d elapsed=%s err=%v",
+			repository, uploadID, digest, r.RemoteAddr, r.ContentLength, len(body), time.Since(start), err)
 		http.Error(w, fmt.Sprintf("Failed to read blob: %v", err), http.StatusBadRequest)
 		return
 	}
